@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-contrib/cors"
@@ -110,6 +111,17 @@ func main() {
 		log.Println("No .env file found, relying on system environment variables")
 	}
 
+	// Validate critical environment variables
+	jwtSecretStr := os.Getenv("JWT_SECRET")
+	if jwtSecretStr == "" {
+		log.Fatal("FATAL: JWT_SECRET environment variable is not set")
+	}
+	jwtSecret := []byte(jwtSecretStr)
+	doctorInviteCode := os.Getenv("DOCTOR_INVITE_CODE")
+	if doctorInviteCode == "" {
+		log.Fatal("FATAL: DOCTOR_INVITE_CODE environment variable is not set")
+	}
+
 	// Initialize DB
 	var db = init_db()
 	defer db.Close()
@@ -138,17 +150,35 @@ func main() {
 
 	// Create the API Handler
 	h := &api.Handler{
-		Repo:       repo,
-		S3Client:   s3Client,
-		BucketName: bucketName,
+		Repo:             repo,
+		S3Client:         s3Client,
+		BucketName:       bucketName,
+		JWTSecret:        jwtSecret,
+		DoctorInviteCode: doctorInviteCode,
 	}
 
 	// Set up Gin Server
 	r := gin.Default()
 
-	// Enable CORS middleware
+	// Configure CORS
+	corsOrigins := os.Getenv("CORS_ALLOWED_ORIGINS")
+	allowedOrigins := []string{"http://localhost:3000", "https://d11ox9eozk6am1.cloudfront.net"}
+	if corsOrigins != "" {
+		originsList := strings.Split(corsOrigins, ",")
+		var cleaned []string
+		for _, o := range originsList {
+			trimmed := strings.TrimSpace(o)
+			if trimmed != "" {
+				cleaned = append(cleaned, trimmed)
+			}
+		}
+		if len(cleaned) > 0 {
+			allowedOrigins = cleaned
+		}
+	}
+
 	r.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"https://d11ox9eozk6am1.cloudfront.net"}, // TODO: Replace with the fontend's address like []string{"http://localhost:3000"}
+		AllowOrigins:     allowedOrigins,
 		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
 		ExposeHeaders:    []string{"Content-Length"},
@@ -164,27 +194,40 @@ func main() {
 
 	// --- Protected Routes ---
 	authGroup := r.Group("/api")
-
-	// All routes inside this block will require authentication
-	authGroup.Use(api.AuthMiddleware())
+	authGroup.Use(api.AuthMiddleware(jwtSecret))
 	{
+		// Common Profile Route (Accessible to both Patients & Doctors)
 		authGroup.GET("/profile", h.GetUserProfile)
-		authGroup.GET("/doctors", h.GetDoctors)
-		authGroup.GET("/patient/appointments", h.GetPatientAppointments)
-		authGroup.GET("/doctor/appointments", h.GetDoctorAppointments)
-		authGroup.GET("/patient/prescriptions", h.GetPatientPrescriptions)
-		authGroup.GET("/doctor/patients", h.GetDoctorPatients)
 
-		authGroup.POST("/appointments", h.CreateAppointment)
-		authGroup.POST("/prescriptions", h.CreatePrescription)
+		// Patient-only Routes
+		patientGroup := authGroup.Group("")
+		patientGroup.Use(api.RequireRole("patient"))
+		{
+			patientGroup.GET("/doctors", h.GetDoctors)
+			patientGroup.GET("/patient/appointments", h.GetPatientAppointments)
+			patientGroup.GET("/patient/prescriptions", h.GetPatientPrescriptions)
+			patientGroup.POST("/appointments", h.CreateAppointment)
+			patientGroup.GET("/prescriptions/:filename", h.DownloadPrescription)
+		}
 
-		authGroup.GET("/prescriptions/:filename", h.DownloadPrescription)
-		authGroup.GET("/doctor/prescriptions/:filename", h.DoctorDownloadPrescription)
-		authGroup.GET("/doctor/patients/:id/appointments", h.GetPatientHistoryAppointments)
-		authGroup.GET("/doctor/patients/:id/prescriptions", h.GetPatientHistoryPrescriptions)
-		authGroup.PATCH("/appointments/:id", h.MarkAppointmentAsCompleted)
+		// Doctor-only Routes
+		doctorGroup := authGroup.Group("")
+		doctorGroup.Use(api.RequireRole("doctor"))
+		{
+			doctorGroup.GET("/doctor/appointments", h.GetDoctorAppointments)
+			doctorGroup.GET("/doctor/patients", h.GetDoctorPatients)
+			doctorGroup.POST("/prescriptions", h.CreatePrescription)
+			doctorGroup.GET("/doctor/prescriptions/:filename", h.DoctorDownloadPrescription)
+			doctorGroup.GET("/doctor/patients/:id/appointments", h.GetPatientHistoryAppointments)
+			doctorGroup.GET("/doctor/patients/:id/prescriptions", h.GetPatientHistoryPrescriptions)
+			doctorGroup.PATCH("/appointments/:id", h.MarkAppointmentAsCompleted)
+		}
 	}
 
 	// Run the server
-	r.Run()
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	r.Run(":" + port)
 }

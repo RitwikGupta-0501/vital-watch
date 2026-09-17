@@ -6,7 +6,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -24,19 +23,19 @@ import (
 	"github.com/RitwikGupta-0501/vital-watch/utils"
 )
 
-var jwtSecret = []byte(os.Getenv("JWT_SECRET"))
-
 type Handler struct {
-	Repo       *repository.Repository
-	S3Client   *s3.Client
-	BucketName string
+	Repo             *repository.Repository
+	S3Client         *s3.Client
+	BucketName       string
+	JWTSecret        []byte
+	DoctorInviteCode string
 }
 
 func (h *Handler) Ping(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "pong from the api layer!"})
 }
 
-func AuthMiddleware() gin.HandlerFunc {
+func AuthMiddleware(jwtSecret []byte) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		authHeader := c.GetHeader("Authorization")
 		if authHeader == "" {
@@ -82,6 +81,31 @@ func AuthMiddleware() gin.HandlerFunc {
 		}
 
 		c.Next()
+	}
+}
+
+func RequireRole(allowedRoles ...string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		userRole, exists := c.Get("role")
+		if !exists {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Role not found in token context"})
+			return
+		}
+
+		roleStr, ok := userRole.(string)
+		if !ok {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid role format in context"})
+			return
+		}
+
+		for _, allowed := range allowedRoles {
+			if roleStr == allowed {
+				c.Next()
+				return
+			}
+		}
+
+		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "Access denied: insufficient permissions for this endpoint"})
 	}
 }
 
@@ -135,7 +159,7 @@ func (h *Handler) Login(c *gin.Context) {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 
 	// Sign the token with the secret key
-	tokenString, err := token.SignedString(jwtSecret)
+	tokenString, err := token.SignedString(h.JWTSecret)
 	if err != nil {
 		log.Println("Failed to sign token:", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
@@ -154,8 +178,9 @@ func (h *Handler) Register(c *gin.Context) {
 		LastName   string `json:"last_name"`
 		Email      string `json:"email"`
 		Password   string `json:"password"`
-		Specialty  string `json:"specialty,omitempty"`  // For doctors
-		Experience int    `json:"experience,omitempty"` // For doctors
+		Specialty  string `json:"specialty,omitempty"`   // For doctors
+		Experience int    `json:"experience,omitempty"`  // For doctors
+		InviteCode string `json:"invite_code,omitempty"` // For doctors
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -163,17 +188,42 @@ func (h *Handler) Register(c *gin.Context) {
 		return
 	}
 
-	hashed, err := utils.HashPassword(req.Password)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
+	req.Email = strings.TrimSpace(req.Email)
+	if req.Email == "" || !strings.Contains(req.Email, "@") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "A valid email address is required"})
+		return
+	}
+
+	if len(req.Password) < 8 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Password must be at least 8 characters long"})
+		return
+	}
+
+	if strings.TrimSpace(req.FirstName) == "" || strings.TrimSpace(req.LastName) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "First name and last name are required"})
 		return
 	}
 
 	var id int
+	var err error
 	switch req.Role {
 	case "patient":
+		hashed, err := utils.HashPassword(req.Password)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
+			return
+		}
 		id, err = h.Repo.CreatePatient(req.FirstName, req.LastName, req.Email, hashed)
 	case "doctor":
+		if h.DoctorInviteCode == "" || req.InviteCode != h.DoctorInviteCode {
+			c.JSON(http.StatusForbidden, gin.H{"error": "Doctor registration is restricted or invalid invite code"})
+			return
+		}
+		hashed, err := utils.HashPassword(req.Password)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
+			return
+		}
 		id, err = h.Repo.CreateDoctor(req.FirstName, req.LastName, req.Email, hashed, req.Specialty, req.Experience)
 	default:
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid role"})
@@ -482,17 +532,27 @@ func (h *Handler) CreatePrescription(c *gin.Context) {
 }
 
 func (h *Handler) MarkAppointmentAsCompleted(c *gin.Context) {
+	doctorID, ok := c.Get("userID")
+	if !ok {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Doctor ID not found in context"})
+		return
+	}
+
 	appointmentIDStr := c.Param("id")
 	appointmentID, err := strconv.Atoi(appointmentIDStr)
-
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid appointment ID"})
 		return
 	}
 
-	err = h.Repo.UpdateAppointmentAsCompleted(appointmentID)
+	updated, err := h.Repo.UpdateAppointmentAsCompletedForDoctor(appointmentID, doctorID.(int))
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to mark appointment as completed", "err": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to mark appointment as completed"})
+		return
+	}
+
+	if !updated {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Appointment not found or not assigned to you"})
 		return
 	}
 

@@ -278,6 +278,19 @@ func (r *Repository) UpdateAppointmentAsCompleted(appointmentID int) error {
 	return err
 }
 
+func (r *Repository) UpdateAppointmentAsCompletedForDoctor(appointmentID int, doctorID int) (bool, error) {
+	query := `UPDATE appointments SET status = 'completed' WHERE id = $1 AND doctor_id = $2`
+	result, err := r.DB.Exec(query, appointmentID, doctorID)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
 // Prescription Related Methods
 func (r *Repository) CreatePrescription(patientID int, doctorID int, medication, notes, fileName string) (int, error) {
 	query := `

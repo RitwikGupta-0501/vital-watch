@@ -25,10 +25,3 @@ CREATE TABLE IF NOT EXISTS prescriptions (
     file_name VARCHAR(255),
     created_at TIMESTAMPTZ DEFAULT now()
 );
-
--- Add some dummy doctors for testing
-INSERT INTO doctors (firstName, lastName, hashedPassword, email, specialty, experience, available)
-VALUES 
-('Alice', 'Smith', 'dummyhash', 'alice@example.com', 'Cardiologist', 5, true),
-('Bob', 'Johnson', 'dummyhash', 'bob@example.com', 'Dermatologist', 8, true),
-('Charlie', 'Lee', 'dummyhash', 'charlie@example.com', 'Pediatrician', 12, false);
