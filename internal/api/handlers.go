@@ -13,7 +13,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -63,20 +62,25 @@ func AuthMiddleware(jwtSecret []byte) gin.HandlerFunc {
 		}
 
 		if claims, ok := token.Claims.(jwt.MapClaims); ok {
-			userIDFloat, ok := claims["sub"].(float64)
+			subStr, ok := claims["sub"].(string)
 			if !ok {
-				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid token claims"})
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid token claims (sub)"})
 				return
 			}
 
-			// Get User Role
+			userID, err := uuid.Parse(subStr)
+			if err != nil {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid user ID in token"})
+				return
+			}
+
 			role, ok := claims["role"].(string)
 			if !ok {
 				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid token claims (role)"})
 				return
 			}
 
-			c.Set("userID", int(userIDFloat))
+			c.Set("userID", userID)
 			c.Set("role", role)
 		}
 
@@ -127,11 +131,12 @@ func (h *Handler) Login(c *gin.Context) {
 		err  error
 	)
 
+	ctx := c.Request.Context()
 	switch req.Role {
 	case "patient":
-		user, err = h.Repo.GetPatientByEmail(req.Email)
+		user, err = h.Repo.GetPatientByEmail(ctx, req.Email)
 	case "doctor":
-		user, err = h.Repo.GetDoctorByEmail(req.Email)
+		user, err = h.Repo.GetDoctorByEmail(ctx, req.Email)
 	default:
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid role"})
 		return
@@ -148,17 +153,14 @@ func (h *Handler) Login(c *gin.Context) {
 	}
 
 	claims := jwt.MapClaims{
-		"sub":  user.GetID(),                              // "subject" (who the token is for)
-		"role": req.Role,                                  // custom claim for user role
-		"iat":  time.Now().Unix(),                         // "issued at"
-		"exp":  time.Now().Add(time.Hour * 24 * 7).Unix(), // "expires at" (e.g., 7 days)
-		"iss":  "vital-watch",                             // "issuer"
+		"sub":  user.GetID().String(),
+		"role": req.Role,
+		"iat":  time.Now().Unix(),
+		"exp":  time.Now().Add(time.Hour * 24 * 7).Unix(),
+		"iss":  "vital-watch",
 	}
 
-	// Create the token
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-
-	// Sign the token with the secret key
 	tokenString, err := token.SignedString(h.JWTSecret)
 	if err != nil {
 		log.Println("Failed to sign token:", err)
@@ -178,9 +180,9 @@ func (h *Handler) Register(c *gin.Context) {
 		LastName   string `json:"last_name"`
 		Email      string `json:"email"`
 		Password   string `json:"password"`
-		Specialty  string `json:"specialty,omitempty"`   // For doctors
-		Experience int    `json:"experience,omitempty"`  // For doctors
-		InviteCode string `json:"invite_code,omitempty"` // For doctors
+		Specialty  string `json:"specialty,omitempty"`
+		Experience int    `json:"experience,omitempty"`
+		InviteCode string `json:"invite_code,omitempty"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -204,7 +206,8 @@ func (h *Handler) Register(c *gin.Context) {
 		return
 	}
 
-	var id int
+	ctx := c.Request.Context()
+	var newID uuid.UUID
 	var err error
 	switch req.Role {
 	case "patient":
@@ -213,7 +216,7 @@ func (h *Handler) Register(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
 			return
 		}
-		id, err = h.Repo.CreatePatient(req.FirstName, req.LastName, req.Email, hashed)
+		newID, err = h.Repo.CreatePatient(ctx, req.FirstName, req.LastName, req.Email, hashed)
 	case "doctor":
 		if h.DoctorInviteCode == "" || req.InviteCode != h.DoctorInviteCode {
 			c.JSON(http.StatusForbidden, gin.H{"error": "Doctor registration is restricted or invalid invite code"})
@@ -224,26 +227,31 @@ func (h *Handler) Register(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
 			return
 		}
-		id, err = h.Repo.CreateDoctor(req.FirstName, req.LastName, req.Email, hashed, req.Specialty, req.Experience)
+		newID, err = h.Repo.CreateDoctor(ctx, req.FirstName, req.LastName, req.Email, hashed, req.Specialty, req.Experience)
 	default:
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid role"})
 		return
 	}
 
 	if err != nil {
+		if strings.Contains(err.Error(), "duplicate key") || strings.Contains(err.Error(), "users_email_key") {
+			c.JSON(http.StatusConflict, gin.H{"error": "An account with this email already exists"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create user"})
 		return
 	}
 
-	c.JSON(http.StatusCreated, gin.H{"id": id})
+	c.JSON(http.StatusCreated, gin.H{"id": newID})
 }
 
 func (h *Handler) GetUserProfile(c *gin.Context) {
-	userID, ok := c.Get("userID")
+	userIDVal, ok := c.Get("userID")
 	if !ok {
 		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "User ID not found in context"})
 		return
 	}
+	userID := userIDVal.(uuid.UUID)
 
 	role, ok := c.Get("role")
 	if !ok {
@@ -251,9 +259,10 @@ func (h *Handler) GetUserProfile(c *gin.Context) {
 		return
 	}
 
+	ctx := c.Request.Context()
 	switch role {
 	case "patient":
-		patient, err := h.Repo.GetPatientByID(userID.(int))
+		patient, err := h.Repo.GetPatientByID(ctx, userID)
 		if err != nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Patient profile not found"})
 			return
@@ -261,7 +270,7 @@ func (h *Handler) GetUserProfile(c *gin.Context) {
 		c.JSON(http.StatusOK, patient)
 
 	case "doctor":
-		doctor, err := h.Repo.GetDoctorByID(userID.(int))
+		doctor, err := h.Repo.GetDoctorByID(ctx, userID)
 		if err != nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Doctor profile not found"})
 			return
@@ -275,22 +284,23 @@ func (h *Handler) GetUserProfile(c *gin.Context) {
 
 // Patient Portal Handlers
 func (h *Handler) GetDoctors(c *gin.Context) {
-	doctors, err := h.Repo.GetDoctors()
+	doctors, err := h.Repo.GetDoctors(c.Request.Context())
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch doctors", "err": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch doctors"})
 		return
 	}
 	c.JSON(http.StatusOK, doctors)
 }
 
 func (h *Handler) GetPatientAppointments(c *gin.Context) {
-	patientID, ok := c.Get("userID")
+	userIDVal, ok := c.Get("userID")
 	if !ok {
 		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "User ID not found in context"})
 		return
 	}
+	patientID := userIDVal.(uuid.UUID)
 
-	appointments, err := h.Repo.GetAppointmentsByPatientID(patientID.(int))
+	appointments, err := h.Repo.GetAppointmentsByPatientID(c.Request.Context(), patientID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch appointments"})
 		return
@@ -299,13 +309,14 @@ func (h *Handler) GetPatientAppointments(c *gin.Context) {
 }
 
 func (h *Handler) GetPatientPrescriptions(c *gin.Context) {
-	patientID, ok := c.Get("userID")
+	userIDVal, ok := c.Get("userID")
 	if !ok {
 		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "User ID not found in context"})
 		return
 	}
+	patientID := userIDVal.(uuid.UUID)
 
-	prescriptions, err := h.Repo.GetPrescriptionsByPatientID(patientID.(int))
+	prescriptions, err := h.Repo.GetPrescriptionsByPatientID(c.Request.Context(), patientID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch prescriptions"})
 		return
@@ -315,7 +326,7 @@ func (h *Handler) GetPatientPrescriptions(c *gin.Context) {
 
 func (h *Handler) CreateAppointment(c *gin.Context) {
 	var req struct {
-		DoctorID  int       `json:"doctor_id"`
+		DoctorID  uuid.UUID `json:"doctor_id"`
 		StartTime time.Time `json:"start_time"`
 		EndTime   time.Time `json:"end_time"`
 		Type      string    `json:"type"`
@@ -326,15 +337,29 @@ func (h *Handler) CreateAppointment(c *gin.Context) {
 		return
 	}
 
-	patientID, ok := c.Get("userID")
+	if req.StartTime.IsZero() || req.EndTime.IsZero() || !req.EndTime.After(req.StartTime) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "end_time must be strictly after start_time"})
+		return
+	}
+
+	userIDVal, ok := c.Get("userID")
 	if !ok {
 		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "User ID not found in context"})
 		return
 	}
+	patientID := userIDVal.(uuid.UUID)
 
-	newID, err := h.Repo.CreateAppointment(patientID.(int), req.DoctorID, req.StartTime, req.EndTime, req.Type)
+	newID, err := h.Repo.CreateAppointment(c.Request.Context(), patientID, req.DoctorID, req.StartTime, req.EndTime, req.Type)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create appointment", "err": err.Error()})
+		if strings.Contains(err.Error(), "appointments_doctor_id_tstzrange_excl") || strings.Contains(err.Error(), "conflicting key") {
+			c.JSON(http.StatusConflict, gin.H{"error": "Doctor is already booked for this time slot"})
+			return
+		}
+		if strings.Contains(err.Error(), "appointments_doctor_id_fkey") {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid doctor ID: specified doctor does not exist"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create appointment"})
 		return
 	}
 
@@ -344,25 +369,25 @@ func (h *Handler) CreateAppointment(c *gin.Context) {
 func (h *Handler) DownloadPrescription(c *gin.Context) {
 	filename := c.Param("filename")
 
-	patientID, ok := c.Get("userID")
+	userIDVal, ok := c.Get("userID")
 	if !ok {
 		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "User ID not found in context"})
 		return
 	}
+	patientID := userIDVal.(uuid.UUID)
 
-	// SECURITY CHECK: Verify this patient owns this file
-	_, err := h.Repo.GetPrescriptionByFilename(patientID.(int), filename)
+	ctx := c.Request.Context()
+	_, err := h.Repo.GetPrescriptionByFilename(ctx, patientID, filename)
 	if err != nil {
 		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "You are not authorized to download this file"})
 		return
 	}
 
-	// Get the file from S3
 	getObjectInput := &s3.GetObjectInput{
 		Bucket: aws.String(h.BucketName),
 		Key:    aws.String(filename),
 	}
-	out, err := h.S3Client.GetObject(context.TODO(), getObjectInput)
+	out, err := h.S3Client.GetObject(ctx, getObjectInput)
 	if err != nil {
 		log.Printf("Failed to get object from S3: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve file"})
@@ -370,42 +395,39 @@ func (h *Handler) DownloadPrescription(c *gin.Context) {
 	}
 	defer out.Body.Close()
 
-	// Set headers to tell the browser to download it
 	c.Header("Content-Disposition", "attachment; filename="+filename)
 	c.Header("Content-Type", *out.ContentType)
 	c.Header("Content-Length", strconv.FormatInt(*out.ContentLength, 10))
 
-	// Stream the file
 	io.Copy(c.Writer, out.Body)
 }
 
 // Doctor Portal Handlers
 func (h *Handler) GetDoctorAppointments(c *gin.Context) {
-	doctorID, ok := c.Get("userID")
+	userIDVal, ok := c.Get("userID")
 	if !ok {
 		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "User ID not found in context"})
 		return
 	}
+	doctorID := userIDVal.(uuid.UUID)
 
-	// --- DEBUGGING: Log the doctorID ---
-	log.Printf("GetDoctorAppointments: Fetching appointments for doctorID: %d", doctorID.(int))
-
-	appointments, err := h.Repo.GetAppointmentsByDoctorID(doctorID.(int))
+	appointments, err := h.Repo.GetAppointmentsByDoctorID(c.Request.Context(), doctorID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch appointments", "err": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch appointments"})
 		return
 	}
 	c.JSON(http.StatusOK, appointments)
 }
 
 func (h *Handler) GetDoctorPatients(c *gin.Context) {
-	doctorID, ok := c.Get("userID")
+	userIDVal, ok := c.Get("userID")
 	if !ok {
 		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "User ID not found in context"})
 		return
 	}
+	doctorID := userIDVal.(uuid.UUID)
 
-	patients, err := h.Repo.GetPatientsByDoctorID(doctorID.(int))
+	patients, err := h.Repo.GetPatientsByDoctorID(c.Request.Context(), doctorID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch patients"})
 		return
@@ -414,20 +436,20 @@ func (h *Handler) GetDoctorPatients(c *gin.Context) {
 }
 
 func (h *Handler) GetPatientHistoryAppointments(c *gin.Context) {
-	doctorID, ok := c.Get("userID")
+	userIDVal, ok := c.Get("userID")
 	if !ok {
 		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "User ID not found in context"})
 		return
 	}
+	doctorID := userIDVal.(uuid.UUID)
 
-	patientIDStr := c.Param("id")
-	patientID, err := strconv.Atoi(patientIDStr)
+	patientID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid patient ID"})
 		return
 	}
 
-	appointments, err := h.Repo.GetAppointmentsForPatient(doctorID.(int), patientID)
+	appointments, err := h.Repo.GetAppointmentsForPatient(c.Request.Context(), doctorID, patientID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch appointments"})
 		return
@@ -437,20 +459,20 @@ func (h *Handler) GetPatientHistoryAppointments(c *gin.Context) {
 }
 
 func (h *Handler) GetPatientHistoryPrescriptions(c *gin.Context) {
-	doctorID, ok := c.Get("userID")
+	userIDVal, ok := c.Get("userID")
 	if !ok {
 		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "User ID not found in context"})
 		return
 	}
+	doctorID := userIDVal.(uuid.UUID)
 
-	patientIDStr := c.Param("id")
-	patientID, err := strconv.Atoi(patientIDStr)
+	patientID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid patient ID"})
 		return
 	}
 
-	prescriptions, err := h.Repo.GetPrescriptionsForPatient(doctorID.(int), patientID)
+	prescriptions, err := h.Repo.GetPrescriptionsForPatient(c.Request.Context(), doctorID, patientID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch prescriptions"})
 		return
@@ -460,39 +482,42 @@ func (h *Handler) GetPatientHistoryPrescriptions(c *gin.Context) {
 }
 
 func (h *Handler) CreatePrescription(c *gin.Context) {
-	doctorID, ok := c.Get("userID")
+	userIDVal, ok := c.Get("userID")
 	if !ok {
 		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "User ID not found in context"})
 		return
 	}
+	doctorID := userIDVal.(uuid.UUID)
 
-	if err := c.Request.ParseMultipartForm(10 << 20); err != nil { // 10 MB Max File Size
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to parse form", "err": err.Error()})
+	if err := c.Request.ParseMultipartForm(10 << 20); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to parse form"})
 		return
 	}
 
 	patientIDStr := c.Request.FormValue("patientID")
-	medication := c.Request.FormValue("medication")
-	notes := c.Request.FormValue("notes")
-
-	patientID, err := strconv.Atoi(patientIDStr)
+	if patientIDStr == "" {
+		patientIDStr = c.Request.FormValue("patient_id")
+	}
+	patientID, err := uuid.Parse(patientIDStr)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid patientID", "err": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid patient ID"})
 		return
 	}
 
+	medication := c.Request.FormValue("medication")
+	notes := c.Request.FormValue("notes")
+
 	file, header, err := c.Request.FormFile("file")
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "File is required", "err": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "File is required"})
 		return
 	}
 	defer file.Close()
 
-	// Generate a unique filename
-	ext := filepath.Ext(header.Filename) // Get .pdf or .jpg
-	uniqueFilename := fmt.Sprintf("prescription-%s-%s%s", patientIDStr, uuid.New().String(), ext)
+	ext := filepath.Ext(header.Filename)
+	uniqueFilename := fmt.Sprintf("prescription-%s-%s%s", patientID.String(), uuid.New().String(), ext)
 
-	// Upload to S3
+	ctx := c.Request.Context()
 	putObjectInput := &s3.PutObjectInput{
 		Bucket:        aws.String(h.BucketName),
 		Key:           aws.String(uniqueFilename),
@@ -501,30 +526,31 @@ func (h *Handler) CreatePrescription(c *gin.Context) {
 		ContentType:   aws.String(header.Header.Get("Content-Type")),
 	}
 
-	_, err = h.S3Client.PutObject(context.TODO(), putObjectInput)
+	_, err = h.S3Client.PutObject(ctx, putObjectInput)
 	if err != nil {
 		log.Printf("Failed to upload file to S3: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save file", "err": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save file"})
 		return
 	}
 
-	// Save metadata to database
-	newID, err := h.Repo.CreatePrescription(patientID, doctorID.(int), medication, notes, uniqueFilename)
+	newID, err := h.Repo.CreatePrescription(ctx, patientID, doctorID, medication, notes, uniqueFilename)
 	if err != nil {
 		log.Printf("Failed to create prescription in DB: %v", err)
-		// If DB save fails, roll back S3 upload
+		// If DB save fails, roll back S3 upload with timeout
 		go func() {
-			log.Printf("Rolling back S3 upload for key: %s", uniqueFilename)
+			rbCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+
 			deleteObjectInput := &s3.DeleteObjectInput{
 				Bucket: aws.String(h.BucketName),
 				Key:    aws.String(uniqueFilename),
 			}
-			_, delErr := h.S3Client.DeleteObject(context.TODO(), deleteObjectInput)
+			_, delErr := h.S3Client.DeleteObject(rbCtx, deleteObjectInput)
 			if delErr != nil {
 				log.Printf("CRITICAL: Failed to rollback S3 upload: %v", delErr)
 			}
 		}()
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create prescription record", "err": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create prescription record"})
 		return
 	}
 
@@ -532,20 +558,20 @@ func (h *Handler) CreatePrescription(c *gin.Context) {
 }
 
 func (h *Handler) MarkAppointmentAsCompleted(c *gin.Context) {
-	doctorID, ok := c.Get("userID")
+	userIDVal, ok := c.Get("userID")
 	if !ok {
 		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Doctor ID not found in context"})
 		return
 	}
+	doctorID := userIDVal.(uuid.UUID)
 
-	appointmentIDStr := c.Param("id")
-	appointmentID, err := strconv.Atoi(appointmentIDStr)
+	appointmentID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid appointment ID"})
 		return
 	}
 
-	updated, err := h.Repo.UpdateAppointmentAsCompletedForDoctor(appointmentID, doctorID.(int))
+	updated, err := h.Repo.UpdateAppointmentAsCompletedForDoctor(c.Request.Context(), appointmentID, doctorID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to mark appointment as completed"})
 		return
@@ -562,26 +588,25 @@ func (h *Handler) MarkAppointmentAsCompleted(c *gin.Context) {
 func (h *Handler) DoctorDownloadPrescription(c *gin.Context) {
 	filename := c.Param("filename")
 
-	doctorID, ok := c.Get("userID")
+	userIDVal, ok := c.Get("userID")
 	if !ok {
 		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "User ID not found in context"})
 		return
 	}
+	doctorID := userIDVal.(uuid.UUID)
 
-	// SECURITY CHECK: Verify this doctor is associated with this file
-	_, err := h.Repo.GetPrescriptionByFilenameForDoctor(doctorID.(int), filename)
+	ctx := c.Request.Context()
+	_, err := h.Repo.GetPrescriptionByFilenameForDoctor(ctx, doctorID, filename)
 	if err != nil {
-		log.Printf("Doctor download auth failed: %v", err)
 		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "You are not authorized to download this file"})
 		return
 	}
 
-	// Get the file from S3
 	getObjectInput := &s3.GetObjectInput{
 		Bucket: aws.String(h.BucketName),
 		Key:    aws.String(filename),
 	}
-	out, err := h.S3Client.GetObject(context.TODO(), getObjectInput)
+	out, err := h.S3Client.GetObject(ctx, getObjectInput)
 	if err != nil {
 		log.Printf("Failed to get object from S3: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve file"})

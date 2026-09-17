@@ -27,7 +27,7 @@
   - *Fix*: Create role guard middlewares (`RequireRole("doctor")`, `RequireRole("patient")`) and apply them to respective route groups.
   - *File*: `internal/api/handlers.go`, `cmd/main/main.go`
 
-- [ ] **SEC-04: Prevent Colliding User IDs Across Doctors and Patients**
+- [x] **SEC-04: Prevent Colliding User IDs Across Doctors and Patients**
   - *Issue*: `patients` and `doctors` both use auto-incrementing integer IDs starting at 1. Patient #1 and Doctor #1 share ID `1`, enabling cross-role impersonation in ambiguous queries.
   - *Fix*: Migrate to unified `users` table with UUIDs, or enforce table-qualified lookup with strict role verification.
   - *File*: `migrations/`, `internal/models/models.go`, `internal/repository/db.go`
@@ -56,13 +56,38 @@
 
 ## 🟡 Phase 2: Data Integrity & Architectural Hardening (P1)
 
-- [ ] **ARCH-01: Unified Identity Schema Migration**
-  - *Goal*: Consolidate `patients` and `doctors` into `users` (`id UUID`, `email`, `role`, `hashed_password`) + `patient_profiles` and `doctor_profiles`.
-  - *File*: `migrations/000003_unified_users.up.sql`, `internal/models/`
+- [x] **ARCH-01: Unified Identity Schema Migration**
+  - *Goal*: Consolidate `patients` and `doctors` into `users` (`id UUID`, `email`, `role`, `hashed_password`) + `patient_profiles` and `doctor_profiles`. Consolidated cleanly into `000001_init_schema.up.sql` for pre-launch greenfield setup.
+  - *File*: `migrations/000001_init_schema.up.sql`, `internal/models/`
 
-- [ ] **DB-02: Double-Booking Prevention via Exclusion Constraints**
+- [x] **DB-02: Double-Booking Prevention via Exclusion Constraints**
   - *Goal*: Enforce Postgres `EXCLUDE USING gist (doctor_id WITH =, tstzrange(start_time, end_time) WITH &&)` so no two appointments can overlap.
   - *File*: `migrations/`, `internal/repository/db.go`
+
+- [x] **SEC-10: Verify Doctor Role in Appointment Creation**
+  - *Issue*: `CreateAppointment` does not verify that `doctor_id` has `role = 'doctor'` (the foreign key in `appointments` only references `users(id)`). A patient could submit another patient's UUID as `doctor_id`.
+  - *Fix*: Validate `doctor_id` is an active doctor in `doctor_profiles` or via `users.role = 'doctor'` before scheduling.
+  - *File*: `internal/api/handlers.go`, `internal/repository/db.go`
+
+- [x] **SEC-11: Authorize Prescribing Doctor on File Download**
+  - *Issue*: `GetPrescriptionByFilenameForDoctor` strictly joins `appointments`. If a doctor created a prescription directly without an appointment record, the doctor who authored the prescription cannot download the file.
+  - *Fix*: Update query to allow download if `p.doctor_id = $2 OR EXISTS (SELECT 1 FROM appointments a WHERE a.patient_id = p.patient_id AND a.doctor_id = $2)`.
+  - *File*: `internal/repository/db.go`
+
+- [x] **API-07: Handle Duplicate Email Conflict with HTTP 409**
+  - *Issue*: When registration fails due to duplicate email (`users_email_key` unique violation), `Register` returns `500 Internal Server Error` instead of `409 Conflict`.
+  - *Fix*: Catch unique constraint violations and return `409 Conflict: {"error": "An account with this email already exists"}`.
+  - *File*: `internal/api/handlers.go`
+
+- [x] **API-08: Add Timeout to S3 Rollback Goroutine**
+  - *Issue*: S3 rollback in `CreatePrescription` runs in a background goroutine using untimed `context.Background()`, risking leaked/hanging goroutines on network issues.
+  - *Fix*: Use `context.WithTimeout(context.Background(), 15*time.Second)` with `defer cancel()`.
+  - *File*: `internal/api/handlers.go`
+
+- [x] **CODE-01: Standardize Repository Parameter Ordering & Remove Dead Code**
+  - *Issue*: Repository methods have inconsistent argument orders (e.g. `(patientID, doctorID)` vs `(doctorID, patientID)`), prone to transposed UUID bugs. `UpdateAppointmentAsCompleted` is dead code lacking ownership verification.
+  - *Fix*: Standardize method parameter signatures and delete unused `UpdateAppointmentAsCompleted`.
+  - *File*: `internal/repository/db.go`
 
 - [ ] **API-04: Appointment Input Validation**
   - *Goal*: Reject invalid appointment requests where `start_time <= now()`, `end_time <= start_time`, unrealistic durations, or invalid `appointment_type` enums.
@@ -78,7 +103,7 @@
   - *Fix*: Whitelist extensions (`.pdf`, `.jpg`, `.jpeg`, `.png`), validate MIME/magic bytes with `http.DetectContentType`, and sanitize storage filenames.
   - *File*: `internal/api/handlers.go`
 
-- [ ] **API-05: Context Propagation & Request Cancellation**
+- [x] **API-05: Context Propagation & Request Cancellation**
   - *Goal*: Propagate `c.Request.Context()` down to repository queries (`QueryContext`, `ExecContext`) and AWS SDK calls to cancel in-flight work when clients disconnect.
   - *File*: `internal/repository/db.go`, `internal/api/handlers.go`
 
@@ -99,7 +124,7 @@
   - *Goal*: Replace `r.Run()` with `http.Server` and listen for `SIGINT`/`SIGTERM` to safely drain in-flight requests.
   - *File*: `cmd/main/main.go`
 
-- [ ] **DB-04: Add Missing Database Indexes**
+- [x] **DB-04: Add Missing Database Indexes**
   - *Goal*: Add B-tree indexes for `appointments(doctor_id, start_time)`, `appointments(patient_id)`, and `prescriptions(patient_id, file_name)`.
   - *File*: `migrations/`
 
@@ -111,7 +136,7 @@
   - *Goal*: Introduce `type Querier interface` so handlers can be unit-tested using mocks without requiring a live PostgreSQL instance.
   - *File*: `internal/repository/`, `internal/api/handlers.go`
 
-- [ ] **API-06: Model JSON Key Standardization**
+- [x] **API-06: Model JSON Key Standardization**
   - *Goal*: Standardize inconsistent `camelCase` keys (`doctorName`, `patientName`, `specialty`) to `snake_case` across models.
   - *File*: `internal/models/models.go`
 

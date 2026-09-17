@@ -3,26 +3,27 @@ package api
 import (
 	"net/http"
 	"net/http/httptest"
-	"testing"
 	"strings"
+	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 )
 
 func init() {
 	gin.SetMode(gin.TestMode)
 }
 
-func generateTestToken(secret []byte, userID int, role string, expired bool) string {
+func generateTestToken(secret []byte, userID uuid.UUID, role string, expired bool) string {
 	exp := time.Now().Add(time.Hour * 1).Unix()
 	if expired {
 		exp = time.Now().Add(-time.Hour * 1).Unix()
 	}
 
 	claims := jwt.MapClaims{
-		"sub":  userID,
+		"sub":  userID.String(),
 		"role": role,
 		"iat":  time.Now().Unix(),
 		"exp":  exp,
@@ -37,6 +38,7 @@ func generateTestToken(secret []byte, userID int, role string, expired bool) str
 func TestAuthMiddleware(t *testing.T) {
 	testSecret := []byte("correct-test-secret-key")
 	wrongSecret := []byte("wrong-test-secret-key")
+	testID := uuid.New()
 
 	r := gin.New()
 	r.Use(AuthMiddleware(testSecret))
@@ -66,17 +68,17 @@ func TestAuthMiddleware(t *testing.T) {
 		},
 		{
 			name:           "Token signed with wrong secret",
-			authHeader:     "Bearer " + generateTestToken(wrongSecret, 1, "patient", false),
+			authHeader:     "Bearer " + generateTestToken(wrongSecret, testID, "patient", false),
 			expectedStatus: http.StatusUnauthorized,
 		},
 		{
 			name:           "Expired token",
-			authHeader:     "Bearer " + generateTestToken(testSecret, 1, "patient", true),
+			authHeader:     "Bearer " + generateTestToken(testSecret, testID, "patient", true),
 			expectedStatus: http.StatusUnauthorized,
 		},
 		{
-			name:           "Valid token",
-			authHeader:     "Bearer " + generateTestToken(testSecret, 42, "doctor", false),
+			name:           "Valid token with UUID",
+			authHeader:     "Bearer " + generateTestToken(testSecret, testID, "doctor", false),
 			expectedStatus: http.StatusOK,
 		},
 	}
@@ -117,7 +119,7 @@ func TestRequireRoleMiddleware(t *testing.T) {
 	})
 
 	// 1. Doctor token accessing doctor-only endpoint -> Expect 200
-	doctorToken := generateTestToken(testSecret, 1, "doctor", false)
+	doctorToken := generateTestToken(testSecret, uuid.New(), "doctor", false)
 	w1 := httptest.NewRecorder()
 	req1, _ := http.NewRequest(http.MethodGet, "/api/doctor/dashboard", nil)
 	req1.Header.Set("Authorization", "Bearer "+doctorToken)
@@ -136,7 +138,7 @@ func TestRequireRoleMiddleware(t *testing.T) {
 	}
 
 	// 3. Patient token accessing patient-only endpoint -> Expect 200
-	patientToken := generateTestToken(testSecret, 2, "patient", false)
+	patientToken := generateTestToken(testSecret, uuid.New(), "patient", false)
 	w3 := httptest.NewRecorder()
 	req3, _ := http.NewRequest(http.MethodGet, "/api/patient/records", nil)
 	req3.Header.Set("Authorization", "Bearer "+patientToken)
@@ -156,7 +158,6 @@ func TestRequireRoleMiddleware(t *testing.T) {
 }
 
 func TestDoctorRegistrationValidation(t *testing.T) {
-	// Setup handler with configured invite code
 	h := &Handler{
 		DoctorInviteCode: "valid-invite-code",
 	}
