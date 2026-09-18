@@ -2,30 +2,28 @@ package api
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 
 	"github.com/RitwikGupta-0501/vital-watch/internal/models"
 	"github.com/RitwikGupta-0501/vital-watch/internal/repository"
+	"github.com/RitwikGupta-0501/vital-watch/internal/storage"
 	"github.com/RitwikGupta-0501/vital-watch/utils"
 )
 
 type Handler struct {
 	Repo             *repository.Repository
-	S3Client         *s3.Client
-	BucketName       string
+	Storage          storage.Provider
 	JWTSecret        []byte
 	DoctorInviteCode string
 }
@@ -366,6 +364,7 @@ func (h *Handler) CreateAppointment(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{"id": newID})
 }
 
+// DownloadPrescription provides a pre-signed direct download URL to the authorized patient
 func (h *Handler) DownloadPrescription(c *gin.Context) {
 	filename := c.Param("filename")
 
@@ -379,27 +378,26 @@ func (h *Handler) DownloadPrescription(c *gin.Context) {
 	ctx := c.Request.Context()
 	_, err := h.Repo.GetPrescriptionByFilename(ctx, patientID, filename)
 	if err != nil {
-		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "You are not authorized to download this file"})
+		if errors.Is(err, sql.ErrNoRows) {
+			c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "Prescription not found or access denied"})
+			return
+		}
+		log.Printf("Database error fetching prescription: %v", err)
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Internal database error"})
 		return
 	}
 
-	getObjectInput := &s3.GetObjectInput{
-		Bucket: aws.String(h.BucketName),
-		Key:    aws.String(filename),
-	}
-	out, err := h.S3Client.GetObject(ctx, getObjectInput)
+	downloadURL, err := h.Storage.GenerateDownloadURL(ctx, filename, 5*time.Minute)
 	if err != nil {
-		log.Printf("Failed to get object from S3: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve file"})
+		log.Printf("Failed to generate download URL: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate download URL"})
 		return
 	}
-	defer out.Body.Close()
 
-	c.Header("Content-Disposition", "attachment; filename="+filename)
-	c.Header("Content-Type", *out.ContentType)
-	c.Header("Content-Length", strconv.FormatInt(*out.ContentLength, 10))
-
-	io.Copy(c.Writer, out.Body)
+	c.JSON(http.StatusOK, gin.H{
+		"download_url": downloadURL,
+		"expires_in":   300,
+	})
 }
 
 // Doctor Portal Handlers
@@ -481,6 +479,48 @@ func (h *Handler) GetPatientHistoryPrescriptions(c *gin.Context) {
 	c.JSON(http.StatusOK, prescriptions)
 }
 
+// GetPrescriptionUploadURL generates a guarded pre-signed upload URL for direct cloud upload
+func (h *Handler) GetPrescriptionUploadURL(c *gin.Context) {
+	var req struct {
+		PatientID   uuid.UUID `json:"patient_id"`
+		Filename    string    `json:"filename"`
+		ContentType string    `json:"content_type"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+
+	if req.PatientID == uuid.Nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "A valid patient_id is required"})
+		return
+	}
+
+	if err := storage.ValidatePrescriptionFileType(req.Filename, req.ContentType); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	ext := strings.ToLower(filepath.Ext(req.Filename))
+	uniqueFilename := fmt.Sprintf("prescription-%s-%s%s", req.PatientID.String(), uuid.New().String(), ext)
+
+	ctx := c.Request.Context()
+	uploadURL, err := h.Storage.GenerateUploadURL(ctx, uniqueFilename, req.ContentType, 5*time.Minute)
+	if err != nil {
+		log.Printf("Failed to generate upload URL: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate upload URL"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"upload_url": uploadURL,
+		"file_key":   uniqueFilename,
+		"expires_in": 300,
+	})
+}
+
+// CreatePrescription persists the prescription record once the file has been uploaded
 func (h *Handler) CreatePrescription(c *gin.Context) {
 	userIDVal, ok := c.Get("userID")
 	if !ok {
@@ -489,72 +529,67 @@ func (h *Handler) CreatePrescription(c *gin.Context) {
 	}
 	doctorID := userIDVal.(uuid.UUID)
 
-	if err := c.Request.ParseMultipartForm(10 << 20); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to parse form"})
+	var req struct {
+		PatientID  uuid.UUID `json:"patient_id"`
+		Medication string    `json:"medication"`
+		Notes      string    `json:"notes"`
+		FileName   string    `json:"file_name"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
 		return
 	}
 
-	patientIDStr := c.Request.FormValue("patientID")
-	if patientIDStr == "" {
-		patientIDStr = c.Request.FormValue("patient_id")
-	}
-	patientID, err := uuid.Parse(patientIDStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid patient ID"})
+	if req.PatientID == uuid.Nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "A valid patient_id is required"})
 		return
 	}
 
-	medication := c.Request.FormValue("medication")
-	notes := c.Request.FormValue("notes")
-
-	file, header, err := c.Request.FormFile("file")
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "File is required"})
+	req.Medication = strings.TrimSpace(req.Medication)
+	if req.Medication == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Medication is required"})
 		return
 	}
-	defer file.Close()
 
-	ext := filepath.Ext(header.Filename)
-	uniqueFilename := fmt.Sprintf("prescription-%s-%s%s", patientID.String(), uuid.New().String(), ext)
+	req.FileName = strings.TrimSpace(req.FileName)
+	if req.FileName == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "File name (storage key) is required"})
+		return
+	}
+
+	if !storage.IsValidPrescriptionKey(req.PatientID, req.FileName) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid or unauthorized file key"})
+		return
+	}
 
 	ctx := c.Request.Context()
-	putObjectInput := &s3.PutObjectInput{
-		Bucket:        aws.String(h.BucketName),
-		Key:           aws.String(uniqueFilename),
-		Body:          file,
-		ContentLength: aws.Int64(header.Size),
-		ContentType:   aws.String(header.Header.Get("Content-Type")),
-	}
-
-	_, err = h.S3Client.PutObject(ctx, putObjectInput)
+	exists, err := h.Storage.ObjectExists(ctx, req.FileName)
 	if err != nil {
-		log.Printf("Failed to upload file to S3: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save file"})
+		log.Printf("Storage error verifying object existence: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify file upload status"})
 		return
 	}
-
-	newID, err := h.Repo.CreatePrescription(ctx, patientID, doctorID, medication, notes, uniqueFilename)
+	if !exists {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Uploaded file not found in storage. Please upload the file first"})
+		return
+	}
+	newID, err := h.Repo.CreatePrescription(ctx, req.PatientID, doctorID, req.Medication, req.Notes, req.FileName)
 	if err != nil {
 		log.Printf("Failed to create prescription in DB: %v", err)
-		// If DB save fails, roll back S3 upload with timeout
+		// Clean up uploaded file if DB record insertion fails
 		go func() {
 			rbCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
-
-			deleteObjectInput := &s3.DeleteObjectInput{
-				Bucket: aws.String(h.BucketName),
-				Key:    aws.String(uniqueFilename),
-			}
-			_, delErr := h.S3Client.DeleteObject(rbCtx, deleteObjectInput)
-			if delErr != nil {
-				log.Printf("CRITICAL: Failed to rollback S3 upload: %v", delErr)
+			if delErr := h.Storage.DeleteFile(rbCtx, req.FileName); delErr != nil {
+				log.Printf("CRITICAL: Failed to rollback storage file: %v", delErr)
 			}
 		}()
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create prescription record"})
 		return
 	}
 
-	c.JSON(http.StatusCreated, gin.H{"id": newID, "filename": uniqueFilename})
+	c.JSON(http.StatusCreated, gin.H{"id": newID, "filename": req.FileName})
 }
 
 func (h *Handler) MarkAppointmentAsCompleted(c *gin.Context) {
@@ -585,6 +620,7 @@ func (h *Handler) MarkAppointmentAsCompleted(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Appointment marked as completed"})
 }
 
+// DoctorDownloadPrescription provides a pre-signed direct download URL to the authorized doctor
 func (h *Handler) DoctorDownloadPrescription(c *gin.Context) {
 	filename := c.Param("filename")
 
@@ -598,25 +634,24 @@ func (h *Handler) DoctorDownloadPrescription(c *gin.Context) {
 	ctx := c.Request.Context()
 	_, err := h.Repo.GetPrescriptionByFilenameForDoctor(ctx, doctorID, filename)
 	if err != nil {
-		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "You are not authorized to download this file"})
+		if errors.Is(err, sql.ErrNoRows) {
+			c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "Prescription not found or access denied"})
+			return
+		}
+		log.Printf("Database error fetching prescription: %v", err)
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Internal database error"})
 		return
 	}
 
-	getObjectInput := &s3.GetObjectInput{
-		Bucket: aws.String(h.BucketName),
-		Key:    aws.String(filename),
-	}
-	out, err := h.S3Client.GetObject(ctx, getObjectInput)
+	downloadURL, err := h.Storage.GenerateDownloadURL(ctx, filename, 5*time.Minute)
 	if err != nil {
-		log.Printf("Failed to get object from S3: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve file"})
+		log.Printf("Failed to generate download URL: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate download URL"})
 		return
 	}
-	defer out.Body.Close()
 
-	c.Header("Content-Disposition", "attachment; filename="+filename)
-	c.Header("Content-Type", *out.ContentType)
-	c.Header("Content-Length", strconv.FormatInt(*out.ContentLength, 10))
-
-	io.Copy(c.Writer, out.Body)
+	c.JSON(http.StatusOK, gin.H{
+		"download_url": downloadURL,
+		"expires_in":   300,
+	})
 }

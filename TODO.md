@@ -93,12 +93,12 @@
   - *Goal*: Reject invalid appointment requests where `start_time <= now()`, `end_time <= start_time`, unrealistic durations, or invalid `appointment_type` enums.
   - *File*: `internal/api/handlers.go`
 
-- [ ] **S3-01: Replace S3 Backend Streaming with Direct Pre-Signed URLs**
+- [x] **S3-01: Replace S3 Backend Streaming with Direct Pre-Signed URLs**
   - *Issue*: Backend currently proxies files via `io.Copy(c.Writer, out.Body)`, burning Go memory and bandwidth.
   - *Fix*: Implement `POST /api/prescriptions/upload-url` and `GET /api/prescriptions/:id/download-url` returning short-lived (5 min) S3 Pre-signed URLs.
   - *File*: `internal/api/handlers.go`
 
-- [ ] **SEC-08: File Upload Sanitization & Stored XSS Prevention**
+- [x] **SEC-08: File Upload Sanitization & Stored XSS Prevention**
   - *Issue*: `CreatePrescription` accepts any file extension and content-type without validation, risking malicious uploads or Stored XSS.
   - *Fix*: Whitelist extensions (`.pdf`, `.jpg`, `.jpeg`, `.png`), validate MIME/magic bytes with `http.DetectContentType`, and sanitize storage filenames.
   - *File*: `internal/api/handlers.go`

@@ -21,6 +21,7 @@ import (
 
 	"github.com/RitwikGupta-0501/vital-watch/internal/api"
 	"github.com/RitwikGupta-0501/vital-watch/internal/repository"
+	"github.com/RitwikGupta-0501/vital-watch/internal/storage"
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -129,19 +130,53 @@ func main() {
 	// Run DB migrations
 	run_migrations(db)
 
-	// Initialize AWS S3 Client
-	log.Println("Initializing AWS Config...")
-	cfg, err := config.LoadDefaultConfig(context.TODO())
-	if err != nil {
-		log.Fatal("Failed to load AWS config:", err)
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
 	}
 
-	s3Client := s3.NewFromConfig(cfg)
-	bucketName := os.Getenv("S3_BUCKET_NAME")
-	if bucketName == "" {
-		log.Fatal("S3_BUCKET_NAME environment variable is not set")
+	// Initialize Storage Provider (S3 or Local Disk)
+	storageType := os.Getenv("STORAGE_PROVIDER")
+	if storageType == "" {
+		storageType = "local"
 	}
-	log.Println("Successfully initialized S3 Client")
+
+	var storageProvider storage.Provider
+	switch storageType {
+	case "s3":
+		log.Println("Initializing AWS Config for S3 Storage Provider...")
+		cfg, err := config.LoadDefaultConfig(context.TODO())
+		if err != nil {
+			log.Fatal("Failed to load AWS config:", err)
+		}
+		bucketName := os.Getenv("S3_BUCKET_NAME")
+		if bucketName == "" {
+			log.Fatal("S3_BUCKET_NAME environment variable is not set")
+		}
+		s3Client := s3.NewFromConfig(cfg)
+		storageProvider = storage.NewS3Provider(s3Client, bucketName)
+		log.Println("Successfully initialized S3 Storage Provider")
+
+	default: // "local"
+		log.Println("Initializing Local Disk Storage Provider...")
+		localStorageURL := os.Getenv("LOCAL_STORAGE_BASE_URL")
+		if localStorageURL == "" {
+			localStorageURL = "http://localhost:" + port
+		}
+		localSecretStr := os.Getenv("LOCAL_STORAGE_SECRET")
+		var localSecret []byte
+		if localSecretStr != "" {
+			localSecret = []byte(localSecretStr)
+		} else {
+			localSecret = jwtSecret
+		}
+		localProv, err := storage.NewLocalProvider("./storage", localStorageURL, localSecret)
+		if err != nil {
+			log.Fatal("Failed to initialize local storage:", err)
+		}
+		storageProvider = localProv
+		log.Println("Successfully initialized Local Storage Provider (Base URL:", localStorageURL, ")")
+	}
 
 	// Initialize repository
 	repo := &repository.Repository{
@@ -151,8 +186,7 @@ func main() {
 	// Create the API Handler
 	h := &api.Handler{
 		Repo:             repo,
-		S3Client:         s3Client,
-		BucketName:       bucketName,
+		Storage:          storageProvider,
 		JWTSecret:        jwtSecret,
 		DoctorInviteCode: doctorInviteCode,
 	}
@@ -207,7 +241,8 @@ func main() {
 			patientGroup.GET("/patient/appointments", h.GetPatientAppointments)
 			patientGroup.GET("/patient/prescriptions", h.GetPatientPrescriptions)
 			patientGroup.POST("/appointments", h.CreateAppointment)
-			patientGroup.GET("/prescriptions/:filename", h.DownloadPrescription)
+			patientGroup.GET("/prescriptions/:filename/download-url", h.DownloadPrescription)
+			patientGroup.GET("/prescriptions/:filename", h.DownloadPrescription) // alias
 		}
 
 		// Doctor-only Routes
@@ -216,18 +251,22 @@ func main() {
 		{
 			doctorGroup.GET("/doctor/appointments", h.GetDoctorAppointments)
 			doctorGroup.GET("/doctor/patients", h.GetDoctorPatients)
+			doctorGroup.POST("/prescriptions/upload-url", h.GetPrescriptionUploadURL)
 			doctorGroup.POST("/prescriptions", h.CreatePrescription)
-			doctorGroup.GET("/doctor/prescriptions/:filename", h.DoctorDownloadPrescription)
+			doctorGroup.GET("/doctor/prescriptions/:filename/download-url", h.DoctorDownloadPrescription)
+			doctorGroup.GET("/doctor/prescriptions/:filename", h.DoctorDownloadPrescription) // alias
 			doctorGroup.GET("/doctor/patients/:id/appointments", h.GetPatientHistoryAppointments)
 			doctorGroup.GET("/doctor/patients/:id/prescriptions", h.GetPatientHistoryPrescriptions)
 			doctorGroup.PATCH("/appointments/:id", h.MarkAppointmentAsCompleted)
 		}
 	}
 
-	// Run the server
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
+	// Local development file routes with cryptographic HMAC pre-signing
+	if storageType == "local" {
+		r.PUT("/storage/upload", h.HandleLocalStorageUpload)
+		r.GET("/storage/download", h.HandleLocalStorageDownload)
 	}
+
+	// Run the server
 	r.Run(":" + port)
 }
