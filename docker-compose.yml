@@ -23,8 +23,8 @@ services:
       POSTGRES_DB: appdb
     ports:
       - "5432:5432"
-    
-    # We are using tmpfs as I dont want persistent storage during development
-    # TODO: Change this to a volume for production deployments
-    tmpfs:
-      - /var/lib/postgresql/data:size=1g
+    volumes:
+      - vital-watch-db-data:/var/lib/postgresql/data
+
+volumes:
+  vital-watch-db-data:
