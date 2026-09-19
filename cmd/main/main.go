@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"net/http"
+	"os/signal"
+	"syscall"
 	"strconv"
 	"strings"
 	"time"
@@ -16,7 +19,7 @@ import (
 	"github.com/joho/godotenv"
 
 	"github.com/golang-migrate/migrate/v4"
-	"github.com/golang-migrate/migrate/v4/database/postgres"
+	pgxmigrate "github.com/golang-migrate/migrate/v4/database/pgx/v5"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 
 	"github.com/RitwikGupta-0501/vital-watch/internal/api"
@@ -55,6 +58,12 @@ func init_db() *sql.DB {
 		log.Fatal("Failed to open database connection:", err)
 	}
 
+	// Tune database connection pool settings (DB-03)
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(25)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	db.SetConnMaxIdleTime(2 * time.Minute)
+
 	// --- NEW: Add a retry loop for db.Ping() ---
 	var dbErr error
 	for i := 0; i < 5; i++ { // Try 5 times
@@ -80,13 +89,13 @@ func init_db() *sql.DB {
 */
 func run_migrations(db *sql.DB) {
 	log.Println("Running database migrations...")
-	driver, err := postgres.WithInstance(db, &postgres.Config{})
+	driver, err := pgxmigrate.WithInstance(db, &pgxmigrate.Config{})
 	if err != nil {
 		log.Fatal("Failed to create migration driver:", err)
 	}
 
 	// Point to the migration files
-	m, err := migrate.NewWithDatabaseInstance("file://./migrations", "postgres", driver)
+	m, err := migrate.NewWithDatabaseInstance("file://./migrations", "pgx5", driver)
 	if err != nil {
 		log.Fatal("Failed to create migration instance:", err)
 	}
@@ -178,10 +187,8 @@ func main() {
 		log.Println("Successfully initialized Local Storage Provider (Base URL:", localStorageURL, ")")
 	}
 
-	// Initialize repository
-	repo := &repository.Repository{
-		DB: db,
-	}
+	// Initialize repository (ARCH-02)
+	repo := repository.New(db)
 
 	// Create the API Handler
 	h := &api.Handler{
@@ -267,6 +274,36 @@ func main() {
 		r.GET("/storage/download", h.HandleLocalStorageDownload)
 	}
 
-	// Run the server
-	r.Run(":" + port)
+	// Set up HTTP Server with timeouts (OPS-02)
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           r,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	// Run server in a goroutine
+	go func() {
+		log.Printf("Starting HTTP server on port %s...", port)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("HTTP server listen error: %v", err)
+		}
+	}()
+
+	// Listen for OS signals for graceful shutdown (OPS-02)
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	sig := <-quit
+	log.Printf("Received shutdown signal (%v). Draining in-flight connections...", sig)
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Server forced to shutdown: %v", err)
+	}
+
+	log.Println("Server exited gracefully.")
 }
