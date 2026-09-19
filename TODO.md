@@ -89,7 +89,7 @@
   - *Fix*: Standardize method parameter signatures and delete unused `UpdateAppointmentAsCompleted`.
   - *File*: `internal/repository/db.go`
 
-- [ ] **API-04: Appointment Input Validation**
+- [x] **API-04: Appointment Input Validation**
   - *Goal*: Reject invalid appointment requests where `start_time <= now()`, `end_time <= start_time`, unrealistic durations, or invalid `appointment_type` enums.
   - *File*: `internal/api/handlers.go`
 
@@ -107,11 +107,11 @@
   - *Goal*: Propagate `c.Request.Context()` down to repository queries (`QueryContext`, `ExecContext`) and AWS SDK calls to cancel in-flight work when clients disconnect.
   - *File*: `internal/repository/db.go`, `internal/api/handlers.go`
 
-- [ ] **DB-03: Tune Database Connection Pooling**
+- [x] **DB-03: Tune Database Connection Pooling**
   - *Goal*: Configure `SetMaxOpenConns(25)`, `SetMaxIdleConns(25)`, `SetConnMaxLifetime(5 * time.Minute)` on `sql.DB`.
   - *File*: `cmd/main/main.go`
 
-- [ ] **API-01: Sanitize Internal Error Leaks**
+- [x] **API-01: Sanitize Internal Error Leaks**
   - *Issue*: Returning `"err": err.Error()` in 500 responses leaks SQL schemas, S3 bucket names, and internal paths (specifically lines 280, 337, 395, 507, 527).
   - *Fix*: Log detailed error internally via structured logger; return standard safe messages (`{"error": "Internal server error"}`) to clients.
   - *File*: `internal/api/handlers.go`
@@ -120,7 +120,7 @@
   - *Goal*: Make CORS allowed origins dynamic via `CORS_ALLOWED_ORIGINS` env var instead of hardcoded CloudFront URL.
   - *File*: `cmd/main/main.go`, `.env.example`
 
-- [ ] **OPS-02: Implement Graceful Server Shutdown**
+- [x] **OPS-02: Implement Graceful Server Shutdown**
   - *Goal*: Replace `r.Run()` with `http.Server` and listen for `SIGINT`/`SIGTERM` to safely drain in-flight requests.
   - *File*: `cmd/main/main.go`
 
@@ -128,17 +128,21 @@
   - *Goal*: Add B-tree indexes for `appointments(doctor_id, start_time)`, `appointments(patient_id)`, and `prescriptions(patient_id, file_name)`.
   - *File*: `migrations/`
 
-- [ ] **API-03: Add Pagination to List Endpoints**
+- [x] **API-03: Add Pagination to List Endpoints**
   - *Goal*: Add `limit` and `cursor`/`offset` query parameters to `GetDoctors`, `GetAppointments`, and `GetPrescriptions`.
   - *File*: `internal/api/handlers.go`, `internal/repository/db.go`
 
-- [ ] **ARCH-02: Decouple Handlers via Repository Interface**
+- [x] **ARCH-02: Decouple Handlers via Repository Interface**
   - *Goal*: Introduce `type Querier interface` so handlers can be unit-tested using mocks without requiring a live PostgreSQL instance.
   - *File*: `internal/repository/`, `internal/api/handlers.go`
 
 - [x] **API-06: Model JSON Key Standardization**
   - *Goal*: Standardize inconsistent `camelCase` keys (`doctorName`, `patientName`, `specialty`) to `snake_case` across models.
   - *File*: `internal/models/models.go`
+
+- [x] **ARCH-03: Full Migration to jackc/pgx/v5 & Type-Safe sqlc Code Generation**
+  - *Goal*: Eliminate legacy `lib/pq` driver across application runtime and migrations (`migrate/v4/database/pgx/v5`). Adopt `sqlc` for compile-time verified queries, automated scan mapping, and zero manual SQL parsing bugs.
+  - *File*: `sqlc.yaml`, `internal/repository/queries/`, `internal/repository/dbgen/`, `internal/repository/db.go`, `cmd/main/main.go`
 
 ---
 

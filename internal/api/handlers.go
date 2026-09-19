@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,7 +23,7 @@ import (
 )
 
 type Handler struct {
-	Repo             *repository.Repository
+	Repo             repository.Repository
 	Storage          storage.Provider
 	JWTSecret        []byte
 	DoctorInviteCode string
@@ -280,14 +281,41 @@ func (h *Handler) GetUserProfile(c *gin.Context) {
 	}
 }
 
+
+func parsePagination(c *gin.Context) (int, int) {
+	limit := 20
+	if limitStr := c.Query("limit"); limitStr != "" {
+		if parsed, err := strconv.Atoi(limitStr); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+	if limit > 100 {
+		limit = 100
+	}
+
+	offset := 0
+	if offsetStr := c.Query("offset"); offsetStr != "" {
+		if parsed, err := strconv.Atoi(offsetStr); err == nil && parsed >= 0 {
+			offset = parsed
+		}
+	}
+	return limit, offset
+}
+
 // Patient Portal Handlers
 func (h *Handler) GetDoctors(c *gin.Context) {
-	doctors, err := h.Repo.GetDoctors(c.Request.Context())
+	limit, offset := parsePagination(c)
+	doctors, err := h.Repo.GetDoctors(c.Request.Context(), limit, offset)
 	if err != nil {
+		log.Printf("Internal error in GetDoctors: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch doctors"})
 		return
 	}
-	c.JSON(http.StatusOK, doctors)
+	c.JSON(http.StatusOK, gin.H{
+		"data":   doctors,
+		"limit":  limit,
+		"offset": offset,
+	})
 }
 
 func (h *Handler) GetPatientAppointments(c *gin.Context) {
@@ -298,12 +326,18 @@ func (h *Handler) GetPatientAppointments(c *gin.Context) {
 	}
 	patientID := userIDVal.(uuid.UUID)
 
-	appointments, err := h.Repo.GetAppointmentsByPatientID(c.Request.Context(), patientID)
+	limit, offset := parsePagination(c)
+	appointments, err := h.Repo.GetAppointmentsByPatientID(c.Request.Context(), patientID, limit, offset)
 	if err != nil {
+		log.Printf("Internal error in GetPatientAppointments: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch appointments"})
 		return
 	}
-	c.JSON(http.StatusOK, appointments)
+	c.JSON(http.StatusOK, gin.H{
+		"data":   appointments,
+		"limit":  limit,
+		"offset": offset,
+	})
 }
 
 func (h *Handler) GetPatientPrescriptions(c *gin.Context) {
@@ -314,12 +348,18 @@ func (h *Handler) GetPatientPrescriptions(c *gin.Context) {
 	}
 	patientID := userIDVal.(uuid.UUID)
 
-	prescriptions, err := h.Repo.GetPrescriptionsByPatientID(c.Request.Context(), patientID)
+	limit, offset := parsePagination(c)
+	prescriptions, err := h.Repo.GetPrescriptionsByPatientID(c.Request.Context(), patientID, limit, offset)
 	if err != nil {
+		log.Printf("Internal error in GetPatientPrescriptions: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch prescriptions"})
 		return
 	}
-	c.JSON(http.StatusOK, prescriptions)
+	c.JSON(http.StatusOK, gin.H{
+		"data":   prescriptions,
+		"limit":  limit,
+		"offset": offset,
+	})
 }
 
 func (h *Handler) CreateAppointment(c *gin.Context) {
@@ -335,8 +375,46 @@ func (h *Handler) CreateAppointment(c *gin.Context) {
 		return
 	}
 
-	if req.StartTime.IsZero() || req.EndTime.IsZero() || !req.EndTime.After(req.StartTime) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "end_time must be strictly after start_time"})
+	if req.DoctorID == uuid.Nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Doctor ID is required"})
+		return
+	}
+
+	if req.StartTime.IsZero() || req.EndTime.IsZero() {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "start_time and end_time are required"})
+		return
+	}
+
+	// API-04: start_time must be in the future
+	if !req.StartTime.After(time.Now()) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Appointment start time must be in the future"})
+		return
+	}
+
+	// API-04: end_time must be after start_time
+	if !req.EndTime.After(req.StartTime) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Appointment end time must be after start time"})
+		return
+	}
+
+	// API-04: duration validation (15 min - 4 hours)
+	duration := req.EndTime.Sub(req.StartTime)
+	if duration < 15*time.Minute {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Appointment duration must be at least 15 minutes"})
+		return
+	}
+	if duration > 4*time.Hour {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Appointment duration cannot exceed 4 hours"})
+		return
+	}
+
+	// API-04: appointment type validation
+	req.Type = strings.ToLower(strings.TrimSpace(req.Type))
+	if req.Type == "" {
+		req.Type = "in_person"
+	}
+	if req.Type != "in_person" && req.Type != "virtual" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid appointment type: must be in_person or virtual"})
 		return
 	}
 
@@ -357,6 +435,7 @@ func (h *Handler) CreateAppointment(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid doctor ID: specified doctor does not exist"})
 			return
 		}
+		log.Printf("Internal error in CreateAppointment: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create appointment"})
 		return
 	}
@@ -409,12 +488,18 @@ func (h *Handler) GetDoctorAppointments(c *gin.Context) {
 	}
 	doctorID := userIDVal.(uuid.UUID)
 
-	appointments, err := h.Repo.GetAppointmentsByDoctorID(c.Request.Context(), doctorID)
+	limit, offset := parsePagination(c)
+	appointments, err := h.Repo.GetAppointmentsByDoctorID(c.Request.Context(), doctorID, limit, offset)
 	if err != nil {
+		log.Printf("Internal error in GetDoctorAppointments: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch appointments"})
 		return
 	}
-	c.JSON(http.StatusOK, appointments)
+	c.JSON(http.StatusOK, gin.H{
+		"data":   appointments,
+		"limit":  limit,
+		"offset": offset,
+	})
 }
 
 func (h *Handler) GetDoctorPatients(c *gin.Context) {
@@ -425,12 +510,18 @@ func (h *Handler) GetDoctorPatients(c *gin.Context) {
 	}
 	doctorID := userIDVal.(uuid.UUID)
 
-	patients, err := h.Repo.GetPatientsByDoctorID(c.Request.Context(), doctorID)
+	limit, offset := parsePagination(c)
+	patients, err := h.Repo.GetPatientsByDoctorID(c.Request.Context(), doctorID, limit, offset)
 	if err != nil {
+		log.Printf("Internal error in GetDoctorPatients: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch patients"})
 		return
 	}
-	c.JSON(http.StatusOK, patients)
+	c.JSON(http.StatusOK, gin.H{
+		"data":   patients,
+		"limit":  limit,
+		"offset": offset,
+	})
 }
 
 func (h *Handler) GetPatientHistoryAppointments(c *gin.Context) {
@@ -447,13 +538,19 @@ func (h *Handler) GetPatientHistoryAppointments(c *gin.Context) {
 		return
 	}
 
-	appointments, err := h.Repo.GetAppointmentsForPatient(c.Request.Context(), doctorID, patientID)
+	limit, offset := parsePagination(c)
+	appointments, err := h.Repo.GetAppointmentsForPatient(c.Request.Context(), doctorID, patientID, limit, offset)
 	if err != nil {
+		log.Printf("Internal error in GetPatientHistoryAppointments: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch appointments"})
 		return
 	}
 
-	c.JSON(http.StatusOK, appointments)
+	c.JSON(http.StatusOK, gin.H{
+		"data":   appointments,
+		"limit":  limit,
+		"offset": offset,
+	})
 }
 
 func (h *Handler) GetPatientHistoryPrescriptions(c *gin.Context) {
@@ -470,13 +567,19 @@ func (h *Handler) GetPatientHistoryPrescriptions(c *gin.Context) {
 		return
 	}
 
-	prescriptions, err := h.Repo.GetPrescriptionsForPatient(c.Request.Context(), doctorID, patientID)
+	limit, offset := parsePagination(c)
+	prescriptions, err := h.Repo.GetPrescriptionsForPatient(c.Request.Context(), doctorID, patientID, limit, offset)
 	if err != nil {
+		log.Printf("Internal error in GetPatientHistoryPrescriptions: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch prescriptions"})
 		return
 	}
 
-	c.JSON(http.StatusOK, prescriptions)
+	c.JSON(http.StatusOK, gin.H{
+		"data":   prescriptions,
+		"limit":  limit,
+		"offset": offset,
+	})
 }
 
 // GetPrescriptionUploadURL generates a guarded pre-signed upload URL for direct cloud upload
@@ -608,6 +711,7 @@ func (h *Handler) MarkAppointmentAsCompleted(c *gin.Context) {
 
 	updated, err := h.Repo.UpdateAppointmentAsCompletedForDoctor(c.Request.Context(), appointmentID, doctorID)
 	if err != nil {
+		log.Printf("Internal error in MarkAppointmentAsCompleted: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to mark appointment as completed"})
 		return
 	}

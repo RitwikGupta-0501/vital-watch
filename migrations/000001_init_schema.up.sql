@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS appointments (
     start_time TIMESTAMPTZ NOT NULL,
     end_time TIMESTAMPTZ NOT NULL,
     status VARCHAR(50) DEFAULT 'upcoming' CHECK (status IN ('upcoming', 'completed', 'cancelled')),
-    appointment_type VARCHAR(100) DEFAULT 'in-person',
+    appointment_type VARCHAR(100) DEFAULT 'in_person' CHECK (appointment_type IN ('in_person', 'virtual')),
     created_at TIMESTAMPTZ DEFAULT now(),
 
     -- Ensure end_time is strictly after start_time

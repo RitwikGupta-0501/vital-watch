@@ -8,37 +8,60 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/RitwikGupta-0501/vital-watch/internal/models"
+	"github.com/RitwikGupta-0501/vital-watch/internal/repository/dbgen"
 )
 
-// Repository is the struct that holds our database connection
-type Repository struct {
-	DB *sql.DB
+// DBRepository is the concrete implementation of the Repository interface wrapping sqlc generated queries
+type DBRepository struct {
+	DB      *sql.DB
+	queries *dbgen.Queries
+}
+
+var _ Repository = (*DBRepository)(nil)
+
+// New creates a new DBRepository instance
+func New(db *sql.DB) *DBRepository {
+	return &DBRepository{
+		DB:      db,
+		queries: dbgen.New(db),
+	}
+}
+
+func clampPagination(limit, offset int) (int, int) {
+	if limit <= 0 {
+		limit = 20
+	} else if limit > 100 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	return limit, offset
 }
 
 // Patient Related Methods
-func (r *Repository) CreatePatient(ctx context.Context, firstName, lastName, email, hashedPassword string) (uuid.UUID, error) {
+func (r *DBRepository) CreatePatient(ctx context.Context, firstName, lastName, email, hashedPassword string) (uuid.UUID, error) {
 	tx, err := r.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return uuid.Nil, err
 	}
 	defer tx.Rollback()
 
-	userQuery := `
-		INSERT INTO users (email, hashed_password, role)
-		VALUES ($1, $2, 'patient')
-		RETURNING id
-	`
-	var newID uuid.UUID
-	err = tx.QueryRowContext(ctx, userQuery, email, hashedPassword).Scan(&newID)
+	qtx := r.queries.WithTx(tx)
+
+	newID, err := qtx.CreatePatientUser(ctx, dbgen.CreatePatientUserParams{
+		Email:          email,
+		HashedPassword: hashedPassword,
+	})
 	if err != nil {
 		return uuid.Nil, err
 	}
 
-	profileQuery := `
-		INSERT INTO patient_profiles (user_id, first_name, last_name)
-		VALUES ($1, $2, $3)
-	`
-	_, err = tx.ExecContext(ctx, profileQuery, newID, firstName, lastName)
+	err = qtx.CreatePatientProfile(ctx, dbgen.CreatePatientProfileParams{
+		UserID:    newID,
+		FirstName: firstName,
+		LastName:  lastName,
+	})
 	if err != nil {
 		return uuid.Nil, err
 	}
@@ -50,94 +73,87 @@ func (r *Repository) CreatePatient(ctx context.Context, firstName, lastName, ema
 	return newID, nil
 }
 
-func (r *Repository) GetPatientByEmail(ctx context.Context, email string) (models.Patient, error) {
-	query := `
-		SELECT u.id, u.email, p.first_name, p.last_name, u.hashed_password, u.created_at
-		FROM users u
-		JOIN patient_profiles p ON u.id = p.user_id
-		WHERE u.email = $1 AND u.role = 'patient' AND u.is_active = true
-	`
-	var user models.Patient
-	err := r.DB.QueryRowContext(ctx, query, email).Scan(
-		&user.ID, &user.Email, &user.FirstName, &user.LastName, &user.HashedPassword, &user.CreatedAt,
-	)
+func (r *DBRepository) GetPatientByEmail(ctx context.Context, email string) (models.Patient, error) {
+	row, err := r.queries.GetPatientByEmail(ctx, email)
 	if err != nil {
 		return models.Patient{}, err
 	}
-	user.Role = "patient"
-	return user, nil
+	return models.Patient{
+		ID:             row.ID,
+		Email:          row.Email,
+		FirstName:      row.FirstName,
+		LastName:       row.LastName,
+		HashedPassword: row.HashedPassword,
+		Role:           "patient",
+		CreatedAt:      row.CreatedAt.Time,
+	}, nil
 }
 
-func (r *Repository) GetPatientByID(ctx context.Context, id uuid.UUID) (models.Patient, error) {
-	query := `
-		SELECT u.id, u.email, p.first_name, p.last_name, u.hashed_password, u.created_at
-		FROM users u
-		JOIN patient_profiles p ON u.id = p.user_id
-		WHERE u.id = $1 AND u.role = 'patient' AND u.is_active = true
-	`
-	var user models.Patient
-	err := r.DB.QueryRowContext(ctx, query, id).Scan(
-		&user.ID, &user.Email, &user.FirstName, &user.LastName, &user.HashedPassword, &user.CreatedAt,
-	)
+func (r *DBRepository) GetPatientByID(ctx context.Context, id uuid.UUID) (models.Patient, error) {
+	row, err := r.queries.GetPatientByID(ctx, id)
 	if err != nil {
 		return models.Patient{}, err
 	}
-	user.Role = "patient"
-	return user, nil
+	return models.Patient{
+		ID:        row.ID,
+		Email:     row.Email,
+		FirstName: row.FirstName,
+		LastName:  row.LastName,
+		Role:      "patient",
+		CreatedAt: row.CreatedAt.Time,
+	}, nil
 }
 
-func (r *Repository) GetPatientsByDoctorID(ctx context.Context, doctorID uuid.UUID) ([]models.Patient, error) {
-	query := `
-		SELECT DISTINCT u.id, u.email, p.first_name, p.last_name, u.created_at
-		FROM users u
-		JOIN patient_profiles p ON u.id = p.user_id
-		JOIN appointments a ON u.id = a.patient_id
-		WHERE a.doctor_id = $1
-		ORDER BY u.created_at DESC
-	`
-	rows, err := r.DB.QueryContext(ctx, query, doctorID)
+func (r *DBRepository) GetPatientsByDoctorID(ctx context.Context, doctorID uuid.UUID, limit, offset int) ([]models.Patient, error) {
+	lim, off := clampPagination(limit, offset)
+	rows, err := r.queries.GetPatientsByDoctorID(ctx, dbgen.GetPatientsByDoctorIDParams{
+		DoctorID: doctorID,
+		Limit:    int32(lim),
+		Offset:   int32(off),
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
-	var patients []models.Patient
-	for rows.Next() {
-		var patient models.Patient
-		err := rows.Scan(&patient.ID, &patient.Email, &patient.FirstName, &patient.LastName, &patient.CreatedAt)
-		if err != nil {
-			return nil, err
-		}
-		patient.Role = "patient"
-		patients = append(patients, patient)
+	patients := make([]models.Patient, 0, len(rows))
+	for _, row := range rows {
+		patients = append(patients, models.Patient{
+			ID:        row.ID,
+			Email:     row.Email,
+			FirstName: row.FirstName,
+			LastName:  row.LastName,
+			Role:      "patient",
+			CreatedAt: row.CreatedAt.Time,
+		})
 	}
 	return patients, nil
 }
 
 // Doctor Related Methods
-func (r *Repository) CreateDoctor(ctx context.Context, firstName, lastName, email, hashedPassword, specialty string, experience int) (uuid.UUID, error) {
+func (r *DBRepository) CreateDoctor(ctx context.Context, firstName, lastName, email, hashedPassword, specialty string, experience int) (uuid.UUID, error) {
 	tx, err := r.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return uuid.Nil, err
 	}
 	defer tx.Rollback()
 
-	userQuery := `
-		INSERT INTO users (email, hashed_password, role)
-		VALUES ($1, $2, 'doctor')
-		RETURNING id
-	`
-	var newID uuid.UUID
-	err = tx.QueryRowContext(ctx, userQuery, email, hashedPassword).Scan(&newID)
+	qtx := r.queries.WithTx(tx)
+
+	newID, err := qtx.CreateDoctorUser(ctx, dbgen.CreateDoctorUserParams{
+		Email:          email,
+		HashedPassword: hashedPassword,
+	})
 	if err != nil {
 		return uuid.Nil, err
 	}
 
-	profileQuery := `
-		INSERT INTO doctor_profiles (user_id, first_name, last_name, specialty, experience_years)
-		VALUES ($1, $2, $3, $4, $5)
-	`
-	_, err = tx.ExecContext(ctx, profileQuery, newID, firstName, lastName, specialty, experience)
+	err = qtx.CreateDoctorProfile(ctx, dbgen.CreateDoctorProfileParams{
+		UserID:          newID,
+		FirstName:       firstName,
+		LastName:        lastName,
+		Specialty:       sql.NullString{String: specialty, Valid: specialty != ""},
+		ExperienceYears: sql.NullInt32{Int32: int32(experience), Valid: true},
+	})
 	if err != nil {
 		return uuid.Nil, err
 	}
@@ -149,306 +165,263 @@ func (r *Repository) CreateDoctor(ctx context.Context, firstName, lastName, emai
 	return newID, nil
 }
 
-func (r *Repository) GetDoctorByEmail(ctx context.Context, email string) (models.Doctor, error) {
-	query := `
-		SELECT u.id, u.email, d.first_name, d.last_name, u.hashed_password, d.specialty, d.experience_years, d.available, u.created_at
-		FROM users u
-		JOIN doctor_profiles d ON u.id = d.user_id
-		WHERE u.email = $1 AND u.role = 'doctor' AND u.is_active = true
-	`
-	var user models.Doctor
-	err := r.DB.QueryRowContext(ctx, query, email).Scan(
-		&user.ID, &user.Email, &user.FirstName, &user.LastName, &user.HashedPassword,
-		&user.Specialty, &user.Experience, &user.Available, &user.CreatedAt,
-	)
+func (r *DBRepository) GetDoctorByEmail(ctx context.Context, email string) (models.Doctor, error) {
+	row, err := r.queries.GetDoctorByEmail(ctx, email)
 	if err != nil {
 		return models.Doctor{}, err
 	}
-	user.Role = "doctor"
-	return user, nil
+	return models.Doctor{
+		ID:             row.ID,
+		Email:          row.Email,
+		FirstName:      row.FirstName,
+		LastName:       row.LastName,
+		Specialty:      row.Specialty.String,
+		Experience:     int(row.ExperienceYears.Int32),
+		Available:      row.Available.Bool,
+		HashedPassword: row.HashedPassword,
+		Role:           "doctor",
+		CreatedAt:      row.CreatedAt.Time,
+	}, nil
 }
 
-func (r *Repository) GetDoctorByID(ctx context.Context, id uuid.UUID) (models.Doctor, error) {
-	query := `
-		SELECT u.id, u.email, d.first_name, d.last_name, u.hashed_password, d.specialty, d.experience_years, d.available, u.created_at
-		FROM users u
-		JOIN doctor_profiles d ON u.id = d.user_id
-		WHERE u.id = $1 AND u.role = 'doctor' AND u.is_active = true
-	`
-	var user models.Doctor
-	err := r.DB.QueryRowContext(ctx, query, id).Scan(
-		&user.ID, &user.Email, &user.FirstName, &user.LastName, &user.HashedPassword,
-		&user.Specialty, &user.Experience, &user.Available, &user.CreatedAt,
-	)
+func (r *DBRepository) GetDoctorByID(ctx context.Context, id uuid.UUID) (models.Doctor, error) {
+	row, err := r.queries.GetDoctorByID(ctx, id)
 	if err != nil {
 		return models.Doctor{}, err
 	}
-	user.Role = "doctor"
-	return user, nil
+	return models.Doctor{
+		ID:         row.ID,
+		Email:      row.Email,
+		FirstName:  row.FirstName,
+		LastName:   row.LastName,
+		Specialty:  row.Specialty.String,
+		Experience: int(row.ExperienceYears.Int32),
+		Available:  row.Available.Bool,
+		Role:       "doctor",
+		CreatedAt:  row.CreatedAt.Time,
+	}, nil
 }
 
-func (r *Repository) GetDoctors(ctx context.Context) ([]models.Doctor, error) {
-	query := `
-		SELECT u.id, u.email, d.first_name, d.last_name, d.specialty, d.experience_years, d.available, u.created_at
-		FROM users u
-		JOIN doctor_profiles d ON u.id = d.user_id
-		WHERE u.role = 'doctor' AND u.is_active = true
-		ORDER BY d.first_name ASC
-	`
-	rows, err := r.DB.QueryContext(ctx, query)
+func (r *DBRepository) GetDoctors(ctx context.Context, limit, offset int) ([]models.Doctor, error) {
+	lim, off := clampPagination(limit, offset)
+	rows, err := r.queries.GetDoctors(ctx, dbgen.GetDoctorsParams{
+		Limit:  int32(lim),
+		Offset: int32(off),
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
-	var doctors []models.Doctor
-	for rows.Next() {
-		var doc models.Doctor
-		err := rows.Scan(
-			&doc.ID, &doc.Email, &doc.FirstName, &doc.LastName, &doc.Specialty,
-			&doc.Experience, &doc.Available, &doc.CreatedAt,
-		)
-		if err != nil {
-			return nil, err
-		}
-		doc.Role = "doctor"
-		doctors = append(doctors, doc)
+	doctors := make([]models.Doctor, 0, len(rows))
+	for _, row := range rows {
+		doctors = append(doctors, models.Doctor{
+			ID:         row.ID,
+			Email:      row.Email,
+			FirstName:  row.FirstName,
+			LastName:   row.LastName,
+			Specialty:  row.Specialty.String,
+			Experience: int(row.ExperienceYears.Int32),
+			Available:  row.Available.Bool,
+			Role:       "doctor",
+			CreatedAt:  row.CreatedAt.Time,
+		})
 	}
 	return doctors, nil
 }
 
 // Appointment Related Methods
-func (r *Repository) CreateAppointment(ctx context.Context, patientID, doctorID uuid.UUID, startTime, endTime time.Time, apptType string) (uuid.UUID, error) {
-	query := `
-		INSERT INTO appointments (patient_id, doctor_id, start_time, end_time, appointment_type)
-		VALUES ($1, $2, $3, $4, $5)
-		RETURNING id
-	`
-	var newID uuid.UUID
-	err := r.DB.QueryRowContext(ctx, query, patientID, doctorID, startTime, endTime, apptType).Scan(&newID)
-	if err != nil {
-		return uuid.Nil, err
-	}
-	return newID, nil
+func (r *DBRepository) CreateAppointment(ctx context.Context, patientID, doctorID uuid.UUID, startTime, endTime time.Time, apptType string) (uuid.UUID, error) {
+	return r.queries.CreateAppointment(ctx, dbgen.CreateAppointmentParams{
+		PatientID:       patientID,
+		DoctorID:        doctorID,
+		StartTime:       startTime,
+		EndTime:         endTime,
+		AppointmentType: sql.NullString{String: apptType, Valid: apptType != ""},
+	})
 }
 
-func (r *Repository) GetAppointmentsByDoctorID(ctx context.Context, doctorID uuid.UUID) ([]models.Appointment, error) {
-	query := `
-		SELECT 
-			a.id, a.patient_id, a.doctor_id, a.start_time, a.end_time, a.status, a.appointment_type, a.created_at,
-			p.first_name, p.last_name
-		FROM appointments a
-		JOIN patient_profiles p ON a.patient_id = p.user_id
-		WHERE a.doctor_id = $1
-		ORDER BY a.start_time DESC
-	`
-	rows, err := r.DB.QueryContext(ctx, query, doctorID)
+func (r *DBRepository) GetAppointmentsByDoctorID(ctx context.Context, doctorID uuid.UUID, limit, offset int) ([]models.Appointment, error) {
+	lim, off := clampPagination(limit, offset)
+	rows, err := r.queries.GetAppointmentsByDoctorID(ctx, dbgen.GetAppointmentsByDoctorIDParams{
+		DoctorID: doctorID,
+		Limit:    int32(lim),
+		Offset:   int32(off),
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
-	var appointments []models.Appointment
-	for rows.Next() {
-		var appt models.Appointment
-		var patientFirstName, patientLastName string
-
-		err := rows.Scan(
-			&appt.ID, &appt.PatientID, &appt.DoctorID, &appt.StartTime, &appt.EndTime,
-			&appt.Status, &appt.Type, &appt.CreatedAt, &patientFirstName, &patientLastName,
-		)
-		if err != nil {
-			return nil, err
-		}
-
-		appt.PatientName = patientFirstName + " " + patientLastName
-		appointments = append(appointments, appt)
+	appointments := make([]models.Appointment, 0, len(rows))
+	for _, row := range rows {
+		appointments = append(appointments, models.Appointment{
+			ID:          row.ID,
+			PatientID:   row.PatientID,
+			DoctorID:    row.DoctorID,
+			StartTime:   row.StartTime,
+			EndTime:     row.EndTime,
+			Status:      row.Status.String,
+			Type:        row.AppointmentType.String,
+			PatientName: row.FirstName + " " + row.LastName,
+			CreatedAt:   row.CreatedAt.Time,
+		})
 	}
 	return appointments, nil
 }
 
-func (r *Repository) GetAppointmentsByPatientID(ctx context.Context, patientID uuid.UUID) ([]models.Appointment, error) {
-	query := `
-		SELECT 
-			a.id, a.patient_id, a.doctor_id, a.start_time, a.end_time, a.status, a.appointment_type, a.created_at,
-			d.first_name, d.last_name, d.specialty
-		FROM appointments a
-		JOIN doctor_profiles d ON a.doctor_id = d.user_id
-		WHERE a.patient_id = $1
-		ORDER BY a.start_time DESC
-	`
-	rows, err := r.DB.QueryContext(ctx, query, patientID)
+func (r *DBRepository) GetAppointmentsByPatientID(ctx context.Context, patientID uuid.UUID, limit, offset int) ([]models.Appointment, error) {
+	lim, off := clampPagination(limit, offset)
+	rows, err := r.queries.GetAppointmentsByPatientID(ctx, dbgen.GetAppointmentsByPatientIDParams{
+		PatientID: patientID,
+		Limit:     int32(lim),
+		Offset:    int32(off),
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
-	var appointments []models.Appointment
-	for rows.Next() {
-		var appt models.Appointment
-		var docFirstName, docLastName, docSpecialty string
-
-		err := rows.Scan(
-			&appt.ID, &appt.PatientID, &appt.DoctorID, &appt.StartTime, &appt.EndTime,
-			&appt.Status, &appt.Type, &appt.CreatedAt, &docFirstName, &docLastName, &docSpecialty,
-		)
-		if err != nil {
-			return nil, err
-		}
-
-		appt.DoctorName = docFirstName + " " + docLastName
-		appt.DoctorSpecialty = docSpecialty
-		appointments = append(appointments, appt)
+	appointments := make([]models.Appointment, 0, len(rows))
+	for _, row := range rows {
+		appointments = append(appointments, models.Appointment{
+			ID:              row.ID,
+			PatientID:       row.PatientID,
+			DoctorID:        row.DoctorID,
+			StartTime:       row.StartTime,
+			EndTime:         row.EndTime,
+			Status:          row.Status.String,
+			Type:            row.AppointmentType.String,
+			DoctorName:      row.FirstName + " " + row.LastName,
+			DoctorSpecialty: row.Specialty.String,
+			CreatedAt:       row.CreatedAt.Time,
+		})
 	}
 	return appointments, nil
 }
 
-func (r *Repository) GetAppointmentsForPatient(ctx context.Context, doctorID, patientID uuid.UUID) ([]models.Appointment, error) {
-	query := `
-		SELECT 
-			a.id, a.patient_id, a.doctor_id, a.start_time, a.end_time, a.status, a.appointment_type, a.created_at,
-			d.first_name, d.last_name, d.specialty
-		FROM appointments a
-		JOIN doctor_profiles d ON a.doctor_id = d.user_id
-		WHERE a.patient_id = $1 AND a.doctor_id = $2
-		ORDER BY a.start_time DESC
-	`
-	rows, err := r.DB.QueryContext(ctx, query, patientID, doctorID)
+func (r *DBRepository) GetAppointmentsForPatient(ctx context.Context, doctorID, patientID uuid.UUID, limit, offset int) ([]models.Appointment, error) {
+	lim, off := clampPagination(limit, offset)
+	rows, err := r.queries.GetAppointmentsForPatient(ctx, dbgen.GetAppointmentsForPatientParams{
+		PatientID: patientID,
+		DoctorID:  doctorID,
+		Limit:     int32(lim),
+		Offset:    int32(off),
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
-	var appointments []models.Appointment
-	for rows.Next() {
-		var appt models.Appointment
-		var docFirstName, docLastName, docSpecialty string
-
-		err := rows.Scan(
-			&appt.ID, &appt.PatientID, &appt.DoctorID, &appt.StartTime, &appt.EndTime,
-			&appt.Status, &appt.Type, &appt.CreatedAt, &docFirstName, &docLastName, &docSpecialty,
-		)
-		if err != nil {
-			return nil, err
-		}
-
-		appt.DoctorName = docFirstName + " " + docLastName
-		appt.DoctorSpecialty = docSpecialty
-		appointments = append(appointments, appt)
+	appointments := make([]models.Appointment, 0, len(rows))
+	for _, row := range rows {
+		appointments = append(appointments, models.Appointment{
+			ID:              row.ID,
+			PatientID:       row.PatientID,
+			DoctorID:        row.DoctorID,
+			StartTime:       row.StartTime,
+			EndTime:         row.EndTime,
+			Status:          row.Status.String,
+			Type:            row.AppointmentType.String,
+			DoctorName:      row.FirstName + " " + row.LastName,
+			DoctorSpecialty: row.Specialty.String,
+			CreatedAt:       row.CreatedAt.Time,
+		})
 	}
 	return appointments, nil
 }
 
-func (r *Repository) UpdateAppointmentAsCompletedForDoctor(ctx context.Context, appointmentID, doctorID uuid.UUID) (bool, error) {
-	query := `UPDATE appointments SET status = 'completed' WHERE id = $1 AND doctor_id = $2`
-	result, err := r.DB.ExecContext(ctx, query, appointmentID, doctorID)
+func (r *DBRepository) UpdateAppointmentAsCompletedForDoctor(ctx context.Context, appointmentID, doctorID uuid.UUID) (bool, error) {
+	rowsAffected, err := r.queries.UpdateAppointmentAsCompletedForDoctor(ctx, dbgen.UpdateAppointmentAsCompletedForDoctorParams{
+		ID:       appointmentID,
+		DoctorID: doctorID,
+	})
 	if err != nil {
 		return false, err
 	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	return rows > 0, nil
+	return rowsAffected > 0, nil
 }
 
 // Prescription Related Methods
-func (r *Repository) CreatePrescription(ctx context.Context, patientID, doctorID uuid.UUID, medication, notes, fileName string) (uuid.UUID, error) {
-	query := `
-		INSERT INTO prescriptions (patient_id, doctor_id, medication, notes, file_name)
-		VALUES ($1, $2, $3, $4, $5)
-		RETURNING id
-	`
-	var newID uuid.UUID
-	err := r.DB.QueryRowContext(ctx, query, patientID, doctorID, medication, notes, fileName).Scan(&newID)
-	if err != nil {
-		return uuid.Nil, err
-	}
-	return newID, nil
+func (r *DBRepository) CreatePrescription(ctx context.Context, patientID, doctorID uuid.UUID, medication, notes, fileName string) (uuid.UUID, error) {
+	return r.queries.CreatePrescription(ctx, dbgen.CreatePrescriptionParams{
+		PatientID:  patientID,
+		DoctorID:   doctorID,
+		Medication: medication,
+		Notes:      sql.NullString{String: notes, Valid: notes != ""},
+		FileName:   fileName,
+	})
 }
 
-func (r *Repository) GetPrescriptionsByPatientID(ctx context.Context, patientID uuid.UUID) ([]models.Prescription, error) {
-	query := `
-		SELECT p.id, p.patient_id, p.doctor_id, p.medication, p.notes, p.file_name, p.created_at, d.first_name, d.last_name
-		FROM prescriptions p
-		JOIN doctor_profiles d ON p.doctor_id = d.user_id
-		WHERE p.patient_id = $1
-		ORDER BY p.created_at DESC
-	`
-	rows, err := r.DB.QueryContext(ctx, query, patientID)
+func (r *DBRepository) GetPrescriptionsByPatientID(ctx context.Context, patientID uuid.UUID, limit, offset int) ([]models.Prescription, error) {
+	lim, off := clampPagination(limit, offset)
+	rows, err := r.queries.GetPrescriptionsByPatientID(ctx, dbgen.GetPrescriptionsByPatientIDParams{
+		PatientID: patientID,
+		Limit:     int32(lim),
+		Offset:    int32(off),
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
-	var prescriptions []models.Prescription
-	for rows.Next() {
-		var pres models.Prescription
-		var docFirstName, docLastName string
-		err := rows.Scan(
-			&pres.ID, &pres.PatientID, &pres.DoctorID, &pres.Medication, &pres.Notes,
-			&pres.FileName, &pres.CreatedAt, &docFirstName, &docLastName,
-		)
-		if err != nil {
-			return nil, err
-		}
-		pres.DoctorName = docFirstName + " " + docLastName
-		prescriptions = append(prescriptions, pres)
+	prescriptions := make([]models.Prescription, 0, len(rows))
+	for _, row := range rows {
+		prescriptions = append(prescriptions, models.Prescription{
+			ID:         row.ID,
+			PatientID:  row.PatientID,
+			DoctorID:   row.DoctorID,
+			Medication: row.Medication,
+			Notes:      row.Notes.String,
+			FileName:   row.FileName,
+			DoctorName: row.FirstName + " " + row.LastName,
+			CreatedAt:  row.CreatedAt.Time,
+		})
 	}
 	return prescriptions, nil
 }
 
-func (r *Repository) GetPrescriptionByFilename(ctx context.Context, patientID uuid.UUID, filename string) (models.Prescription, error) {
-	query := `SELECT id FROM prescriptions WHERE patient_id = $1 AND file_name = $2`
-	var pres models.Prescription
-	err := r.DB.QueryRowContext(ctx, query, patientID, filename).Scan(&pres.ID)
-	return pres, err
+func (r *DBRepository) GetPrescriptionByFilename(ctx context.Context, patientID uuid.UUID, filename string) (models.Prescription, error) {
+	id, err := r.queries.GetPrescriptionByFilename(ctx, dbgen.GetPrescriptionByFilenameParams{
+		PatientID: patientID,
+		FileName:  filename,
+	})
+	if err != nil {
+		return models.Prescription{}, err
+	}
+	return models.Prescription{ID: id}, nil
 }
 
-func (r *Repository) GetPrescriptionsForPatient(ctx context.Context, doctorID, patientID uuid.UUID) ([]models.Prescription, error) {
-	query := `
-		SELECT 
-			p.id, p.patient_id, p.doctor_id, p.medication, p.notes, p.file_name, p.created_at, 
-			d.first_name, d.last_name
-		FROM prescriptions p
-		JOIN doctor_profiles d ON p.doctor_id = d.user_id
-		WHERE p.patient_id = $1 AND EXISTS (
-			SELECT 1 FROM appointments WHERE patient_id = $1 AND doctor_id = $2
-		)
-		ORDER BY p.created_at DESC
-	`
-	rows, err := r.DB.QueryContext(ctx, query, patientID, doctorID)
+func (r *DBRepository) GetPrescriptionsForPatient(ctx context.Context, doctorID, patientID uuid.UUID, limit, offset int) ([]models.Prescription, error) {
+	lim, off := clampPagination(limit, offset)
+	rows, err := r.queries.GetPrescriptionsForPatient(ctx, dbgen.GetPrescriptionsForPatientParams{
+		PatientID: patientID,
+		DoctorID:  doctorID,
+		Limit:     int32(lim),
+		Offset:    int32(off),
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
-	var prescriptions []models.Prescription
-	for rows.Next() {
-		var pres models.Prescription
-		var docFirstName, docLastName string
-		err := rows.Scan(
-			&pres.ID, &pres.PatientID, &pres.DoctorID, &pres.Medication, &pres.Notes,
-			&pres.FileName, &pres.CreatedAt, &docFirstName, &docLastName,
-		)
-		if err != nil {
-			return nil, err
-		}
-		pres.DoctorName = docFirstName + " " + docLastName
-		prescriptions = append(prescriptions, pres)
+	prescriptions := make([]models.Prescription, 0, len(rows))
+	for _, row := range rows {
+		prescriptions = append(prescriptions, models.Prescription{
+			ID:         row.ID,
+			PatientID:  row.PatientID,
+			DoctorID:   row.DoctorID,
+			Medication: row.Medication,
+			Notes:      row.Notes.String,
+			FileName:   row.FileName,
+			DoctorName: row.FirstName + " " + row.LastName,
+			CreatedAt:  row.CreatedAt.Time,
+		})
 	}
 	return prescriptions, nil
 }
 
-func (r *Repository) GetPrescriptionByFilenameForDoctor(ctx context.Context, doctorID uuid.UUID, filename string) (models.Prescription, error) {
-	query := `
-		SELECT p.id 
-		FROM prescriptions p
-		LEFT JOIN appointments a ON p.patient_id = a.patient_id AND a.doctor_id = $2
-		WHERE p.file_name = $1 AND (p.doctor_id = $2 OR a.doctor_id = $2)
-		LIMIT 1
-	`
-	var pres models.Prescription
-	err := r.DB.QueryRowContext(ctx, query, filename, doctorID).Scan(&pres.ID)
-	return pres, err
+func (r *DBRepository) GetPrescriptionByFilenameForDoctor(ctx context.Context, doctorID uuid.UUID, filename string) (models.Prescription, error) {
+	id, err := r.queries.GetPrescriptionByFilenameForDoctor(ctx, dbgen.GetPrescriptionByFilenameForDoctorParams{
+		FileName: filename,
+		DoctorID: doctorID,
+	})
+	if err != nil {
+		return models.Prescription{}, err
+	}
+	return models.Prescription{ID: id}, nil
 }
