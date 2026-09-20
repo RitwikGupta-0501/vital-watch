@@ -2,32 +2,33 @@ package main
 
 import (
 	"context"
-	"database/sql"
+	"errors"
 	"fmt"
 	"log"
-	"os"
 	"net/http"
+	"os"
 	"os/signal"
-	"syscall"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
-
-	"github.com/gin-contrib/cors"
-	"github.com/gin-gonic/gin"
-	_ "github.com/jackc/pgx/v5/stdlib"
-	"github.com/joho/godotenv"
-
-	"github.com/golang-migrate/migrate/v4"
-	pgxmigrate "github.com/golang-migrate/migrate/v4/database/pgx/v5"
-	_ "github.com/golang-migrate/migrate/v4/source/file"
-
-	"github.com/RitwikGupta-0501/vital-watch/internal/api"
-	"github.com/RitwikGupta-0501/vital-watch/internal/repository"
-	"github.com/RitwikGupta-0501/vital-watch/internal/storage"
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/gin-contrib/cors"
+	"github.com/gin-gonic/gin"
+	"github.com/golang-migrate/migrate/v4"
+	pgxmigrate "github.com/golang-migrate/migrate/v4/database/pgx/v5"
+	_ "github.com/golang-migrate/migrate/v4/source/file"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/joho/godotenv"
+
+	"github.com/RitwikGupta-0501/vital-watch/internal/api"
+	"github.com/RitwikGupta-0501/vital-watch/internal/ocr"
+	"github.com/RitwikGupta-0501/vital-watch/internal/queue"
+	"github.com/RitwikGupta-0501/vital-watch/internal/repository"
+	"github.com/RitwikGupta-0501/vital-watch/internal/storage"
 )
 
 /*
@@ -35,8 +36,7 @@ import (
 =        Database Initialization       =
 ========================================
 */
-func init_db() *sql.DB {
-
+func init_db(ctx context.Context) *pgxpool.Pool {
 	dbHost := os.Getenv("DB_HOST")
 	dbPortStr := os.Getenv("DB_PORT")
 	dbUser := os.Getenv("DB_USER")
@@ -52,32 +52,34 @@ func init_db() *sql.DB {
 	connStr := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
 		dbHost, dbPort, dbUser, dbPassword, dbName, sslMode)
 
-	// Open the database connection pool
-	db, err := sql.Open("pgx", connStr)
+	poolConfig, err := pgxpool.ParseConfig(connStr)
 	if err != nil {
-		log.Fatal("Failed to open database connection:", err)
+		log.Fatal("Failed to parse database pool configuration:", err)
 	}
 
 	// Tune database connection pool settings (DB-03)
-	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(25)
-	db.SetConnMaxLifetime(5 * time.Minute)
-	db.SetConnMaxIdleTime(2 * time.Minute)
+	poolConfig.MaxConns = 25
+	poolConfig.MinConns = 5
+	poolConfig.MaxConnLifetime = 5 * time.Minute
+	poolConfig.MaxConnIdleTime = 2 * time.Minute
 
-	// --- NEW: Add a retry loop for db.Ping() ---
+	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
+	if err != nil {
+		log.Fatal("Failed to initialize database connection pool:", err)
+	}
+
+	// Retry loop for pool.Ping()
 	var dbErr error
-	for i := 0; i < 5; i++ { // Try 5 times
-		err = db.Ping()
+	for i := 0; i < 5; i++ {
+		err = pool.Ping(ctx)
 		if err == nil {
-			// Success!
-			log.Println("Successfully connected to database!")
-			return db
+			log.Println("Successfully connected to database pool!")
+			return pool
 		}
 		dbErr = err
 		log.Println("Failed to ping database, retrying in 2 seconds...")
 		time.Sleep(2 * time.Second)
 	}
-	// If the loop finishes, we failed
 	log.Fatal("Failed to ping database after retries:", dbErr)
 	return nil
 }
@@ -87,9 +89,11 @@ func init_db() *sql.DB {
 =           Migrations Runner          =
 ========================================
 */
-func run_migrations(db *sql.DB) {
+func run_migrations(pool *pgxpool.Pool) {
 	log.Println("Running database migrations...")
-	driver, err := pgxmigrate.WithInstance(db, &pgxmigrate.Config{})
+	sqlDB := stdlib.OpenDBFromPool(pool)
+	defer sqlDB.Close()
+	driver, err := pgxmigrate.WithInstance(sqlDB, &pgxmigrate.Config{})
 	if err != nil {
 		log.Fatal("Failed to create migration driver:", err)
 	}
@@ -132,12 +136,13 @@ func main() {
 		log.Fatal("FATAL: DOCTOR_INVITE_CODE environment variable is not set")
 	}
 
-	// Initialize DB
-	var db = init_db()
-	defer db.Close()
+	// Initialize DB Pool
+	ctx := context.Background()
+	pool := init_db(ctx)
+	defer pool.Close()
 
 	// Run DB migrations
-	run_migrations(db)
+	run_migrations(pool)
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -187,8 +192,34 @@ func main() {
 		log.Println("Successfully initialized Local Storage Provider (Base URL:", localStorageURL, ")")
 	}
 
-	// Initialize repository (ARCH-02)
-	repo := repository.New(db)
+	// Initialize Multi-Provider Vision AI OCR Engine
+	ocrManager := ocr.NewManagerFromEnv(ctx)
+	if ocrManager.IsEnabled() {
+		providersStr := os.Getenv("OCR_PROVIDERS")
+		if providersStr == "" {
+			providersStr = "gemini,claude,openai (default)"
+		}
+		log.Printf("Vision AI OCR enabled with active providers: %s", providersStr)
+	} else {
+		log.Println("Vision AI OCR is disabled (zero-config / no active provider keys). Prescriptions will enter needs_review for manual clinician entry.")
+	}
+
+	// Initialize Repository (breaks initialization cycle with River)
+	repo := repository.New(pool, nil)
+
+	// Initialize River Task Queue & Worker
+	ocrWorker := queue.NewPrescriptionOCRWorker(repo, storageProvider, ocrManager)
+	riverClient, err := queue.NewClient(pool, ocrWorker)
+	if err != nil {
+		log.Fatalf("Failed to initialize River task queue: %v", err)
+	}
+	repo.SetRiverClient(riverClient.RiverClient)
+
+	// Start River Queue Consumer
+	log.Println("Starting River task queue worker...")
+	if err := riverClient.RiverClient.Start(ctx); err != nil {
+		log.Fatalf("Failed to start River background worker: %v", err)
+	}
 
 	// Create the API Handler
 	h := &api.Handler{
@@ -196,9 +227,57 @@ func main() {
 		Storage:          storageProvider,
 		JWTSecret:        jwtSecret,
 		DoctorInviteCode: doctorInviteCode,
+		OCREnabled:       ocrManager.IsEnabled(),
 	}
 
-	// Set up Gin Server
+	// Set up Gin Router
+	r := setupRouter(h, storageType, jwtSecret)
+
+	// Set up HTTP Server with timeouts (OPS-02)
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           r,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	// Run server in a goroutine
+	go func() {
+		log.Printf("Starting HTTP server on port %s...", port)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("HTTP server listen error: %v", err)
+		}
+	}()
+
+	// Listen for OS signals for graceful shutdown (OPS-02)
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	sig := <-quit
+	log.Printf("Received shutdown signal (%v). Draining in-flight connections and queue workers...", sig)
+
+	// Graceful shutdown: HTTP Server (stop accepting new requests, finish in-flight requests)
+	log.Println("Stopping HTTP server listener and draining in-flight requests...")
+	httpShutdownCtx, httpCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer httpCancel()
+	if err := srv.Shutdown(httpShutdownCtx); err != nil {
+		log.Printf("Server forced to shutdown: %v", err)
+	}
+
+	// Graceful shutdown: River Task Queue (drains worker after in-flight requests finish enqueueing)
+	log.Println("Stopping River queue consumer...")
+	riverShutdownCtx, riverCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer riverCancel()
+	if err := riverClient.RiverClient.Stop(riverShutdownCtx); err != nil {
+		log.Printf("River client stop error: %v", err)
+	}
+
+	log.Println("Server exited gracefully.")
+}
+
+// setupRouter builds and configures the Gin engine and route tree
+func setupRouter(h *api.Handler, storageType string, jwtSecret []byte) *gin.Engine {
 	r := gin.Default()
 
 	// Configure CORS
@@ -237,8 +316,10 @@ func main() {
 	authGroup := r.Group("/api")
 	authGroup.Use(api.AuthMiddleware(jwtSecret))
 	{
-		// Common Profile Route (Accessible to both Patients & Doctors)
+		// Common Profile & Prescription Routes (Accessible to Patients & Authorized Doctors)
 		authGroup.GET("/profile", h.GetUserProfile)
+		authGroup.GET("/prescriptions/:id", h.GetPrescriptionByID)
+		authGroup.GET("/prescriptions/:id/download-url", h.DownloadPrescription)
 
 		// Patient-only Routes
 		patientGroup := authGroup.Group("")
@@ -248,8 +329,7 @@ func main() {
 			patientGroup.GET("/patient/appointments", h.GetPatientAppointments)
 			patientGroup.GET("/patient/prescriptions", h.GetPatientPrescriptions)
 			patientGroup.POST("/appointments", h.CreateAppointment)
-			patientGroup.GET("/prescriptions/:filename/download-url", h.DownloadPrescription)
-			patientGroup.GET("/prescriptions/:filename", h.DownloadPrescription) // alias
+			patientGroup.GET("/patient/prescriptions/:filename/download-url", h.DownloadPrescription)
 		}
 
 		// Doctor-only Routes
@@ -260,6 +340,9 @@ func main() {
 			doctorGroup.GET("/doctor/patients", h.GetDoctorPatients)
 			doctorGroup.POST("/prescriptions/upload-url", h.GetPrescriptionUploadURL)
 			doctorGroup.POST("/prescriptions", h.CreatePrescription)
+			doctorGroup.POST("/prescriptions/digital", h.CreateDigitalPrescription)
+			doctorGroup.GET("/prescriptions/pending-review", h.GetPendingReviewPrescriptions)
+			doctorGroup.PATCH("/prescriptions/:id/verify", h.VerifyPrescription)
 			doctorGroup.GET("/doctor/prescriptions/:filename/download-url", h.DoctorDownloadPrescription)
 			doctorGroup.GET("/doctor/prescriptions/:filename", h.DoctorDownloadPrescription) // alias
 			doctorGroup.GET("/doctor/patients/:id/appointments", h.GetPatientHistoryAppointments)
@@ -274,36 +357,5 @@ func main() {
 		r.GET("/storage/download", h.HandleLocalStorageDownload)
 	}
 
-	// Set up HTTP Server with timeouts (OPS-02)
-	srv := &http.Server{
-		Addr:              ":" + port,
-		Handler:           r,
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       60 * time.Second,
-		WriteTimeout:      60 * time.Second,
-		IdleTimeout:       120 * time.Second,
-	}
-
-	// Run server in a goroutine
-	go func() {
-		log.Printf("Starting HTTP server on port %s...", port)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("HTTP server listen error: %v", err)
-		}
-	}()
-
-	// Listen for OS signals for graceful shutdown (OPS-02)
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	sig := <-quit
-	log.Printf("Received shutdown signal (%v). Draining in-flight connections...", sig)
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Printf("Server forced to shutdown: %v", err)
-	}
-
-	log.Println("Server exited gracefully.")
+	return r
 }

@@ -122,7 +122,7 @@ func (h *Handler) HandleLocalStorageDownload(c *gin.Context) {
 	}
 
 	filename := filepath.Base(key)
-	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
+	c.Header("Content-Disposition", fmt.Sprintf("inline; filename=%q", filename))
 	c.Header("X-Content-Type-Options", "nosniff")
 	c.File(filePath)
 }

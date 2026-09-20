@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"github.com/jackc/pgx/v5"
 	"log"
 	"net/http"
 	"path/filepath"
@@ -27,6 +28,7 @@ type Handler struct {
 	Storage          storage.Provider
 	JWTSecret        []byte
 	DoctorInviteCode string
+	OCREnabled       bool
 }
 
 func (h *Handler) Ping(c *gin.Context) {
@@ -281,7 +283,6 @@ func (h *Handler) GetUserProfile(c *gin.Context) {
 	}
 }
 
-
 func parsePagination(c *gin.Context) (int, int) {
 	limit := 20
 	if limitStr := c.Query("limit"); limitStr != "" {
@@ -443,30 +444,141 @@ func (h *Handler) CreateAppointment(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{"id": newID})
 }
 
-// DownloadPrescription provides a pre-signed direct download URL to the authorized patient
+func validatePrescriptionItems(inputs []PrescriptionItemInput) ([]models.PrescriptionItem, error) {
+	if len(inputs) == 0 {
+		return nil, errors.New("at least one medication item is required")
+	}
+	items := make([]models.PrescriptionItem, 0, len(inputs))
+	for idx, it := range inputs {
+		medName := strings.TrimSpace(it.MedicationName)
+		if medName == "" {
+			return nil, fmt.Errorf("medication name is required for item at index %d", idx)
+		}
+		if len([]rune(medName)) > 255 {
+			return nil, fmt.Errorf("medication name at index %d exceeds maximum length of 255 characters", idx)
+		}
+		dosage := strings.TrimSpace(it.Dosage)
+		if len([]rune(dosage)) > 100 {
+			return nil, fmt.Errorf("dosage for medication %q exceeds maximum length of 100 characters", medName)
+		}
+		frequency := strings.TrimSpace(it.Frequency)
+		if len([]rune(frequency)) > 100 {
+			return nil, fmt.Errorf("frequency for medication %q exceeds maximum length of 100 characters", medName)
+		}
+		duration := strings.TrimSpace(it.Duration)
+		if len([]rune(duration)) > 100 {
+			return nil, fmt.Errorf("duration for medication %q exceeds maximum length of 100 characters", medName)
+		}
+		timing := strings.TrimSpace(it.Timing)
+		if len([]rune(timing)) > 100 {
+			return nil, fmt.Errorf("timing for medication %q exceeds maximum length of 100 characters", medName)
+		}
+		items = append(items, models.PrescriptionItem{
+			MedicationName: medName,
+			Dosage:         dosage,
+			Frequency:      frequency,
+			Duration:       duration,
+			Timing:         timing,
+			Instructions:   strings.TrimSpace(it.Instructions),
+		})
+	}
+	return items, nil
+}
+
+func clampString(s string, maxLen int) string {
+	s = strings.TrimSpace(s)
+	runes := []rune(s)
+	if len(runes) > maxLen {
+		return string(runes[:maxLen])
+	}
+	return s
+}
+
+// DownloadPrescription provides a pre-signed direct download URL to authorized patients and doctors
 func (h *Handler) DownloadPrescription(c *gin.Context) {
-	filename := c.Param("filename")
+	identifier := c.Param("filename")
+	if identifier == "" {
+		identifier = c.Param("id")
+	}
 
 	userIDVal, ok := c.Get("userID")
 	if !ok {
 		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "User ID not found in context"})
 		return
 	}
-	patientID := userIDVal.(uuid.UUID)
+	callerID := userIDVal.(uuid.UUID)
+	roleVal, _ := c.Get("role")
+	role, _ := roleVal.(string)
 
 	ctx := c.Request.Context()
-	_, err := h.Repo.GetPrescriptionByFilename(ctx, patientID, filename)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "Prescription not found or access denied"})
+	targetFilename := identifier
+
+	// If identifier is a valid UUID, look up by prescription ID
+	if prescUUID, parseErr := uuid.Parse(identifier); parseErr == nil {
+		presc, err := h.Repo.GetPrescriptionByID(ctx, prescUUID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) || errors.Is(err, pgx.ErrNoRows) {
+				c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "Prescription not found or access denied"})
+				return
+			}
+			log.Printf("Database error fetching prescription by ID: %v", err)
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Internal database error"})
 			return
 		}
-		log.Printf("Database error fetching prescription: %v", err)
-		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Internal database error"})
-		return
+
+		if role == "patient" {
+			if presc.PatientID != callerID || presc.Status != "approved" {
+				c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "Prescription not found or access denied"})
+				return
+			}
+		} else if role == "doctor" {
+			if presc.DoctorID != callerID {
+				appts, apptErr := h.Repo.GetAppointmentsForPatient(ctx, callerID, presc.PatientID, 1, 0)
+				if apptErr != nil || len(appts) == 0 {
+					c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "Prescription not found or access denied"})
+					return
+				}
+			}
+		} else {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "Access denied"})
+			return
+		}
+
+		if presc.FileName == "" {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "This digital prescription has no uploaded file attachment"})
+			return
+		}
+		targetFilename = presc.FileName
+	} else {
+		if role == "patient" {
+			_, err := h.Repo.GetPrescriptionByFilename(ctx, callerID, identifier)
+			if err != nil {
+				if errors.Is(err, sql.ErrNoRows) || errors.Is(err, pgx.ErrNoRows) {
+					c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "Prescription not found or access denied"})
+					return
+				}
+				log.Printf("Database error fetching prescription: %v", err)
+				c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Internal database error"})
+				return
+			}
+		} else if role == "doctor" {
+			_, err := h.Repo.GetPrescriptionByFilenameForDoctor(ctx, callerID, identifier)
+			if err != nil {
+				if errors.Is(err, sql.ErrNoRows) || errors.Is(err, pgx.ErrNoRows) {
+					c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "Prescription not found or access denied"})
+					return
+				}
+				log.Printf("Database error fetching prescription: %v", err)
+				c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Internal database error"})
+				return
+			}
+		} else {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "Access denied"})
+			return
+		}
 	}
 
-	downloadURL, err := h.Storage.GenerateDownloadURL(ctx, filename, 5*time.Minute)
+	downloadURL, err := h.Storage.GenerateDownloadURL(ctx, targetFilename, 5*time.Minute)
 	if err != nil {
 		log.Printf("Failed to generate download URL: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate download URL"})
@@ -567,8 +679,14 @@ func (h *Handler) GetPatientHistoryPrescriptions(c *gin.Context) {
 		return
 	}
 
+	status := strings.ToLower(strings.TrimSpace(c.Query("status")))
+	if status != "" && status != "pending_ocr" && status != "needs_review" && status != "approved" && status != "rejected" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid status filter. Allowed values: pending_ocr, needs_review, approved, rejected"})
+		return
+	}
+
 	limit, offset := parsePagination(c)
-	prescriptions, err := h.Repo.GetPrescriptionsForPatient(c.Request.Context(), doctorID, patientID, limit, offset)
+	prescriptions, err := h.Repo.GetPrescriptionsForPatient(c.Request.Context(), doctorID, patientID, status, limit, offset)
 	if err != nil {
 		log.Printf("Internal error in GetPatientHistoryPrescriptions: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch prescriptions"})
@@ -605,6 +723,32 @@ func (h *Handler) GetPrescriptionUploadURL(c *gin.Context) {
 		return
 	}
 
+	if h.Repo != nil {
+		userIDVal, ok := c.Get("userID")
+		if !ok {
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Doctor ID not found in context"})
+			return
+		}
+		doctorID, ok := userIDVal.(uuid.UUID)
+		if !ok {
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Invalid doctor ID in context"})
+			return
+		}
+
+		ctx := c.Request.Context()
+		patient, err := h.Repo.GetPatientByID(ctx, req.PatientID)
+		if err != nil || patient.ID == uuid.Nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Patient not found"})
+			return
+		}
+
+		appointments, err := h.Repo.GetAppointmentsForPatient(ctx, doctorID, req.PatientID, 1, 0)
+		if err != nil || len(appointments) == 0 {
+			c.JSON(http.StatusForbidden, gin.H{"error": "You can only generate upload URLs for patients who have booked appointments with you"})
+			return
+		}
+	}
+
 	ext := strings.ToLower(filepath.Ext(req.Filename))
 	uniqueFilename := fmt.Sprintf("prescription-%s-%s%s", req.PatientID.String(), uuid.New().String(), ext)
 
@@ -623,7 +767,17 @@ func (h *Handler) GetPrescriptionUploadURL(c *gin.Context) {
 	})
 }
 
-// CreatePrescription persists the prescription record once the file has been uploaded
+// PrescriptionItemInput represents client input for prescription medication items
+type PrescriptionItemInput struct {
+	MedicationName string `json:"medication_name"`
+	Dosage         string `json:"dosage"`
+	Frequency      string `json:"frequency"`
+	Duration       string `json:"duration"`
+	Timing         string `json:"timing"`
+	Instructions   string `json:"instructions"`
+}
+
+// CreatePrescription persists an uploaded prescription record and enqueues an OCR task
 func (h *Handler) CreatePrescription(c *gin.Context) {
 	userIDVal, ok := c.Get("userID")
 	if !ok {
@@ -634,7 +788,7 @@ func (h *Handler) CreatePrescription(c *gin.Context) {
 
 	var req struct {
 		PatientID  uuid.UUID `json:"patient_id"`
-		Medication string    `json:"medication"`
+		Medication string    `json:"medication"` // Optional for uploads; OCR or clinician extracts items
 		Notes      string    `json:"notes"`
 		FileName   string    `json:"file_name"`
 	}
@@ -646,12 +800,6 @@ func (h *Handler) CreatePrescription(c *gin.Context) {
 
 	if req.PatientID == uuid.Nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "A valid patient_id is required"})
-		return
-	}
-
-	req.Medication = strings.TrimSpace(req.Medication)
-	if req.Medication == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Medication is required"})
 		return
 	}
 
@@ -667,6 +815,21 @@ func (h *Handler) CreatePrescription(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
+
+	if h.Repo != nil {
+		patient, err := h.Repo.GetPatientByID(ctx, req.PatientID)
+		if err != nil || patient.ID == uuid.Nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Patient not found"})
+			return
+		}
+
+		appointments, err := h.Repo.GetAppointmentsForPatient(ctx, doctorID, req.PatientID, 1, 0)
+		if err != nil || len(appointments) == 0 {
+			c.JSON(http.StatusForbidden, gin.H{"error": "You can only prescribe to patients who have booked appointments with you"})
+			return
+		}
+	}
+
 	exists, err := h.Storage.ObjectExists(ctx, req.FileName)
 	if err != nil {
 		log.Printf("Storage error verifying object existence: %v", err)
@@ -677,7 +840,17 @@ func (h *Handler) CreatePrescription(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Uploaded file not found in storage. Please upload the file first"})
 		return
 	}
-	newID, err := h.Repo.CreatePrescription(ctx, req.PatientID, doctorID, req.Medication, req.Notes, req.FileName)
+
+	notes := strings.TrimSpace(req.Notes)
+	if req.Medication = strings.TrimSpace(req.Medication); req.Medication != "" {
+		if notes == "" {
+			notes = req.Medication
+		} else {
+			notes = notes + " (" + req.Medication + ")"
+		}
+	}
+
+	newID, status, err := h.Repo.CreateUploadedPrescriptionWithJob(ctx, req.PatientID, doctorID, req.FileName, notes, h.OCREnabled)
 	if err != nil {
 		log.Printf("Failed to create prescription in DB: %v", err)
 		// Clean up uploaded file if DB record insertion fails
@@ -692,7 +865,189 @@ func (h *Handler) CreatePrescription(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusCreated, gin.H{"id": newID, "filename": req.FileName})
+	c.JSON(http.StatusCreated, gin.H{
+		"id":       newID,
+		"filename": req.FileName,
+		"status":   status,
+	})
+}
+
+// CreateDigitalPrescriptionRequest represents client input for digital e-prescribing
+type CreateDigitalPrescriptionRequest struct {
+	PatientID uuid.UUID               `json:"patient_id"`
+	Notes     string                  `json:"notes"`
+	Items     []PrescriptionItemInput `json:"items"`
+}
+
+// CreateDigitalPrescription allows a doctor to author a digital native prescription
+func (h *Handler) CreateDigitalPrescription(c *gin.Context) {
+	userIDVal, ok := c.Get("userID")
+	if !ok {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Doctor ID not found in context"})
+		return
+	}
+	doctorID := userIDVal.(uuid.UUID)
+
+	var req CreateDigitalPrescriptionRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+
+	if req.PatientID == uuid.Nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "A valid patient_id is required"})
+		return
+	}
+
+	items, err := validatePrescriptionItems(req.Items)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	// Verify patient exists
+	patient, err := h.Repo.GetPatientByID(ctx, req.PatientID)
+	if err != nil || patient.ID == uuid.Nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Patient not found"})
+		return
+	}
+
+	// Verify doctor has an appointment with the patient
+	appointments, err := h.Repo.GetAppointmentsForPatient(ctx, doctorID, req.PatientID, 1, 0)
+	if err != nil || len(appointments) == 0 {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You can only prescribe to patients who have booked appointments with you"})
+		return
+	}
+
+	newID, err := h.Repo.CreateDigitalPrescription(ctx, req.PatientID, doctorID, strings.TrimSpace(req.Notes), items)
+	if err != nil {
+		log.Printf("Failed to create digital prescription: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create digital prescription"})
+		return
+	}
+
+	c.JSON(http.StatusCreated, gin.H{
+		"id":     newID,
+		"source": "digital",
+		"status": "approved",
+	})
+}
+
+// GetPendingReviewPrescriptions retrieves prescriptions waiting for doctor HITL verification
+func (h *Handler) GetPendingReviewPrescriptions(c *gin.Context) {
+	userIDVal, ok := c.Get("userID")
+	if !ok {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Doctor ID not found in context"})
+		return
+	}
+	doctorID := userIDVal.(uuid.UUID)
+
+	limit, offset := parsePagination(c)
+	prescriptions, err := h.Repo.GetPrescriptionsPendingReview(c.Request.Context(), doctorID, limit, offset)
+	if err != nil {
+		log.Printf("Internal error in GetPendingReviewPrescriptions: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch pending prescriptions"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"data":   prescriptions,
+		"limit":  limit,
+		"offset": offset,
+	})
+}
+
+// VerifyPrescriptionRequest represents doctor approval or rejection of an OCR/uploaded slip
+type VerifyPrescriptionRequest struct {
+	Status string                  `json:"status"` // "approved" or "rejected"
+	Notes  string                  `json:"notes"`
+	Items  []PrescriptionItemInput `json:"items"`
+}
+
+// VerifyPrescription implements clinician sign-off on uploaded prescriptions
+func (h *Handler) VerifyPrescription(c *gin.Context) {
+	userIDVal, ok := c.Get("userID")
+	if !ok {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Doctor ID not found in context"})
+		return
+	}
+	doctorID := userIDVal.(uuid.UUID)
+
+	prescriptionID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid prescription ID"})
+		return
+	}
+
+	var req VerifyPrescriptionRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+
+	req.Status = strings.ToLower(strings.TrimSpace(req.Status))
+	if req.Status != "approved" && req.Status != "rejected" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Status must be either 'approved' or 'rejected'"})
+		return
+	}
+
+	var items []models.PrescriptionItem
+	if req.Status == "approved" {
+		if req.Items != nil {
+			validated, valErr := validatePrescriptionItems(req.Items)
+			if valErr != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": valErr.Error()})
+				return
+			}
+			items = validated
+		} else {
+			existing, getErr := h.Repo.GetPrescriptionByID(c.Request.Context(), prescriptionID)
+			if getErr == nil && existing.Status == "needs_review" && len(existing.Items) == 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "No medications were detected by OCR. You must provide at least one medication item to approve this prescription."})
+				return
+			}
+		}
+	} else if req.Status == "rejected" {
+		// Clean up unverified items from OCR on rejection
+		items = []models.PrescriptionItem{}
+	}
+
+	updated, err := h.Repo.VerifyPrescription(c.Request.Context(), prescriptionID, doctorID, req.Status, strings.TrimSpace(req.Notes), items)
+	if err != nil {
+		log.Printf("Internal error in VerifyPrescription: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify prescription"})
+		return
+	}
+
+	if !updated {
+		existing, getErr := h.Repo.GetPrescriptionByID(c.Request.Context(), prescriptionID)
+		if getErr == nil {
+			isAuthorized := existing.DoctorID == doctorID
+			if !isAuthorized {
+				appts, apptErr := h.Repo.GetAppointmentsForPatient(c.Request.Context(), doctorID, existing.PatientID, 1, 0)
+				isAuthorized = apptErr == nil && len(appts) > 0
+			}
+			if isAuthorized {
+				if existing.Status == "pending_ocr" {
+					c.JSON(http.StatusConflict, gin.H{"error": "Prescription OCR processing is in progress. Verification is only available once OCR completes."})
+					return
+				}
+				if existing.Status == "approved" || existing.Status == "rejected" {
+					c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("Prescription has already been verified (status: %s)", existing.Status)})
+					return
+				}
+			}
+		}
+		c.JSON(http.StatusNotFound, gin.H{"error": "Prescription not found or access denied"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Prescription verified successfully",
+		"status":  req.Status,
+	})
 }
 
 func (h *Handler) MarkAppointmentAsCompleted(c *gin.Context) {
@@ -724,38 +1079,56 @@ func (h *Handler) MarkAppointmentAsCompleted(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Appointment marked as completed"})
 }
 
-// DoctorDownloadPrescription provides a pre-signed direct download URL to the authorized doctor
+// DoctorDownloadPrescription provides a pre-signed direct download URL to the authorized doctor (alias)
 func (h *Handler) DoctorDownloadPrescription(c *gin.Context) {
-	filename := c.Param("filename")
+	h.DownloadPrescription(c)
+}
 
+// GetPrescriptionByID retrieves a single prescription by ID with ownership access control
+func (h *Handler) GetPrescriptionByID(c *gin.Context) {
 	userIDVal, ok := c.Get("userID")
 	if !ok {
 		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "User ID not found in context"})
 		return
 	}
-	doctorID := userIDVal.(uuid.UUID)
+	userID := userIDVal.(uuid.UUID)
+	roleVal, _ := c.Get("role")
+	role, _ := roleVal.(string)
 
-	ctx := c.Request.Context()
-	_, err := h.Repo.GetPrescriptionByFilenameForDoctor(ctx, doctorID, filename)
+	prescriptionID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "Prescription not found or access denied"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid prescription ID"})
+		return
+	}
+
+	prescription, err := h.Repo.GetPrescriptionByID(c.Request.Context(), prescriptionID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) || errors.Is(err, pgx.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Prescription not found or access denied"})
 			return
 		}
-		log.Printf("Database error fetching prescription: %v", err)
-		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Internal database error"})
+		log.Printf("Internal error in GetPrescriptionByID: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch prescription"})
 		return
 	}
 
-	downloadURL, err := h.Storage.GenerateDownloadURL(ctx, filename, 5*time.Minute)
-	if err != nil {
-		log.Printf("Failed to generate download URL: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate download URL"})
+	if role == "patient" {
+		if prescription.PatientID != userID || prescription.Status != "approved" {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Prescription not found or access denied"})
+			return
+		}
+	} else if role == "doctor" {
+		if prescription.DoctorID != userID {
+			appts, apptErr := h.Repo.GetAppointmentsForPatient(c.Request.Context(), userID, prescription.PatientID, 1, 0)
+			if apptErr != nil || len(appts) == 0 {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Prescription not found or access denied"})
+				return
+			}
+		}
+	} else {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"download_url": downloadURL,
-		"expires_in":   300,
-	})
+	c.JSON(http.StatusOK, prescription)
 }

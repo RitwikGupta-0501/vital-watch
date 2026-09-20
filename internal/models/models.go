@@ -95,13 +95,30 @@ type Appointment struct {
 	CreatedAt       time.Time `json:"created_at"`
 }
 
+type PrescriptionItem struct {
+	ID             uuid.UUID `json:"id"`
+	PrescriptionID uuid.UUID `json:"prescription_id"`
+	MedicationName string    `json:"medication_name"`
+	Dosage         string    `json:"dosage,omitempty"`
+	Frequency      string    `json:"frequency,omitempty"`
+	Duration       string    `json:"duration,omitempty"`
+	Timing         string    `json:"timing,omitempty"`
+	Instructions   string    `json:"instructions,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
 type Prescription struct {
-	ID         uuid.UUID `json:"id"`
-	PatientID  uuid.UUID `json:"patient_id"`
-	DoctorID   uuid.UUID `json:"doctor_id"`
-	Medication string    `json:"medication"`
-	Notes      string    `json:"notes"`
-	FileName   string    `json:"file_name"`
-	CreatedAt  time.Time `json:"created_at"`
-	DoctorName string    `json:"doctor_name,omitempty"`
+	ID          uuid.UUID          `json:"id"`
+	PatientID   uuid.UUID          `json:"patient_id"`
+	DoctorID    uuid.UUID          `json:"doctor_id"`
+	Source      string             `json:"source"`
+	Status      string             `json:"status"`
+	FileName    string             `json:"file_name,omitempty"`
+	Notes       string             `json:"notes"`
+	OCRProvider string             `json:"ocr_provider,omitempty"`
+	Items       []PrescriptionItem `json:"items"`
+	CreatedAt   time.Time          `json:"created_at"`
+	UpdatedAt   time.Time          `json:"updated_at"`
+	DoctorName  string             `json:"doctor_name,omitempty"`
+	PatientName string             `json:"patient_name,omitempty"`
 }

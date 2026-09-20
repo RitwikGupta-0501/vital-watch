@@ -148,11 +148,11 @@
 
 ## 🟢 Phase 3: Dual-Mode Prescriptions, Vision AI OCR & Clinical Intelligence (P2)
 
-- [ ] **RX-01: Dual-Mode Prescription Schema & Database Migration**
+- [x] **RX-01: Dual-Mode Prescription Schema & Database Migration**
   - *Goal*: Refactor `prescriptions` to support both uploaded image slips and direct digital e-prescriptions. Drop `file_name NOT NULL`, add `source VARCHAR(20)` (`'uploaded'`, `'digital'`), lifecycle `status VARCHAR(20)` (`'pending_ocr'`, `'needs_review'`, `'approved'`, `'rejected'`), and structured fields: `dosage`, `frequency`, `duration`, `timing`, and `instructions`.
   - *File*: `migrations/`, `internal/repository/queries/prescriptions.sql`, `internal/models/`
 
-- [ ] **RX-02: Digital Native E-Prescribing Endpoint (Doctor-Only)**
+- [x] **RX-02: Digital Native E-Prescribing Endpoint (Doctor-Only)**
   - *Goal*: Create `POST /api/prescriptions/digital` protected by `RequireRole("doctor")`. Allows physicians to directly create structured prescriptions during or after appointments without paper slips, pre-validating against `SAFE-01` and committing directly with `status = 'approved'`.
   - *File*: `internal/api/handlers.go`, `internal/repository/`
 
@@ -160,15 +160,15 @@
   - *Goal*: Auto-generate standardized, clinic-branded downloadable PDF prescription slips with doctor credentials, clinic letterhead, structured medication tables, and a verification QR code for digital prescriptions, stored directly to S3.
   - *File*: `internal/pdf/`, `internal/api/handlers.go`
 
-- [ ] **OCR-01: River Background Task Queue Integration (PostgreSQL-Backed)**
+- [x] **OCR-01: River Background Task Queue Integration (PostgreSQL-Backed)**
   - *Goal*: Deploy [River](https://github.com/riverqueue/river) using the existing `jackc/pgx/v5` pool. Enforce transactional job enqueueing (insert uploaded prescription + schedule OCR job atomically in the same DB transaction to eliminate dual-write risks).
   - *File*: `internal/queue/`, `cmd/worker/`
 
-- [ ] **OCR-02: Pluggable OCR Provider Interface & Gemini Vision AI Primary**
+- [x] **OCR-02: Pluggable OCR Provider Interface & Gemini Vision AI Primary**
   - *Goal*: Create `internal/ocr/` with a clean `Provider` interface (`ExtractPrescription(ctx, fileBytes, mimeType)`). Implement Gemini Vision API (`google-genai` / structured JSON response schema) as primary provider extracting: `medication_name`, `dosage`, `frequency`, `duration`, `timing`, and `special_instructions`.
   - *File*: `internal/ocr/`
 
-- [ ] **OCR-03: Human-in-the-Loop (HITL) Verification Workflow**
+- [x] **OCR-03: Human-in-the-Loop (HITL) Verification Workflow**
   - *Goal*: Uploaded prescriptions follow a database-backed lifecycle state machine: `pending_ocr` ➔ `needs_review` ➔ `approved`. Provide authenticated doctor review endpoints (`GET /api/prescriptions/pending-review`, `PATCH /api/prescriptions/:id/verify`) to inspect, adjust, and approve AI extractions before committing them to active records.
   - *File*: `internal/api/handlers.go`, `internal/models/`, `internal/repository/`
 

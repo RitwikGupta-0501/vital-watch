@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -233,5 +234,66 @@ func TestMockProvider(t *testing.T) {
 
 	if _, ok := mock.UploadURLs[key]; ok {
 		t.Fatalf("expected upload URL to be removed from mock")
+	}
+}
+
+func TestGetFileBytes(t *testing.T) {
+	ctx := context.Background()
+	mock := NewMockProvider()
+	key := "test.png"
+	// 8-byte PNG signature
+	pngHeader := []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}
+	mock.Files[key] = pngHeader
+
+	data, mimeType, err := mock.GetFileBytes(ctx, key)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(data) != len(pngHeader) {
+		t.Fatalf("expected length %d, got %d", len(pngHeader), len(data))
+	}
+	if mimeType != "image/png" {
+		t.Fatalf("expected image/png, got %s", mimeType)
+	}
+
+	_, _, err = mock.GetFileBytes(ctx, "nonexistent.png")
+	if err == nil {
+		t.Fatalf("expected error for nonexistent file")
+	}
+}
+
+func TestGetFileBytes_SizeLimit(t *testing.T) {
+	ctx := context.Background()
+	mock := NewMockProvider()
+	key := "oversized.png"
+	// Create mock file exceeding 15 MB
+	mock.Files[key] = make([]byte, MaxOCRFileSize+10)
+
+	_, _, err := mock.GetFileBytes(ctx, key)
+	if err == nil {
+		t.Fatalf("expected error for file exceeding size limit, got nil")
+	}
+	if !errors.Is(err, ErrFileTooLarge) {
+		t.Fatalf("expected ErrFileTooLarge, got: %v", err)
+	}
+}
+
+func TestGetFileBytes_OctetStreamDetection(t *testing.T) {
+	ctx := context.Background()
+	mock := NewMockProvider()
+	key := "prescription.pdf"
+	// PDF magic bytes header
+	pdfHeader := []byte("%PDF-1.4\n%test pdf content")
+	mock.Files[key] = pdfHeader
+
+	data, mimeType, err := mock.GetFileBytes(ctx, key)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(data) != len(pdfHeader) {
+		t.Fatalf("expected length %d, got %d", len(pdfHeader), len(data))
+	}
+	if mimeType != "application/pdf" {
+		t.Fatalf("expected application/pdf, got %s", mimeType)
 	}
 }

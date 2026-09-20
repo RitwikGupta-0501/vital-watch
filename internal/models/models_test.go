@@ -66,3 +66,41 @@ func TestModelJSONSnakeCase(t *testing.T) {
 		}
 	}
 }
+
+func TestPrescriptionJSONSnakeCase(t *testing.T) {
+	item := PrescriptionItem{
+		ID:             uuid.New(),
+		PrescriptionID: uuid.New(),
+		MedicationName: "Amoxicillin",
+		Dosage:         "500mg",
+		Frequency:      "TID",
+		CreatedAt:      time.Now(),
+	}
+
+	p := Prescription{
+		ID:          uuid.New(),
+		PatientID:   uuid.New(),
+		DoctorID:    uuid.New(),
+		Source:      "uploaded",
+		Status:      "pending_ocr",
+		OCRProvider: "gemini",
+		Items:       []PrescriptionItem{item},
+		CreatedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
+		DoctorName:  "Dr. Jane",
+		PatientName: "John Doe",
+	}
+
+	data, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("failed to marshal prescription: %v", err)
+	}
+
+	jsonStr := string(data)
+	expectedKeys := []string{"patient_id", "doctor_id", "ocr_provider", "items", "medication_name", "doctor_name", "patient_name"}
+	for _, key := range expectedKeys {
+		if !strings.Contains(jsonStr, `"`+key+`"`) {
+			t.Errorf("expected JSON to contain snake_case key '%s', got: %s", key, jsonStr)
+		}
+	}
+}
