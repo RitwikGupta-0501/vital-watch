@@ -81,3 +81,10 @@ func (m *MockProvider) GetFileBytes(ctx context.Context, key string) ([]byte, st
 	mimeType = strings.ToLower(strings.TrimSpace(strings.Split(mimeType, ";")[0]))
 	return data, mimeType, nil
 }
+
+func (m *MockProvider) SaveFile(ctx context.Context, key string, data []byte, contentType string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.Files[key] = data
+	return nil
+}

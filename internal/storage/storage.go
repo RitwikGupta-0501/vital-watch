@@ -106,4 +106,7 @@ type Provider interface {
 
 	// GetFileBytes retrieves the raw file bytes and detected MIME type on the server side
 	GetFileBytes(ctx context.Context, key string) ([]byte, string, error)
+
+	// SaveFile persists raw bytes directly into storage (e.g. for generated PDFs)
+	SaveFile(ctx context.Context, key string, data []byte, contentType string) error
 }

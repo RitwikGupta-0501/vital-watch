@@ -11,6 +11,7 @@ import (
 	"github.com/riverqueue/river/rivertype"
 
 	"github.com/RitwikGupta-0501/vital-watch/internal/models"
+	"github.com/RitwikGupta-0501/vital-watch/internal/notifications"
 	"github.com/RitwikGupta-0501/vital-watch/internal/ocr"
 	"github.com/RitwikGupta-0501/vital-watch/internal/repository"
 	"github.com/RitwikGupta-0501/vital-watch/internal/storage"
@@ -502,5 +503,65 @@ func TestPrescriptionOCRWorker_StringClamping(t *testing.T) {
 	}
 	if len(savedProvider) > 50 {
 		t.Errorf("Provider length %d exceeds 50", len(savedProvider))
+	}
+}
+
+func TestPrescriptionOCRWorker_NotificationOnPermanentFailure(t *testing.T) {
+	ctx := context.Background()
+	prescID := uuid.New()
+	doctorID := uuid.New()
+	storageKey := "rx-file.png"
+
+	notifier := notifications.NewSSEBroker()
+	defer notifier.Shutdown()
+
+	eventCh, unsub := notifier.Subscribe(doctorID)
+	defer unsub()
+
+	mockRepo := &repository.MockRepository{
+		GetPrescriptionByIDFunc: func(ctx context.Context, id uuid.UUID) (models.Prescription, error) {
+			return models.Prescription{ID: id, DoctorID: doctorID}, nil
+		},
+		UpdatePrescriptionOCRResultsFunc: func(ctx context.Context, id uuid.UUID, status, notes, ocrProvider string, items []models.PrescriptionItem) error {
+			return nil
+		},
+	}
+	mockStorage := storage.NewMockProvider()
+	mockStorage.Files[storageKey] = []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}
+
+	mockOCR := ocr.NewMockProvider("mock-failing")
+	mockOCR.ExtractFunc = func(ctx context.Context, fileBytes []byte, mimeType string) (*ocr.ExtractedPrescription, error) {
+		return nil, ocr.ErrPermanent
+	}
+	ocrManager := ocr.NewManagerWithChain(ocr.NewFallbackChain(mockOCR))
+
+	worker := NewPrescriptionOCRWorker(mockRepo, mockStorage, ocrManager)
+	worker.SetNotifier(notifier)
+
+	job := &river.Job[PrescriptionOCRArgs]{
+		Args: PrescriptionOCRArgs{
+			PrescriptionID: prescID,
+			StorageKey:     storageKey,
+		},
+	}
+
+	err := worker.Work(ctx, job)
+	if err != nil {
+		t.Fatalf("expected nil error on permanent failure, got: %v", err)
+	}
+
+	select {
+	case evt := <-eventCh:
+		if evt.Type != notifications.EventOCRCompleted {
+			t.Errorf("expected EventOCRCompleted, got %v", evt.Type)
+		}
+		if evt.DoctorID != doctorID {
+			t.Errorf("expected DoctorID %v, got %v", doctorID, evt.DoctorID)
+		}
+		if !strings.Contains(evt.Message, "manual review required") {
+			t.Errorf("expected message mentioning manual review, got: %s", evt.Message)
+		}
+	default:
+		t.Fatalf("expected notification to be published on permanent failure")
 	}
 }

@@ -28,16 +28,17 @@ type MockRepository struct {
 	GetAppointmentsForPatientFunc             func(ctx context.Context, doctorID, patientID uuid.UUID, limit, offset int) ([]models.Appointment, error)
 	UpdateAppointmentAsCompletedForDoctorFunc func(ctx context.Context, appointmentID, doctorID uuid.UUID) (bool, error)
 
-	CreateUploadedPrescriptionWithJobFunc func(ctx context.Context, patientID, doctorID uuid.UUID, fileName, notes string, ocrEnabled bool) (uuid.UUID, string, error)
-	CreateDigitalPrescriptionFunc         func(ctx context.Context, patientID, doctorID uuid.UUID, notes string, items []models.PrescriptionItem) (uuid.UUID, error)
-	UpdatePrescriptionOCRResultsFunc      func(ctx context.Context, prescriptionID uuid.UUID, status, notes, ocrProvider string, items []models.PrescriptionItem) error
-	VerifyPrescriptionFunc                func(ctx context.Context, prescriptionID, doctorID uuid.UUID, status, notes string, items []models.PrescriptionItem) (bool, error)
-	GetPrescriptionsPendingReviewFunc     func(ctx context.Context, doctorID uuid.UUID, limit, offset int) ([]models.Prescription, error)
-	GetPrescriptionsByPatientIDFunc       func(ctx context.Context, patientID uuid.UUID, limit, offset int) ([]models.Prescription, error)
-	GetPrescriptionByFilenameFunc         func(ctx context.Context, patientID uuid.UUID, filename string) (models.Prescription, error)
-	GetPrescriptionsForPatientFunc        func(ctx context.Context, doctorID, patientID uuid.UUID, status string, limit, offset int) ([]models.Prescription, error)
+	CreateUploadedPrescriptionWithJobFunc  func(ctx context.Context, patientID, doctorID uuid.UUID, fileName, notes string, ocrEnabled bool) (uuid.UUID, string, error)
+	CreateDigitalPrescriptionFunc          func(ctx context.Context, patientID, doctorID uuid.UUID, notes string, items []models.PrescriptionItem) (uuid.UUID, error)
+	UpdatePrescriptionOCRResultsFunc       func(ctx context.Context, prescriptionID uuid.UUID, status, notes, ocrProvider string, items []models.PrescriptionItem) error
+	VerifyPrescriptionFunc                 func(ctx context.Context, prescriptionID, doctorID uuid.UUID, status, notes string, items []models.PrescriptionItem) (bool, error)
+	GetPrescriptionsPendingReviewFunc      func(ctx context.Context, doctorID uuid.UUID, limit, offset int) ([]models.Prescription, error)
+	GetPrescriptionsByPatientIDFunc        func(ctx context.Context, patientID uuid.UUID, limit, offset int) ([]models.Prescription, error)
+	GetPrescriptionByFilenameFunc          func(ctx context.Context, patientID uuid.UUID, filename string) (models.Prescription, error)
+	GetPrescriptionsForPatientFunc         func(ctx context.Context, doctorID, patientID uuid.UUID, status string, limit, offset int) ([]models.Prescription, error)
 	GetPrescriptionByFilenameForDoctorFunc func(ctx context.Context, doctorID uuid.UUID, filename string) (models.Prescription, error)
-	GetPrescriptionByIDFunc               func(ctx context.Context, id uuid.UUID) (models.Prescription, error)
+	GetPrescriptionByIDFunc                func(ctx context.Context, id uuid.UUID) (models.Prescription, error)
+	UpdatePrescriptionFileNameFunc         func(ctx context.Context, prescriptionID uuid.UUID, fileName string) error
 }
 
 func (m *MockRepository) CreatePatient(ctx context.Context, firstName, lastName, email, hashedPassword string) (uuid.UUID, error) {
@@ -203,4 +204,11 @@ func (m *MockRepository) GetPrescriptionByID(ctx context.Context, id uuid.UUID) 
 		return m.GetPrescriptionByIDFunc(ctx, id)
 	}
 	return models.Prescription{ID: id}, nil
+}
+
+func (m *MockRepository) UpdatePrescriptionFileName(ctx context.Context, prescriptionID uuid.UUID, fileName string) error {
+	if m.UpdatePrescriptionFileNameFunc != nil {
+		return m.UpdatePrescriptionFileNameFunc(ctx, prescriptionID, fileName)
+	}
+	return nil
 }

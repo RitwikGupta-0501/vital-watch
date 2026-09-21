@@ -184,3 +184,14 @@ func (l *LocalProvider) GetFileBytes(ctx context.Context, key string) ([]byte, s
 	mimeType = strings.ToLower(strings.TrimSpace(strings.Split(mimeType, ";")[0]))
 	return data, mimeType, nil
 }
+
+func (l *LocalProvider) SaveFile(ctx context.Context, key string, data []byte, contentType string) error {
+	path, err := l.resolvePath(key)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fmt.Errorf("failed to create directory for local storage: %w", err)
+	}
+	return os.WriteFile(path, data, 0644)
+}

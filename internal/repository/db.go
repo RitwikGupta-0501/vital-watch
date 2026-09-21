@@ -12,7 +12,7 @@ import (
 	"github.com/riverqueue/river"
 
 	"github.com/RitwikGupta-0501/vital-watch/internal/models"
-		"github.com/RitwikGupta-0501/vital-watch/internal/repository/dbgen"
+	"github.com/RitwikGupta-0501/vital-watch/internal/repository/dbgen"
 )
 
 // DBRepository is the concrete implementation of the Repository interface wrapping sqlc generated queries
@@ -764,4 +764,15 @@ func (r *DBRepository) GetPrescriptionByID(ctx context.Context, id uuid.UUID) (m
 		DoctorName:  row.DoctorFirstName + " " + row.DoctorLastName,
 		PatientName: row.PatientFirstName + " " + row.PatientLastName,
 	}, nil
+}
+
+func (r *DBRepository) UpdatePrescriptionFileName(ctx context.Context, prescriptionID uuid.UUID, fileName string) error {
+	tag, err := r.pool.Exec(ctx, "UPDATE prescriptions SET file_name = $1, updated_at = now() WHERE id = $2", fileName, prescriptionID)
+	if err != nil {
+		return fmt.Errorf("failed to update prescription file_name: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("prescription %s not found", prescriptionID)
+	}
+	return nil
 }

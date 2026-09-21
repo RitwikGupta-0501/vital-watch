@@ -2,9 +2,9 @@ package ocr
 
 import (
 	"context"
-	"os"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 
 	"google.golang.org/genai"

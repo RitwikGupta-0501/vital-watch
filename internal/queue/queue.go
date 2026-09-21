@@ -9,12 +9,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 
 	"github.com/RitwikGupta-0501/vital-watch/internal/models"
+	"github.com/RitwikGupta-0501/vital-watch/internal/notifications"
 	"github.com/RitwikGupta-0501/vital-watch/internal/ocr"
 	"github.com/RitwikGupta-0501/vital-watch/internal/repository"
 	"github.com/RitwikGupta-0501/vital-watch/internal/storage"
@@ -27,6 +29,7 @@ type PrescriptionOCRWorker struct {
 	repo       repository.Repository
 	storage    storage.Provider
 	ocrManager *ocr.Manager
+	notifier   notifications.Broker
 }
 
 func NewPrescriptionOCRWorker(repo repository.Repository, storage storage.Provider, ocrManager *ocr.Manager) *PrescriptionOCRWorker {
@@ -35,6 +38,10 @@ func NewPrescriptionOCRWorker(repo repository.Repository, storage storage.Provid
 		storage:    storage,
 		ocrManager: ocrManager,
 	}
+}
+
+func (w *PrescriptionOCRWorker) SetNotifier(notifier notifications.Broker) {
+	w.notifier = notifier
 }
 
 func clampString(s string, maxLen int) string {
@@ -100,6 +107,7 @@ func (w *PrescriptionOCRWorker) Work(ctx context.Context, job *river.Job[Prescri
 			if updateErr := w.repo.UpdatePrescriptionOCRResults(ctx, job.Args.PrescriptionID, "needs_review", fmt.Sprintf("[OCR Extraction failed: %v]", err), "", nil); updateErr != nil {
 				return fmt.Errorf("failed to update prescription status after permanent OCR failure: %w", updateErr)
 			}
+			w.notifyDoctor(ctx, job.Args.PrescriptionID, "Prescription OCR could not extract text; manual review required", 0, "")
 			return nil // Fatal: return nil to avoid burning River retry attempts
 		}
 		if attempt >= 3 {
@@ -107,6 +115,7 @@ func (w *PrescriptionOCRWorker) Work(ctx context.Context, job *river.Job[Prescri
 			if updateErr := w.repo.UpdatePrescriptionOCRResults(ctx, job.Args.PrescriptionID, "needs_review", fmt.Sprintf("[OCR failed after %d attempts: %v]", attempt, err), "", nil); updateErr != nil {
 				return fmt.Errorf("failed to update prescription status after max attempts: %w", updateErr)
 			}
+			w.notifyDoctor(ctx, job.Args.PrescriptionID, "Prescription OCR failed after max retries; manual review required", 0, "")
 			return nil
 		}
 		// Transient failure: return error to River for exponential backoff retry
@@ -143,7 +152,33 @@ func (w *PrescriptionOCRWorker) Work(ctx context.Context, job *river.Job[Prescri
 	}
 
 	log.Printf("[River Worker] Successfully extracted %d medications for prescription %s via %s. Status: needs_review", len(items), job.Args.PrescriptionID, res.Provider)
+
+	w.notifyDoctor(ctx, job.Args.PrescriptionID, "Prescription OCR analysis ready for clinician review", len(items), res.Provider)
 	return nil
+}
+
+
+func (w *PrescriptionOCRWorker) notifyDoctor(ctx context.Context, prescriptionID uuid.UUID, message string, medCount int, provider string) {
+	if w.notifier == nil {
+		return
+	}
+	rx, fetchErr := w.repo.GetPrescriptionByID(ctx, prescriptionID)
+	if fetchErr != nil {
+		return
+	}
+	data := map[string]interface{}{
+		"medications_count": medCount,
+	}
+	if provider != "" {
+		data["provider"] = provider
+	}
+	w.notifier.Publish(notifications.NotificationEvent{
+		Type:           notifications.EventOCRCompleted,
+		PrescriptionID: prescriptionID,
+		DoctorID:       rx.DoctorID,
+		Message:        message,
+		Data:           data,
+	})
 }
 
 // Client wraps river.Client for job queue management

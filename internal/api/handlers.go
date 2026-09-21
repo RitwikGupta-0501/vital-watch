@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"log"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -18,7 +19,10 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/RitwikGupta-0501/vital-watch/internal/models"
+	"github.com/RitwikGupta-0501/vital-watch/internal/notifications"
+	"github.com/RitwikGupta-0501/vital-watch/internal/pdf"
 	"github.com/RitwikGupta-0501/vital-watch/internal/repository"
+	"github.com/RitwikGupta-0501/vital-watch/internal/safety"
 	"github.com/RitwikGupta-0501/vital-watch/internal/storage"
 	"github.com/RitwikGupta-0501/vital-watch/utils"
 )
@@ -29,6 +33,9 @@ type Handler struct {
 	JWTSecret        []byte
 	DoctorInviteCode string
 	OCREnabled       bool
+	PDFGenerator     pdf.Generator
+	SafetyChecker    safety.Checker
+	Notifier         notifications.Broker
 }
 
 func (h *Handler) Ping(c *gin.Context) {
@@ -36,19 +43,35 @@ func (h *Handler) Ping(c *gin.Context) {
 }
 
 func AuthMiddleware(jwtSecret []byte) gin.HandlerFunc {
+	return parseTokenMiddleware(jwtSecret, false)
+}
+
+// SSEAuthMiddleware allows JWT authentication via Authorization header or ?token= query parameter, specifically for EventSource connections
+func SSEAuthMiddleware(jwtSecret []byte) gin.HandlerFunc {
+	return parseTokenMiddleware(jwtSecret, true)
+}
+
+func parseTokenMiddleware(jwtSecret []byte, allowQueryToken bool) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		authHeader := c.GetHeader("Authorization")
-		if authHeader == "" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Authorization header missing"})
+		tokenString := ""
+		if authHeader != "" {
+			parts := strings.Split(authHeader, " ")
+			if len(parts) != 2 || parts[0] != "Bearer" {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid token format"})
+				return
+			}
+			tokenString = parts[1]
+		} else if allowQueryToken && c.Query("token") != "" {
+			tokenString = strings.TrimSpace(c.Query("token"))
+		} else {
+			errMsg := "Authorization header missing"
+			if allowQueryToken {
+				errMsg = "Authorization header or token query parameter missing"
+			}
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": errMsg})
 			return
 		}
-
-		parts := strings.Split(authHeader, " ")
-		if len(parts) != 2 || parts[0] != "Bearer" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid token format"})
-			return
-		}
-		tokenString := parts[1]
 
 		token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
@@ -874,9 +897,35 @@ func (h *Handler) CreatePrescription(c *gin.Context) {
 
 // CreateDigitalPrescriptionRequest represents client input for digital e-prescribing
 type CreateDigitalPrescriptionRequest struct {
-	PatientID uuid.UUID               `json:"patient_id"`
-	Notes     string                  `json:"notes"`
-	Items     []PrescriptionItemInput `json:"items"`
+	PatientID      uuid.UUID               `json:"patient_id"`
+	Notes          string                  `json:"notes"`
+	Items          []PrescriptionItemInput `json:"items"`
+	OverrideSafety bool                    `json:"override_safety"`
+	OverrideReason string                  `json:"override_reason"`
+}
+
+func (h *Handler) checkSafety(ctx context.Context, patientID uuid.UUID, items []models.PrescriptionItem) (*safety.SafetyReport, error) {
+	if h.SafetyChecker == nil || len(items) == 0 {
+		return nil, nil
+	}
+	newMedNames := make([]string, 0, len(items))
+	for _, it := range items {
+		newMedNames = append(newMedNames, it.MedicationName)
+	}
+	activeMedNames := make([]string, 0)
+	activeRxs, err := h.Repo.GetPrescriptionsByPatientID(ctx, patientID, 50, 0)
+	if err == nil {
+		for _, rx := range activeRxs {
+			if rx.Status != "approved" {
+				continue
+			}
+			for _, it := range rx.Items {
+				activeMedNames = append(activeMedNames, it.MedicationName)
+			}
+		}
+	}
+	// TODO: Pass patient documented allergies once allergy schema is added to patient records
+	return h.SafetyChecker.CheckPrescriptionSafety(ctx, newMedNames, activeMedNames, nil)
 }
 
 // CreateDigitalPrescription allows a doctor to author a digital native prescription
@@ -921,18 +970,106 @@ func (h *Handler) CreateDigitalPrescription(c *gin.Context) {
 		return
 	}
 
-	newID, err := h.Repo.CreateDigitalPrescription(ctx, req.PatientID, doctorID, strings.TrimSpace(req.Notes), items)
+	// Safety Pre-flight Check (DDI and Allergies)
+	safetyReport, safetyErr := h.checkSafety(ctx, req.PatientID, items)
+	if safetyErr == nil && safetyReport != nil && safetyReport.HasHighSeverityAlerts && !req.OverrideSafety {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":             "Critical drug interaction or allergy contraindication detected",
+			"safety_report":     safetyReport,
+			"requires_override": true,
+		})
+		return
+	}
+
+	if req.OverrideSafety && strings.TrimSpace(req.OverrideReason) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "An override_reason is required when overriding safety alerts"})
+		return
+	}
+
+	notes := strings.TrimSpace(req.Notes)
+	if req.OverrideSafety && strings.TrimSpace(req.OverrideReason) != "" {
+		if notes != "" {
+			notes = notes + " [Safety Override: " + strings.TrimSpace(req.OverrideReason) + "]"
+		} else {
+			notes = "[Safety Override: " + strings.TrimSpace(req.OverrideReason) + "]"
+		}
+	}
+
+	newID, err := h.Repo.CreateDigitalPrescription(ctx, req.PatientID, doctorID, notes, items)
 	if err != nil {
 		log.Printf("Failed to create digital prescription: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create digital prescription"})
 		return
 	}
 
-	c.JSON(http.StatusCreated, gin.H{
+	// Auto-generate standardized prescription PDF
+	var linkedFileName string
+	if h.PDFGenerator != nil && h.Storage != nil {
+		targetFileName := fmt.Sprintf("prescription-%s-%s.pdf", req.PatientID.String(), newID.String())
+		doc, docErr := h.Repo.GetDoctorByID(ctx, doctorID)
+		if docErr != nil {
+			log.Printf("Warning: Could not fetch doctor details for PDF: %v", docErr)
+		}
+		baseURL := os.Getenv("APP_BASE_URL")
+		if baseURL == "" {
+			baseURL = "https://vitalwatch.internal"
+		}
+		baseURL = strings.TrimRight(baseURL, "/")
+
+		pdfBytes, genErr := h.PDFGenerator.GeneratePrescriptionPDF(pdf.PrescriptionData{
+			PrescriptionID:  newID,
+			Date:            time.Now().UTC(),
+			DoctorName:      strings.TrimSpace(doc.FirstName + " " + doc.LastName),
+			DoctorSpecialty: doc.Specialty,
+			DoctorEmail:     doc.Email,
+			PatientName:     strings.TrimSpace(patient.FirstName + " " + patient.LastName),
+			PatientEmail:    patient.Email,
+			Notes:           notes,
+			Items:           items,
+			VerificationURL: fmt.Sprintf("%s/verify/rx/%s", baseURL, newID),
+		})
+		if genErr != nil {
+			log.Printf("Warning: Failed to generate digital prescription PDF: %v", genErr)
+		} else if saveErr := h.Storage.SaveFile(ctx, targetFileName, pdfBytes, "application/pdf"); saveErr != nil {
+			log.Printf("Error: Failed to persist generated PDF to storage: %v", saveErr)
+		} else if updateErr := h.Repo.UpdatePrescriptionFileName(ctx, newID, targetFileName); updateErr != nil {
+			log.Printf("Error: Failed to link prescription PDF filename in DB: %v", updateErr)
+		} else {
+			linkedFileName = targetFileName
+		}
+	}
+
+	// Publish real-time SSE notification
+	if h.Notifier != nil {
+		eventData := map[string]interface{}{
+			"source": "digital",
+		}
+		if linkedFileName != "" {
+			eventData["file_name"] = linkedFileName
+		}
+		h.Notifier.Publish(notifications.NotificationEvent{
+			Type:           notifications.EventPrescriptionApproved,
+			PrescriptionID: newID,
+			PatientID:      req.PatientID,
+			DoctorID:       doctorID,
+			Message:        "A new digital prescription has been issued",
+			Data:           eventData,
+		})
+	}
+
+	resp := gin.H{
 		"id":     newID,
 		"source": "digital",
 		"status": "approved",
-	})
+	}
+	if linkedFileName != "" {
+		resp["file_name"] = linkedFileName
+	}
+	if safetyReport != nil {
+		resp["safety_report"] = safetyReport
+	}
+
+	c.JSON(http.StatusCreated, resp)
 }
 
 // GetPendingReviewPrescriptions retrieves prescriptions waiting for doctor HITL verification
@@ -961,9 +1098,11 @@ func (h *Handler) GetPendingReviewPrescriptions(c *gin.Context) {
 
 // VerifyPrescriptionRequest represents doctor approval or rejection of an OCR/uploaded slip
 type VerifyPrescriptionRequest struct {
-	Status string                  `json:"status"` // "approved" or "rejected"
-	Notes  string                  `json:"notes"`
-	Items  []PrescriptionItemInput `json:"items"`
+	Status         string                  `json:"status"` // "approved" or "rejected"
+	Notes          string                  `json:"notes"`
+	Items          []PrescriptionItemInput `json:"items"`
+	OverrideSafety bool                    `json:"override_safety"`
+	OverrideReason string                  `json:"override_reason"`
 }
 
 // VerifyPrescription implements clinician sign-off on uploaded prescriptions
@@ -987,14 +1126,25 @@ func (h *Handler) VerifyPrescription(c *gin.Context) {
 		return
 	}
 
-	req.Status = strings.ToLower(strings.TrimSpace(req.Status))
 	if req.Status != "approved" && req.Status != "rejected" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Status must be either 'approved' or 'rejected'"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Status must be 'approved' or 'rejected'"})
 		return
 	}
 
+	ctx := c.Request.Context()
+	var existing models.Prescription
+	var getErr error
 	var items []models.PrescriptionItem
+
 	if req.Status == "approved" {
+		existing, getErr = h.Repo.GetPrescriptionByID(ctx, prescriptionID)
+		if getErr != nil || existing.ID == uuid.Nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Prescription not found"})
+			return
+		}
+
+		var itemsToCheck []models.PrescriptionItem
+
 		if req.Items != nil {
 			validated, valErr := validatePrescriptionItems(req.Items)
 			if valErr != nil {
@@ -1002,10 +1152,24 @@ func (h *Handler) VerifyPrescription(c *gin.Context) {
 				return
 			}
 			items = validated
+			itemsToCheck = validated
 		} else {
-			existing, getErr := h.Repo.GetPrescriptionByID(c.Request.Context(), prescriptionID)
-			if getErr == nil && existing.Status == "needs_review" && len(existing.Items) == 0 {
+			if existing.Status == "needs_review" && len(existing.Items) == 0 {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "No medications were detected by OCR. You must provide at least one medication item to approve this prescription."})
+				return
+			}
+			itemsToCheck = existing.Items
+			items = nil // Retain existing OCR items in repository
+		}
+
+		if len(itemsToCheck) > 0 {
+			safetyReport, safetyErr := h.checkSafety(ctx, existing.PatientID, itemsToCheck)
+			if safetyErr == nil && safetyReport != nil && safetyReport.HasHighSeverityAlerts && !req.OverrideSafety {
+				c.JSON(http.StatusConflict, gin.H{
+					"error":             "Critical drug interaction or allergy contraindication detected",
+					"safety_report":     safetyReport,
+					"requires_override": true,
+				})
 				return
 			}
 		}
@@ -1014,7 +1178,21 @@ func (h *Handler) VerifyPrescription(c *gin.Context) {
 		items = []models.PrescriptionItem{}
 	}
 
-	updated, err := h.Repo.VerifyPrescription(c.Request.Context(), prescriptionID, doctorID, req.Status, strings.TrimSpace(req.Notes), items)
+	if req.OverrideSafety && strings.TrimSpace(req.OverrideReason) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "An override_reason is required when overriding safety alerts"})
+		return
+	}
+
+	notes := strings.TrimSpace(req.Notes)
+	if req.OverrideSafety && strings.TrimSpace(req.OverrideReason) != "" {
+		if notes != "" {
+			notes = notes + " [Safety Override: " + strings.TrimSpace(req.OverrideReason) + "]"
+		} else {
+			notes = "[Safety Override: " + strings.TrimSpace(req.OverrideReason) + "]"
+		}
+	}
+
+	updated, err := h.Repo.VerifyPrescription(ctx, prescriptionID, doctorID, req.Status, notes, items)
 	if err != nil {
 		log.Printf("Internal error in VerifyPrescription: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify prescription"})
@@ -1022,11 +1200,13 @@ func (h *Handler) VerifyPrescription(c *gin.Context) {
 	}
 
 	if !updated {
-		existing, getErr := h.Repo.GetPrescriptionByID(c.Request.Context(), prescriptionID)
+		if getErr != nil || existing.ID == uuid.Nil {
+			existing, getErr = h.Repo.GetPrescriptionByID(ctx, prescriptionID)
+		}
 		if getErr == nil {
 			isAuthorized := existing.DoctorID == doctorID
 			if !isAuthorized {
-				appts, apptErr := h.Repo.GetAppointmentsForPatient(c.Request.Context(), doctorID, existing.PatientID, 1, 0)
+				appts, apptErr := h.Repo.GetAppointmentsForPatient(ctx, doctorID, existing.PatientID, 1, 0)
 				isAuthorized = apptErr == nil && len(appts) > 0
 			}
 			if isAuthorized {
@@ -1042,6 +1222,82 @@ func (h *Handler) VerifyPrescription(c *gin.Context) {
 		}
 		c.JSON(http.StatusNotFound, gin.H{"error": "Prescription not found or access denied"})
 		return
+	}
+
+	// Reuse existing prescription record or fetch once if not yet loaded (e.g. rejection)
+	if existing.ID == uuid.Nil {
+		existing, getErr = h.Repo.GetPrescriptionByID(ctx, prescriptionID)
+	} else if req.Items != nil {
+		existing.Items = items
+	}
+
+	if getErr == nil {
+		if req.Status == "approved" {
+			// Only generate and link standardized PDF if there is no existing uploaded slip file
+			if existing.FileName == "" {
+				pdfFileName := fmt.Sprintf("prescription-%s-%s.pdf", existing.PatientID.String(), prescriptionID.String())
+				if h.PDFGenerator != nil && h.Storage != nil {
+					doc, docErr := h.Repo.GetDoctorByID(ctx, doctorID)
+					if docErr != nil {
+						log.Printf("Warning: Failed to fetch doctor details for PDF: %v", docErr)
+					}
+					pat, patErr := h.Repo.GetPatientByID(ctx, existing.PatientID)
+					if patErr != nil {
+						log.Printf("Warning: Failed to fetch patient details for PDF: %v", patErr)
+					}
+
+					baseURL := os.Getenv("APP_BASE_URL")
+					if baseURL == "" {
+						baseURL = "https://vitalwatch.internal"
+					}
+					baseURL = strings.TrimRight(baseURL, "/")
+
+					pdfBytes, genErr := h.PDFGenerator.GeneratePrescriptionPDF(pdf.PrescriptionData{
+						PrescriptionID:  prescriptionID,
+						Date:            time.Now().UTC(),
+						DoctorName:      strings.TrimSpace(doc.FirstName + " " + doc.LastName),
+						DoctorSpecialty: doc.Specialty,
+						DoctorEmail:     doc.Email,
+						PatientName:     strings.TrimSpace(pat.FirstName + " " + pat.LastName),
+						PatientEmail:    pat.Email,
+						Notes:           notes,
+						Items:           existing.Items,
+						VerificationURL: fmt.Sprintf("%s/verify/rx/%s", baseURL, prescriptionID),
+					})
+					if genErr == nil {
+						if saveErr := h.Storage.SaveFile(ctx, pdfFileName, pdfBytes, "application/pdf"); saveErr != nil {
+							log.Printf("Error: Failed to persist verified prescription PDF to storage: %v", saveErr)
+						} else {
+							if updateErr := h.Repo.UpdatePrescriptionFileName(ctx, prescriptionID, pdfFileName); updateErr != nil {
+								log.Printf("Error: Failed to link verified prescription PDF filename in DB: %v", updateErr)
+							}
+						}
+					} else {
+						log.Printf("Warning: Failed to generate verified prescription PDF: %v", genErr)
+					}
+				}
+			}
+
+			if h.Notifier != nil {
+				h.Notifier.Publish(notifications.NotificationEvent{
+					Type:           notifications.EventPrescriptionApproved,
+					PrescriptionID: prescriptionID,
+					PatientID:      existing.PatientID,
+					DoctorID:       doctorID,
+					Message:        "Prescription verified and approved by clinician",
+				})
+			}
+		} else if req.Status == "rejected" {
+			if h.Notifier != nil {
+				h.Notifier.Publish(notifications.NotificationEvent{
+					Type:           notifications.EventPrescriptionRejected,
+					PrescriptionID: prescriptionID,
+					PatientID:      existing.PatientID,
+					DoctorID:       doctorID,
+					Message:        "Prescription was rejected by clinician",
+				})
+			}
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -1131,4 +1387,21 @@ func (h *Handler) GetPrescriptionByID(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, prescription)
+}
+
+// StreamNotifications provides a real-time SSE stream for prescription status events
+func (h *Handler) StreamNotifications(c *gin.Context) {
+	userIDVal, ok := c.Get("userID")
+	if !ok {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "User ID not found in context"})
+		return
+	}
+	userID := userIDVal.(uuid.UUID)
+
+	if h.Notifier == nil {
+		c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": "Notification service unavailable"})
+		return
+	}
+
+	notifications.ServeSSE(h.Notifier, c, userID)
 }

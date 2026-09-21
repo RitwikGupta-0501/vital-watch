@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -122,4 +123,17 @@ func (s *S3Provider) GetFileBytes(ctx context.Context, key string) ([]byte, stri
 		mimeType = strings.ToLower(strings.TrimSpace(strings.Split(mimeType, ";")[0]))
 	}
 	return data, mimeType, nil
+}
+
+func (s *S3Provider) SaveFile(ctx context.Context, key string, data []byte, contentType string) error {
+	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      aws.String(s.bucket),
+		Key:         aws.String(key),
+		Body:        bytes.NewReader(data),
+		ContentType: aws.String(contentType),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to save file to S3: %w", err)
+	}
+	return nil
 }

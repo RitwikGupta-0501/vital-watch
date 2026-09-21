@@ -2,13 +2,13 @@ package ocr
 
 import (
 	"bytes"
-	"os"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )

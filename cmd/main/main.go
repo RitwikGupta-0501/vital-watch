@@ -25,9 +25,12 @@ import (
 	"github.com/joho/godotenv"
 
 	"github.com/RitwikGupta-0501/vital-watch/internal/api"
+	"github.com/RitwikGupta-0501/vital-watch/internal/notifications"
 	"github.com/RitwikGupta-0501/vital-watch/internal/ocr"
+	"github.com/RitwikGupta-0501/vital-watch/internal/pdf"
 	"github.com/RitwikGupta-0501/vital-watch/internal/queue"
 	"github.com/RitwikGupta-0501/vital-watch/internal/repository"
+	"github.com/RitwikGupta-0501/vital-watch/internal/safety"
 	"github.com/RitwikGupta-0501/vital-watch/internal/storage"
 )
 
@@ -207,8 +210,14 @@ func main() {
 	// Initialize Repository (breaks initialization cycle with River)
 	repo := repository.New(pool, nil)
 
+	// Initialize PDF Generator, DDI Safety Engine, and Real-Time SSE Broker
+	pdfGen := pdf.NewStandardPDFGenerator()
+	safetyChecker := safety.NewOpenFDAChecker()
+	notifier := notifications.NewSSEBroker()
+
 	// Initialize River Task Queue & Worker
 	ocrWorker := queue.NewPrescriptionOCRWorker(repo, storageProvider, ocrManager)
+	ocrWorker.SetNotifier(notifier)
 	riverClient, err := queue.NewClient(pool, ocrWorker)
 	if err != nil {
 		log.Fatalf("Failed to initialize River task queue: %v", err)
@@ -228,6 +237,9 @@ func main() {
 		JWTSecret:        jwtSecret,
 		DoctorInviteCode: doctorInviteCode,
 		OCREnabled:       ocrManager.IsEnabled(),
+		PDFGenerator:     pdfGen,
+		SafetyChecker:    safetyChecker,
+		Notifier:         notifier,
 	}
 
 	// Set up Gin Router
@@ -256,6 +268,10 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-quit
 	log.Printf("Received shutdown signal (%v). Draining in-flight connections and queue workers...", sig)
+
+	// Graceful shutdown: Real-time notification broker (unblocks active SSE streams so HTTP server can drain)
+	log.Println("Closing notification broker subscriptions...")
+	notifier.Shutdown()
 
 	// Graceful shutdown: HTTP Server (stop accepting new requests, finish in-flight requests)
 	log.Println("Stopping HTTP server listener and draining in-flight requests...")
@@ -312,7 +328,10 @@ func setupRouter(h *api.Handler, storageType string, jwtSecret []byte) *gin.Engi
 	r.POST("/api/register", h.Register)
 	r.POST("/api/login", h.Login)
 
-	// --- Protected Routes ---
+	// Real-Time Notification SSE Stream (Supports EventSource query token and Bearer header)
+	r.GET("/api/notifications/stream", api.SSEAuthMiddleware(jwtSecret), h.StreamNotifications)
+
+	// --- Protected Routes (Strict Bearer Header Authentication) ---
 	authGroup := r.Group("/api")
 	authGroup.Use(api.AuthMiddleware(jwtSecret))
 	{

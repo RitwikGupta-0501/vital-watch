@@ -7,14 +7,20 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/RitwikGupta-0501/vital-watch/internal/models"
+	"github.com/RitwikGupta-0501/vital-watch/internal/notifications"
+	"github.com/RitwikGupta-0501/vital-watch/internal/pdf"
 	"github.com/RitwikGupta-0501/vital-watch/internal/repository"
+	"github.com/RitwikGupta-0501/vital-watch/internal/safety"
 	"github.com/RitwikGupta-0501/vital-watch/internal/storage"
 )
 
@@ -809,7 +815,6 @@ func TestVerifyPrescription(t *testing.T) {
 		}
 	})
 
-
 	t.Run("Rejection of Nil Items Approval when OCR Detected Nothing", func(t *testing.T) {
 		mockRepo := &repository.MockRepository{
 			GetPrescriptionByIDFunc: func(ctx context.Context, id uuid.UUID) (models.Prescription, error) {
@@ -1436,4 +1441,580 @@ func TestUnifiedDownloadPrescription_DoctorAccess(t *testing.T) {
 			t.Fatalf("expected 404 Not Found for unauthorized doctor, got %d: %s", w.Code, w.Body.String())
 		}
 	})
+}
+
+type mockSafetyChecker struct {
+	hasAlert bool
+}
+
+func (m *mockSafetyChecker) CheckPrescriptionSafety(ctx context.Context, newMeds, activeMeds, allergies []string) (*safety.SafetyReport, error) {
+	if m.hasAlert {
+		return &safety.SafetyReport{
+			HasHighSeverityAlerts: true,
+			InteractionAlerts: []safety.InteractionAlert{
+				{
+					DrugA:       "Warfarin",
+					DrugB:       "Aspirin",
+					Severity:    safety.SeverityHigh,
+					Description: "Major bleeding risk",
+					Source:      "OpenFDA",
+				},
+			},
+		}, nil
+	}
+	return &safety.SafetyReport{}, nil
+}
+
+func TestCreateDigitalPrescription_SafetyAndPDF(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	doctorID := uuid.New()
+	patientID := uuid.New()
+
+	t.Run("Blocked by High Severity Interaction without Override", func(t *testing.T) {
+		mockRepo := &repository.MockRepository{
+			GetPatientByIDFunc: func(ctx context.Context, id uuid.UUID) (models.Patient, error) {
+				return models.Patient{ID: id, FirstName: "Jane", LastName: "Doe"}, nil
+			},
+			GetAppointmentsForPatientFunc: func(ctx context.Context, dID, pID uuid.UUID, limit, offset int) ([]models.Appointment, error) {
+				return []models.Appointment{{ID: uuid.New(), DoctorID: dID, PatientID: pID}}, nil
+			},
+			GetPrescriptionsByPatientIDFunc: func(ctx context.Context, pID uuid.UUID, limit, offset int) ([]models.Prescription, error) {
+				return []models.Prescription{}, nil
+			},
+		}
+
+		h := &Handler{
+			Repo:          mockRepo,
+			SafetyChecker: &mockSafetyChecker{hasAlert: true},
+		}
+
+		r := gin.New()
+		r.POST("/prescriptions/digital", func(c *gin.Context) {
+			c.Set("userID", doctorID)
+			c.Set("role", "doctor")
+			h.CreateDigitalPrescription(c)
+		})
+
+		body, _ := json.Marshal(CreateDigitalPrescriptionRequest{
+			PatientID: patientID,
+			Items: []PrescriptionItemInput{
+				{MedicationName: "Warfarin", Dosage: "5mg"},
+			},
+			OverrideSafety: false,
+		})
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodPost, "/prescriptions/digital", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusConflict {
+			t.Fatalf("expected 409 Conflict, got %d: %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("Allowed with Doctor Safety Override and PDF Generated", func(t *testing.T) {
+		mockStorage := storage.NewMockProvider()
+		var linkedFileName string
+		mockRepo := &repository.MockRepository{
+			UpdatePrescriptionFileNameFunc: func(ctx context.Context, prescriptionID uuid.UUID, fileName string) error {
+				linkedFileName = fileName
+				return nil
+			},
+			GetPatientByIDFunc: func(ctx context.Context, id uuid.UUID) (models.Patient, error) {
+				return models.Patient{ID: id, FirstName: "Jane", LastName: "Doe"}, nil
+			},
+			GetDoctorByIDFunc: func(ctx context.Context, id uuid.UUID) (models.Doctor, error) {
+				return models.Doctor{ID: id, FirstName: "Gregory", LastName: "House"}, nil
+			},
+			GetAppointmentsForPatientFunc: func(ctx context.Context, dID, pID uuid.UUID, limit, offset int) ([]models.Appointment, error) {
+				return []models.Appointment{{ID: uuid.New(), DoctorID: dID, PatientID: pID}}, nil
+			},
+			GetPrescriptionsByPatientIDFunc: func(ctx context.Context, pID uuid.UUID, limit, offset int) ([]models.Prescription, error) {
+				return []models.Prescription{}, nil
+			},
+			CreateDigitalPrescriptionFunc: func(ctx context.Context, pID, dID uuid.UUID, notes string, items []models.PrescriptionItem) (uuid.UUID, error) {
+				return uuid.New(), nil
+			},
+		}
+
+		notifier := notifications.NewSSEBroker()
+		defer notifier.Shutdown()
+
+		h := &Handler{
+			Repo:          mockRepo,
+			Storage:       mockStorage,
+			SafetyChecker: &mockSafetyChecker{hasAlert: true},
+			PDFGenerator:  pdf.NewStandardPDFGenerator(),
+			Notifier:      notifier,
+		}
+
+		r := gin.New()
+		r.POST("/prescriptions/digital", func(c *gin.Context) {
+			c.Set("userID", doctorID)
+			c.Set("role", "doctor")
+			h.CreateDigitalPrescription(c)
+		})
+
+		body, _ := json.Marshal(CreateDigitalPrescriptionRequest{
+			PatientID: patientID,
+			Items: []PrescriptionItemInput{
+				{MedicationName: "Warfarin", Dosage: "5mg"},
+			},
+			OverrideSafety: true,
+			OverrideReason: "Benefits outweigh risks; INR will be closely monitored",
+		})
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodPost, "/prescriptions/digital", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusCreated {
+			t.Fatalf("expected 201 Created, got %d: %s", w.Code, w.Body.String())
+		}
+
+		var resp map[string]interface{}
+		_ = json.Unmarshal(w.Body.Bytes(), &resp)
+		fileName, ok := resp["file_name"].(string)
+		if !ok || fileName == "" {
+			t.Fatalf("expected file_name in response, got %v", resp["file_name"])
+		}
+
+		// Verify PDF was saved to storage
+		savedBytes, _, err := mockStorage.GetFileBytes(context.Background(), fileName)
+		if err != nil || len(savedBytes) == 0 {
+			t.Fatalf("expected saved PDF in storage, got err: %v, bytes: %d", err, len(savedBytes))
+		}
+		if !bytes.HasPrefix(savedBytes, []byte("%PDF-")) {
+			t.Fatalf("stored file does not have PDF magic bytes")
+		}
+		if linkedFileName != fileName {
+			t.Fatalf("expected linkedFileName to be %q, got %q", fileName, linkedFileName)
+		}
+	})
+
+	t.Run("PDF Generation Failure Graceful Handling", func(t *testing.T) {
+		mockRepo := &repository.MockRepository{
+			GetPatientByIDFunc: func(ctx context.Context, id uuid.UUID) (models.Patient, error) {
+				return models.Patient{ID: id, FirstName: "Jane", LastName: "Doe"}, nil
+			},
+			GetAppointmentsForPatientFunc: func(ctx context.Context, dID, pID uuid.UUID, limit, offset int) ([]models.Appointment, error) {
+				return []models.Appointment{{ID: uuid.New(), DoctorID: dID, PatientID: pID}}, nil
+			},
+			GetPrescriptionsByPatientIDFunc: func(ctx context.Context, pID uuid.UUID, limit, offset int) ([]models.Prescription, error) {
+				return []models.Prescription{}, nil
+			},
+			CreateDigitalPrescriptionFunc: func(ctx context.Context, pID, dID uuid.UUID, notes string, items []models.PrescriptionItem) (uuid.UUID, error) {
+				return uuid.New(), nil
+			},
+		}
+
+		h := &Handler{
+			Repo:         mockRepo,
+			PDFGenerator: &failingPDFGenerator{},
+			Storage:      storage.NewMockProvider(),
+		}
+
+		r := gin.New()
+		r.POST("/prescriptions/digital", func(c *gin.Context) {
+			c.Set("userID", doctorID)
+			c.Set("role", "doctor")
+			h.CreateDigitalPrescription(c)
+		})
+
+		body, _ := json.Marshal(CreateDigitalPrescriptionRequest{
+			PatientID: patientID,
+			Items: []PrescriptionItemInput{
+				{MedicationName: "Atorvastatin", Dosage: "20mg"},
+			},
+		})
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodPost, "/prescriptions/digital", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusCreated {
+			t.Fatalf("expected 201 Created even if PDF fails, got %d: %s", w.Code, w.Body.String())
+		}
+
+		var resp map[string]interface{}
+		_ = json.Unmarshal(w.Body.Bytes(), &resp)
+		if fn, exists := resp["file_name"]; exists && fn != nil && fn != "" {
+			t.Fatalf("expected no file_name in response when PDF fails, got %v", fn)
+		}
+	})
+}
+
+func TestStreamNotifications(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	notifier := notifications.NewSSEBroker()
+	defer notifier.Shutdown()
+
+	userID := uuid.New()
+	h := &Handler{Notifier: notifier}
+
+	r := gin.New()
+	r.GET("/notifications/stream", func(c *gin.Context) {
+		c.Set("userID", userID)
+		h.StreamNotifications(c)
+	})
+
+	w := httptest.NewRecorder()
+	ctx, cancel := context.WithCancel(context.Background())
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "/notifications/stream", nil)
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		notifier.Publish(notifications.NotificationEvent{
+			Type:     notifications.EventPrescriptionApproved,
+			DoctorID: userID,
+			Message:  "Live SSE event test",
+		})
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	r.ServeHTTP(w, req)
+
+	if w.Header().Get("Content-Type") != "text/event-stream" {
+		t.Fatalf("expected text/event-stream content type, got: %s", w.Header().Get("Content-Type"))
+	}
+	bodyStr := w.Body.String()
+	if !strings.Contains(bodyStr, "prescription.approved") {
+		t.Fatalf("expected streamed event in body, got: %s", bodyStr)
+	}
+}
+
+func TestAuthMiddleware_QueryToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	secret := []byte("test-secret-key-1234567890123456")
+	userID := uuid.New()
+
+	// Generate valid token
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"sub":  userID.String(),
+		"role": "doctor",
+		"exp":  time.Now().Add(time.Hour).Unix(),
+	})
+	tokenStr, _ := token.SignedString(secret)
+
+	// 1. Standard AuthMiddleware must strictly REJECT query token
+	r1 := gin.New()
+	r1.Use(AuthMiddleware(secret))
+	r1.GET("/protected", func(c *gin.Context) {
+		uid, _ := c.Get("userID")
+		c.JSON(http.StatusOK, gin.H{"user_id": uid})
+	})
+
+	w1 := httptest.NewRecorder()
+	req1, _ := http.NewRequest(http.MethodGet, "/protected?token="+tokenStr, nil)
+	r1.ServeHTTP(w1, req1)
+
+	if w1.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized for AuthMiddleware with query token, got %d", w1.Code)
+	}
+
+	// 2. SSEAuthMiddleware must ACCEPT query token specifically for EventSource streams
+	r2 := gin.New()
+	r2.Use(SSEAuthMiddleware(secret))
+	r2.GET("/notifications/stream", func(c *gin.Context) {
+		uid, _ := c.Get("userID")
+		c.JSON(http.StatusOK, gin.H{"user_id": uid})
+	})
+
+	w2 := httptest.NewRecorder()
+	req2, _ := http.NewRequest(http.MethodGet, "/notifications/stream?token="+tokenStr, nil)
+	r2.ServeHTTP(w2, req2)
+
+	if w2.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for SSEAuthMiddleware with query token, got %d: %s", w2.Code, w2.Body.String())
+	}
+}
+
+func TestCheckSafety_IgnoresRejectedAndNeedsReviewPrescriptions(t *testing.T) {
+	patientID := uuid.New()
+	var checkedActiveMeds []string
+
+	mockRepo := &repository.MockRepository{
+		GetPrescriptionsByPatientIDFunc: func(ctx context.Context, pID uuid.UUID, limit, offset int) ([]models.Prescription, error) {
+			return []models.Prescription{
+				{
+					ID:     uuid.New(),
+					Status: "rejected",
+					Items:  []models.PrescriptionItem{{MedicationName: "OldRejectedMed"}},
+				},
+				{
+					ID:     uuid.New(),
+					Status: "needs_review",
+					Items:  []models.PrescriptionItem{{MedicationName: "UnverifiedOCRMed"}},
+				},
+				{
+					ID:     uuid.New(),
+					Status: "approved",
+					Items:  []models.PrescriptionItem{{MedicationName: "ActiveApprovedMed"}},
+				},
+			}, nil
+		},
+	}
+
+	checker := &captureSafetyChecker{
+		onCheck: func(active []string) {
+			checkedActiveMeds = active
+		},
+	}
+
+	h := &Handler{
+		Repo:          mockRepo,
+		SafetyChecker: checker,
+	}
+
+	_, _ = h.checkSafety(context.Background(), patientID, []models.PrescriptionItem{{MedicationName: "NewMed"}})
+
+	if len(checkedActiveMeds) != 1 || checkedActiveMeds[0] != "ActiveApprovedMed" {
+		t.Fatalf("expected only approved medication in safety check active list, got: %v", checkedActiveMeds)
+	}
+}
+
+type captureSafetyChecker struct {
+	onCheck func(active []string)
+}
+
+func (c *captureSafetyChecker) CheckPrescriptionSafety(ctx context.Context, newMeds []string, activeMeds []string, allergies []string) (*safety.SafetyReport, error) {
+	if c.onCheck != nil {
+		c.onCheck(activeMeds)
+	}
+	return &safety.SafetyReport{}, nil
+}
+
+
+func TestVerifyPrescription_PreserveUploadedFileNameAndSafetyOverride(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	doctorID := uuid.New()
+	patientID := uuid.New()
+	prescriptionID := uuid.New()
+
+	var capturedNotes string
+	var updateFileNameCalled bool
+
+	mockRepo := &repository.MockRepository{
+		GetPrescriptionByIDFunc: func(ctx context.Context, id uuid.UUID) (models.Prescription, error) {
+			return models.Prescription{
+				ID:        prescriptionID,
+				DoctorID:  doctorID,
+				PatientID: patientID,
+				Source:    "uploaded",
+				Status:    "needs_review",
+				FileName:  "patient-uploaded-scan.png",
+				Items: []models.PrescriptionItem{
+					{MedicationName: "Warfarin", Dosage: "5mg"},
+				},
+			}, nil
+		},
+		VerifyPrescriptionFunc: func(ctx context.Context, pID, dID uuid.UUID, status, notes string, items []models.PrescriptionItem) (bool, error) {
+			capturedNotes = notes
+			return true, nil
+		},
+		UpdatePrescriptionFileNameFunc: func(ctx context.Context, pID uuid.UUID, fileName string) error {
+			updateFileNameCalled = true
+			return nil
+		},
+	}
+
+	h := &Handler{
+		Repo:          mockRepo,
+		SafetyChecker: &mockSafetyChecker{hasAlert: true},
+	}
+
+	r := gin.New()
+	r.PATCH("/prescriptions/:id/verify", func(c *gin.Context) {
+		c.Set("userID", doctorID)
+		c.Set("role", "doctor")
+		h.VerifyPrescription(c)
+	})
+
+	body, _ := json.Marshal(VerifyPrescriptionRequest{
+		Status:         "approved",
+		Notes:          "Initial clinical observation",
+		OverrideSafety: true,
+		OverrideReason: "INR will be monitored weekly",
+	})
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPatch, "/prescriptions/"+prescriptionID.String()+"/verify", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Verify override reason was appended to notes
+	expectedNoteSnippet := "[Safety Override: INR will be monitored weekly]"
+	if !strings.Contains(capturedNotes, expectedNoteSnippet) {
+		t.Fatalf("expected notes to contain %q, got: %q", expectedNoteSnippet, capturedNotes)
+	}
+
+	// Verify UpdatePrescriptionFileName was NOT called, preserving the uploaded scan file
+	if updateFileNameCalled {
+		t.Fatalf("UpdatePrescriptionFileName was unexpectedly called for an uploaded prescription!")
+	}
+}
+type failingPDFGenerator struct{}
+
+func (f *failingPDFGenerator) GeneratePrescriptionPDF(data pdf.PrescriptionData) ([]byte, error) {
+	return nil, errors.New("simulated pdf generator failure")
+}
+
+func TestCreateDigitalPrescription_OverrideRequiresReason(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	doctorID := uuid.New()
+	patientID := uuid.New()
+
+	mockRepo := &repository.MockRepository{
+		GetPatientByIDFunc: func(ctx context.Context, id uuid.UUID) (models.Patient, error) {
+			return models.Patient{ID: patientID, FirstName: "Alice", LastName: "Smith"}, nil
+		},
+		GetAppointmentsForPatientFunc: func(ctx context.Context, dID, pID uuid.UUID, limit, offset int) ([]models.Appointment, error) {
+			return []models.Appointment{{ID: uuid.New()}}, nil
+		},
+		CreateDigitalPrescriptionFunc: func(ctx context.Context, pID, dID uuid.UUID, notes string, items []models.PrescriptionItem) (uuid.UUID, error) {
+			return uuid.New(), nil
+		},
+	}
+
+	h := &Handler{
+		Repo:          mockRepo,
+		SafetyChecker: &mockSafetyChecker{hasAlert: true},
+	}
+
+	r := gin.New()
+	r.POST("/prescriptions/digital", func(c *gin.Context) {
+		c.Set("userID", doctorID)
+		c.Set("role", "doctor")
+		h.CreateDigitalPrescription(c)
+	})
+
+	// 1. Override without reason -> 400 Bad Request
+	bodyNoReason, _ := json.Marshal(CreateDigitalPrescriptionRequest{
+		PatientID:      patientID,
+		Items:          []PrescriptionItemInput{{MedicationName: "Warfarin", Dosage: "5mg"}},
+		OverrideSafety: true,
+		OverrideReason: "   ",
+	})
+	w1 := httptest.NewRecorder()
+	req1, _ := http.NewRequest(http.MethodPost, "/prescriptions/digital", bytes.NewReader(bodyNoReason))
+	req1.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w1, req1)
+
+	if w1.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request when override_reason is whitespace, got %d: %s", w1.Code, w1.Body.String())
+	}
+
+	// 2. Override with reason -> 201 Created
+	bodyWithReason, _ := json.Marshal(CreateDigitalPrescriptionRequest{
+		PatientID:      patientID,
+		Items:          []PrescriptionItemInput{{MedicationName: "Warfarin", Dosage: "5mg"}},
+		OverrideSafety: true,
+		OverrideReason: "Monitored clinic protocol",
+	})
+	w2 := httptest.NewRecorder()
+	req2, _ := http.NewRequest(http.MethodPost, "/prescriptions/digital", bytes.NewReader(bodyWithReason))
+	req2.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w2, req2)
+
+	if w2.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created with valid override_reason, got %d: %s", w2.Code, w2.Body.String())
+	}
+}
+
+func TestVerifyPrescription_OverrideRequiresReason(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	doctorID := uuid.New()
+	patientID := uuid.New()
+	prescriptionID := uuid.New()
+
+	mockRepo := &repository.MockRepository{
+		GetPrescriptionByIDFunc: func(ctx context.Context, id uuid.UUID) (models.Prescription, error) {
+			return models.Prescription{
+				ID:        prescriptionID,
+				DoctorID:  doctorID,
+				PatientID: patientID,
+				Status:    "needs_review",
+				Items:     []models.PrescriptionItem{{MedicationName: "Warfarin"}},
+			}, nil
+		},
+	}
+
+	h := &Handler{
+		Repo:          mockRepo,
+		SafetyChecker: &mockSafetyChecker{hasAlert: true},
+	}
+
+	r := gin.New()
+	r.PATCH("/prescriptions/:id/verify", func(c *gin.Context) {
+		c.Set("userID", doctorID)
+		c.Set("role", "doctor")
+		h.VerifyPrescription(c)
+	})
+
+	bodyNoReason, _ := json.Marshal(VerifyPrescriptionRequest{
+		Status:         "approved",
+		OverrideSafety: true,
+		OverrideReason: "",
+	})
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPatch, "/prescriptions/"+prescriptionID.String()+"/verify", bytes.NewReader(bodyNoReason))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request when override_reason is empty on verify, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestVerifyPrescription_ApprovedNonExistent_Returns404Fast(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	doctorID := uuid.New()
+	prescriptionID := uuid.New()
+
+	verifyCalled := false
+	mockRepo := &repository.MockRepository{
+		GetPrescriptionByIDFunc: func(ctx context.Context, id uuid.UUID) (models.Prescription, error) {
+			return models.Prescription{}, errors.New("sql: no rows in result set")
+		},
+		VerifyPrescriptionFunc: func(ctx context.Context, pID, dID uuid.UUID, status, notes string, items []models.PrescriptionItem) (bool, error) {
+			verifyCalled = true
+			return false, nil
+		},
+	}
+
+	h := &Handler{Repo: mockRepo}
+	r := gin.New()
+	r.PATCH("/prescriptions/:id/verify", func(c *gin.Context) {
+		c.Set("userID", doctorID)
+		c.Set("role", "doctor")
+		h.VerifyPrescription(c)
+	})
+
+	body, _ := json.Marshal(VerifyPrescriptionRequest{
+		Status: "approved",
+		Items: []PrescriptionItemInput{
+			{MedicationName: "Amoxicillin", Dosage: "500mg"},
+		},
+	})
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPatch, "/prescriptions/"+prescriptionID.String()+"/verify", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 Not Found, got %d: %s", w.Code, w.Body.String())
+	}
+	if verifyCalled {
+		t.Fatalf("VerifyPrescription should not have been called when prescription does not exist")
+	}
 }

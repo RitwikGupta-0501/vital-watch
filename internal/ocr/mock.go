@@ -8,9 +8,9 @@ import (
 
 // MockProvider is a test double strictly for unit testing
 type MockProvider struct {
-	ProviderName string
+	ProviderName   string
 	SupportedMIMEs map[string]bool
-	ExtractFunc  func(ctx context.Context, fileBytes []byte, mimeType string) (*ExtractedPrescription, error)
+	ExtractFunc    func(ctx context.Context, fileBytes []byte, mimeType string) (*ExtractedPrescription, error)
 }
 
 func NewMockProvider(name string, supportedMIMEs ...string) *MockProvider {

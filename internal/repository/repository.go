@@ -38,4 +38,5 @@ type Repository interface {
 	GetPrescriptionsForPatient(ctx context.Context, doctorID, patientID uuid.UUID, status string, limit, offset int) ([]models.Prescription, error)
 	GetPrescriptionByFilenameForDoctor(ctx context.Context, doctorID uuid.UUID, filename string) (models.Prescription, error)
 	GetPrescriptionByID(ctx context.Context, id uuid.UUID) (models.Prescription, error)
+	UpdatePrescriptionFileName(ctx context.Context, prescriptionID uuid.UUID, fileName string) error
 }
