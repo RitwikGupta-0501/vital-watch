@@ -3,10 +3,12 @@ package api
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/jackc/pgx/v5"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -23,7 +25,9 @@ import (
 	"github.com/RitwikGupta-0501/vital-watch/internal/pdf"
 	"github.com/RitwikGupta-0501/vital-watch/internal/repository"
 	"github.com/RitwikGupta-0501/vital-watch/internal/safety"
+	"github.com/RitwikGupta-0501/vital-watch/internal/schedule"
 	"github.com/RitwikGupta-0501/vital-watch/internal/storage"
+	"github.com/RitwikGupta-0501/vital-watch/internal/telehealth"
 	"github.com/RitwikGupta-0501/vital-watch/utils"
 )
 
@@ -36,6 +40,7 @@ type Handler struct {
 	PDFGenerator     pdf.Generator
 	SafetyChecker    safety.Checker
 	Notifier         notifications.Broker
+	Telehealth       telehealth.Provider
 }
 
 func (h *Handler) Ping(c *gin.Context) {
@@ -449,7 +454,77 @@ func (h *Handler) CreateAppointment(c *gin.Context) {
 	}
 	patientID := userIDVal.(uuid.UUID)
 
-	newID, err := h.Repo.CreateAppointment(c.Request.Context(), patientID, req.DoctorID, req.StartTime, req.EndTime, req.Type)
+	allScheds, aErr := h.Repo.GetDoctorSchedules(c.Request.Context(), req.DoctorID)
+	if aErr != nil {
+		log.Printf("Internal error checking doctor schedules: %v", aErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify doctor schedule"})
+		return
+	}
+	if len(allScheds) > 0 {
+		var matchingSched *models.DoctorSchedule
+		for _, s := range allScheds {
+			tz := s.Timezone
+			if tz == "" {
+				tz = "UTC"
+			}
+			loc, lErr := time.LoadLocation(tz)
+			if lErr != nil {
+				loc = time.UTC
+			}
+			if int(req.StartTime.In(loc).Weekday()) == s.DayOfWeek {
+				schedCopy := s
+				matchingSched = &schedCopy
+				break
+			}
+		}
+
+		if matchingSched == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Doctor has no office hours configured on this day"})
+			return
+		}
+		if !matchingSched.IsActive {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Doctor is not available on this day"})
+			return
+		}
+
+		docTz := matchingSched.Timezone
+		if docTz == "" {
+			docTz = "UTC"
+		}
+		loc, lErr := time.LoadLocation(docTz)
+		if lErr != nil {
+			loc = time.UTC
+		}
+
+		localStart := req.StartTime.In(loc)
+		localEnd := req.EndTime.In(loc)
+
+		stParsed, err1 := time.Parse("15:04", matchingSched.StartTime)
+		etParsed, err2 := time.Parse("15:04", matchingSched.EndTime)
+		if err1 == nil && err2 == nil {
+			windowStart := time.Date(localStart.Year(), localStart.Month(), localStart.Day(), stParsed.Hour(), stParsed.Minute(), 0, 0, loc)
+			windowEnd := time.Date(localStart.Year(), localStart.Month(), localStart.Day(), etParsed.Hour(), etParsed.Minute(), 0, 0, loc)
+
+			if localStart.Before(windowStart) || localEnd.After(windowEnd) {
+				c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Appointment is outside doctor's active working hours (%s - %s %s)", matchingSched.StartTime, matchingSched.EndTime, matchingSched.Timezone)})
+				return
+			}
+		}
+	}
+
+	appointmentID := uuid.New()
+	var meetingLink, meetingID string
+	if req.Type == "virtual" && h.Telehealth != nil {
+		room, rErr := h.Telehealth.CreateRoom(c.Request.Context(), appointmentID, req.StartTime, req.EndTime.Sub(req.StartTime))
+		if rErr != nil {
+			log.Printf("Warning: failed to create telehealth room: %v", rErr)
+		} else if room != nil {
+			meetingLink = room.MeetingLink
+			meetingID = room.MeetingID
+		}
+	}
+
+	newID, err := h.Repo.CreateAppointment(c.Request.Context(), appointmentID, patientID, req.DoctorID, req.StartTime, req.EndTime, req.Type, meetingLink, meetingID)
 	if err != nil {
 		if strings.Contains(err.Error(), "appointments_doctor_id_tstzrange_excl") || strings.Contains(err.Error(), "conflicting key") {
 			c.JSON(http.StatusConflict, gin.H{"error": "Doctor is already booked for this time slot"})
@@ -464,7 +539,12 @@ func (h *Handler) CreateAppointment(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusCreated, gin.H{"id": newID})
+	resp := gin.H{"id": newID}
+	if meetingLink != "" {
+		resp["meeting_link"] = meetingLink
+		resp["meeting_id"] = meetingID
+	}
+	c.JSON(http.StatusCreated, resp)
 }
 
 func validatePrescriptionItems(inputs []PrescriptionItemInput) ([]models.PrescriptionItem, error) {
@@ -1404,4 +1484,801 @@ func (h *Handler) StreamNotifications(c *gin.Context) {
 	}
 
 	notifications.ServeSSE(h.Notifier, c, userID)
+}
+
+// ==========================================
+// PHASE 4: ADVANCED SCHEDULING & TELEHEALTH
+// ==========================================
+
+func (h *Handler) GetAppointmentMeetingRoom(c *gin.Context) {
+	idStr := c.Param("id")
+	apptID, err := uuid.Parse(idStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid appointment ID"})
+		return
+	}
+
+	userIDVal, ok := c.Get("userID")
+	if !ok {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "User ID not found in context"})
+		return
+	}
+	callerID := userIDVal.(uuid.UUID)
+
+	appt, err := h.Repo.GetAppointmentByID(c.Request.Context(), apptID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Appointment not found"})
+		return
+	}
+
+	if appt.PatientID != callerID && appt.DoctorID != callerID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied: you are not a participant in this appointment"})
+		return
+	}
+
+	if appt.Status == "cancelled" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Appointment has been cancelled"})
+		return
+	}
+
+	if appt.Type != "virtual" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Appointment is not a virtual consultation"})
+		return
+	}
+
+	if appt.MeetingLink == "" {
+		if h.Telehealth != nil {
+			duration := appt.EndTime.Sub(appt.StartTime)
+			if duration <= 0 {
+				duration = 30 * time.Minute
+			}
+			room, rErr := h.Telehealth.CreateRoom(c.Request.Context(), appt.ID, appt.StartTime, duration)
+			if rErr != nil {
+				log.Printf("Warning: failed to lazily create telehealth room: %v", rErr)
+			} else if room != nil {
+				if uErr := h.Repo.UpdateAppointmentMeetingRoom(c.Request.Context(), appt.ID, room.MeetingLink, room.MeetingID); uErr != nil {
+					log.Printf("Warning: failed to persist generated telehealth meeting room: %v", uErr)
+				}
+				if refreshed, refErr := h.Repo.GetAppointmentByID(c.Request.Context(), appt.ID); refErr == nil && refreshed.MeetingLink != "" {
+					appt.MeetingLink = refreshed.MeetingLink
+					appt.MeetingID = refreshed.MeetingID
+				} else {
+					appt.MeetingLink = room.MeetingLink
+					appt.MeetingID = room.MeetingID
+				}
+			}
+		}
+		if appt.MeetingLink == "" {
+			c.JSON(http.StatusNotFound, gin.H{"error": "No meeting room configured for this appointment"})
+			return
+		}
+	}
+
+	meetingLink := appt.MeetingLink
+	if tp, ok := h.Telehealth.(telehealth.TokenProvider); ok && appt.MeetingID != "" {
+		isOwner := callerID == appt.DoctorID
+		token, tErr := tp.CreateMeetingToken(c.Request.Context(), appt.MeetingID, isOwner, appt.EndTime.Add(30*time.Minute))
+		if tErr != nil {
+			log.Printf("Error: failed to generate meeting token: %v", tErr)
+			c.JSON(http.StatusBadGateway, gin.H{"error": "Failed to generate meeting access token for video consultation"})
+			return
+		}
+		if token != "" {
+			separator := "?"
+			if strings.Contains(meetingLink, "?") {
+				separator = "&"
+			}
+			meetingLink = fmt.Sprintf("%s%st=%s", meetingLink, separator, token)
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"meeting_link": meetingLink,
+		"meeting_id":   appt.MeetingID,
+		"status":       appt.Status,
+		"start_time":   appt.StartTime,
+		"end_time":     appt.EndTime,
+	})
+}
+
+type ScheduleInput struct {
+	DayOfWeek    int    `json:"day_of_week"`
+	StartTime    string `json:"start_time"`
+	EndTime      string `json:"end_time"`
+	SlotDuration int    `json:"slot_duration"`
+	Timezone     string `json:"timezone"`
+	IsActive     *bool  `json:"is_active"`
+}
+
+func validateScheduleInput(in ScheduleInput) (models.DoctorSchedule, error) {
+	if in.DayOfWeek < 0 || in.DayOfWeek > 6 {
+		return models.DoctorSchedule{}, errors.New("day_of_week must be between 0 (Sunday) and 6 (Saturday)")
+	}
+	in.StartTime = strings.TrimSpace(in.StartTime)
+	in.EndTime = strings.TrimSpace(in.EndTime)
+	if in.StartTime == "" || in.EndTime == "" {
+		return models.DoctorSchedule{}, errors.New("start_time and end_time are required (format HH:MM)")
+	}
+
+	st, err := time.Parse("15:04", in.StartTime)
+	if err != nil {
+		return models.DoctorSchedule{}, fmt.Errorf("invalid start_time format (must be HH:MM): %w", err)
+	}
+	et, err := time.Parse("15:04", in.EndTime)
+	if err != nil {
+		return models.DoctorSchedule{}, fmt.Errorf("invalid end_time format (must be HH:MM): %w", err)
+	}
+	if !et.After(st) {
+		return models.DoctorSchedule{}, errors.New("end_time must be after start_time")
+	}
+
+	if in.SlotDuration == 0 {
+		in.SlotDuration = 30
+	}
+	allowedDurations := map[int]bool{15: true, 20: true, 30: true, 45: true, 60: true}
+	if !allowedDurations[in.SlotDuration] {
+		return models.DoctorSchedule{}, errors.New("slot_duration must be 15, 20, 30, 45, or 60 minutes")
+	}
+
+	tz := strings.TrimSpace(in.Timezone)
+	if tz == "" {
+		tz = "UTC"
+	}
+	if _, err := time.LoadLocation(tz); err != nil {
+		return models.DoctorSchedule{}, fmt.Errorf("invalid timezone: %w", err)
+	}
+
+	active := true
+	if in.IsActive != nil {
+		active = *in.IsActive
+	}
+
+	return models.DoctorSchedule{
+		DayOfWeek:    in.DayOfWeek,
+		StartTime:    in.StartTime,
+		EndTime:      in.EndTime,
+		SlotDuration: in.SlotDuration,
+		Timezone:     tz,
+		IsActive:     active,
+	}, nil
+}
+
+func (h *Handler) UpsertDoctorSchedule(c *gin.Context) {
+	userIDVal, ok := c.Get("userID")
+	if !ok {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "User ID not found in context"})
+		return
+	}
+	doctorID := userIDVal.(uuid.UUID)
+
+	bodyBytes, err := c.GetRawData()
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to read request body"})
+		return
+	}
+
+	var inputs []ScheduleInput
+	if err := json.Unmarshal(bodyBytes, &inputs); err != nil {
+		var single ScheduleInput
+		if errSingle := json.Unmarshal(bodyBytes, &single); errSingle != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body: expected schedule object or array of schedules"})
+			return
+		}
+		inputs = []ScheduleInput{single}
+	}
+
+	if len(inputs) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "At least one schedule item is required"})
+		return
+	}
+
+	var validated []models.DoctorSchedule
+	seenDays := make(map[int]bool)
+	for idx, in := range inputs {
+		if seenDays[in.DayOfWeek] {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Duplicate schedule entry for day_of_week %d", in.DayOfWeek)})
+			return
+		}
+		seenDays[in.DayOfWeek] = true
+
+		validSched, err := validateScheduleInput(in)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Schedule [%d]: %s", idx, err.Error())})
+			return
+		}
+		validSched.DoctorID = doctorID
+		validated = append(validated, validSched)
+	}
+
+	saved, err := h.Repo.UpsertDoctorSchedulesTx(c.Request.Context(), doctorID, validated)
+	if err != nil {
+		log.Printf("Internal error in UpsertDoctorSchedule: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save schedule"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"data": saved})
+}
+
+func (h *Handler) GetDoctorSchedules(c *gin.Context) {
+	userIDVal, ok := c.Get("userID")
+	if !ok {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "User ID not found in context"})
+		return
+	}
+	doctorID := userIDVal.(uuid.UUID)
+
+	schedules, err := h.Repo.GetDoctorSchedules(c.Request.Context(), doctorID)
+	if err != nil {
+		log.Printf("Internal error in GetDoctorSchedules: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve schedules"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"data": schedules})
+}
+
+func (h *Handler) DeleteDoctorSchedule(c *gin.Context) {
+	userIDVal, ok := c.Get("userID")
+	if !ok {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "User ID not found in context"})
+		return
+	}
+	doctorID := userIDVal.(uuid.UUID)
+
+	dayStr := c.Param("day")
+	day, err := strconv.Atoi(dayStr)
+	if err != nil || day < 0 || day > 6 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid day parameter: must be between 0 (Sunday) and 6 (Saturday)"})
+		return
+	}
+
+	if err := h.Repo.DeleteDoctorScheduleByDay(c.Request.Context(), doctorID, day); err != nil {
+		log.Printf("Internal error in DeleteDoctorSchedule: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete schedule"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Doctor schedule deleted successfully"})
+}
+
+func (h *Handler) GetDoctorAvailableSlots(c *gin.Context) {
+	idStr := c.Param("id")
+	doctorID, err := uuid.Parse(idStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid doctor ID"})
+		return
+	}
+
+	dateStr := strings.TrimSpace(c.Query("date"))
+	if dateStr == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "date query parameter is required (format: YYYY-MM-DD)"})
+		return
+	}
+
+	targetDate, err := time.Parse("2006-01-02", dateStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid date format: must be YYYY-MM-DD"})
+		return
+	}
+
+	dayOfWeek := int(targetDate.Weekday())
+
+	schedule, err := h.Repo.GetDoctorScheduleByDay(c.Request.Context(), doctorID, dayOfWeek)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			c.JSON(http.StatusOK, gin.H{
+				"date":        dateStr,
+				"day_of_week": dayOfWeek,
+				"slots":       []models.TimeSlot{},
+				"message":     "Doctor is not available on this day",
+			})
+			return
+		}
+		log.Printf("Internal error in GetDoctorScheduleByDay: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check doctor schedule"})
+		return
+	}
+	if !schedule.IsActive {
+		c.JSON(http.StatusOK, gin.H{
+			"date":        dateStr,
+			"day_of_week": dayOfWeek,
+			"slots":       []models.TimeSlot{},
+			"message":     "Doctor is not available on this day",
+		})
+		return
+	}
+
+	loc, err := time.LoadLocation(schedule.Timezone)
+	if err != nil {
+		loc = time.UTC
+	}
+
+	stParsed, err := time.Parse("15:04", schedule.StartTime)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse doctor start time"})
+		return
+	}
+	etParsed, err := time.Parse("15:04", schedule.EndTime)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse doctor end time"})
+		return
+	}
+
+	windowStart := time.Date(targetDate.Year(), targetDate.Month(), targetDate.Day(), stParsed.Hour(), stParsed.Minute(), 0, 0, loc)
+	windowEnd := time.Date(targetDate.Year(), targetDate.Month(), targetDate.Day(), etParsed.Hour(), etParsed.Minute(), 0, 0, loc)
+
+	bookedAppts, err := h.Repo.GetDoctorAppointmentsInRange(c.Request.Context(), doctorID, windowStart, windowEnd)
+	if err != nil {
+		log.Printf("Internal error fetching doctor appointments in range: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check doctor bookings"})
+		return
+	}
+
+	slotDuration := time.Duration(schedule.SlotDuration) * time.Minute
+	if slotDuration <= 0 {
+		slotDuration = 30 * time.Minute
+	}
+
+	now := time.Now()
+	minLeadTime := now.Add(15 * time.Minute)
+	slots := make([]models.TimeSlot, 0)
+
+	for curr := windowStart; curr.Add(slotDuration).Before(windowEnd) || curr.Add(slotDuration).Equal(windowEnd); curr = curr.Add(slotDuration) {
+		slotStart := curr
+		slotEnd := curr.Add(slotDuration)
+
+		available := slotStart.After(minLeadTime)
+		if available {
+			for _, b := range bookedAppts {
+				if b.StartTime.Before(slotEnd) && b.EndTime.After(slotStart) {
+					available = false
+					break
+				}
+			}
+		}
+
+		slots = append(slots, models.TimeSlot{
+			StartTime: slotStart,
+			EndTime:   slotEnd,
+			Available: available,
+		})
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"date":          dateStr,
+		"day_of_week":   dayOfWeek,
+		"slot_duration": schedule.SlotDuration,
+		"timezone":      schedule.Timezone,
+		"slots":         slots,
+	})
+}
+
+// ==========================================
+// PHASE 4: LONGITUDINAL PATIENT VITALS
+// ==========================================
+
+type VitalInput struct {
+	PatientID        *uuid.UUID `json:"patient_id,omitempty"`
+	RecordedAt       *time.Time `json:"recorded_at,omitempty"`
+	SystolicBP       *int       `json:"systolic_bp,omitempty"`
+	DiastolicBP      *int       `json:"diastolic_bp,omitempty"`
+	HeartRate        *int       `json:"heart_rate,omitempty"`
+	BloodGlucose     *float64   `json:"blood_glucose,omitempty"`
+	OxygenSaturation *float64   `json:"oxygen_saturation,omitempty"`
+	Temperature      *float64   `json:"temperature,omitempty"`
+	WeightKg         *float64   `json:"weight_kg,omitempty"`
+	Notes            string     `json:"notes,omitempty"`
+}
+
+func (h *Handler) CreatePatientVital(c *gin.Context) {
+	userIDVal, ok := c.Get("userID")
+	roleVal, roleOk := c.Get("role")
+	if !ok || !roleOk {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "User context missing"})
+		return
+	}
+	callerID := userIDVal.(uuid.UUID)
+	callerRole := roleVal.(string)
+
+	var in VitalInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+
+	var targetPatientID uuid.UUID
+	if callerRole == "patient" {
+		targetPatientID = callerID
+	} else if callerRole == "doctor" {
+		if in.PatientID == nil || *in.PatientID == uuid.Nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "patient_id is required when recording vitals as a doctor"})
+			return
+		}
+		targetPatientID = *in.PatientID
+		hasRel, err := h.Repo.HasDoctorPatientRelationship(c.Request.Context(), callerID, targetPatientID)
+		if err != nil {
+			log.Printf("Internal error checking doctor-patient relationship: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify patient relationship"})
+			return
+		}
+		if !hasRel {
+			c.JSON(http.StatusForbidden, gin.H{"error": "Access denied: no clinical relationship with this patient"})
+			return
+		}
+	} else {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Unauthorized role for recording vitals"})
+		return
+	}
+
+	if len([]rune(strings.TrimSpace(in.Notes))) > 2000 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "notes exceeds maximum length of 2000 characters"})
+		return
+	}
+
+	hasMetric := in.SystolicBP != nil || in.DiastolicBP != nil || in.HeartRate != nil ||
+		in.BloodGlucose != nil || in.OxygenSaturation != nil || in.Temperature != nil || in.WeightKg != nil
+	if !hasMetric {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "At least one vital measurement must be provided"})
+		return
+	}
+
+	isInvalidFloat := func(f *float64) bool {
+		return f != nil && (math.IsNaN(*f) || math.IsInf(*f, 0))
+	}
+	if isInvalidFloat(in.BloodGlucose) || isInvalidFloat(in.OxygenSaturation) || isInvalidFloat(in.Temperature) || isInvalidFloat(in.WeightKg) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Vital measurements must be valid finite numbers"})
+		return
+	}
+
+	if in.SystolicBP != nil && (*in.SystolicBP < 50 || *in.SystolicBP > 300) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "systolic_bp must be between 50 and 300 mmHg"})
+		return
+	}
+	if in.DiastolicBP != nil && (*in.DiastolicBP < 30 || *in.DiastolicBP > 200) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "diastolic_bp must be between 30 and 200 mmHg"})
+		return
+	}
+	if in.SystolicBP != nil && in.DiastolicBP != nil && *in.SystolicBP <= *in.DiastolicBP {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "systolic_bp must be strictly greater than diastolic_bp"})
+		return
+	}
+	if in.HeartRate != nil && (*in.HeartRate < 30 || *in.HeartRate > 250) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "heart_rate must be between 30 and 250 bpm"})
+		return
+	}
+	if in.BloodGlucose != nil && (*in.BloodGlucose < 10.0 || *in.BloodGlucose > 1000.0) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "blood_glucose must be between 10 and 1000 mg/dL"})
+		return
+	}
+	if in.OxygenSaturation != nil && (*in.OxygenSaturation < 50.0 || *in.OxygenSaturation > 100.0) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "oxygen_saturation must be between 50% and 100%"})
+		return
+	}
+	if in.Temperature != nil && (*in.Temperature < 30.0 || *in.Temperature > 45.0) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "temperature must be between 30.0 and 45.0 °C"})
+		return
+	}
+	if in.WeightKg != nil && (*in.WeightKg < 1.0 || *in.WeightKg > 500.0) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "weight_kg must be between 1.0 and 500.0 kg"})
+		return
+	}
+
+	recAt := time.Now()
+	if in.RecordedAt != nil && !in.RecordedAt.IsZero() {
+		if in.RecordedAt.After(time.Now().Add(5 * time.Minute)) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "recorded_at cannot be in the future"})
+			return
+		}
+		recAt = *in.RecordedAt
+	}
+
+	vital := models.PatientVital{
+		PatientID:        targetPatientID,
+		RecordedBy:       callerID,
+		RecordedAt:       recAt,
+		SystolicBP:       in.SystolicBP,
+		DiastolicBP:      in.DiastolicBP,
+		HeartRate:        in.HeartRate,
+		BloodGlucose:     in.BloodGlucose,
+		OxygenSaturation: in.OxygenSaturation,
+		Temperature:      in.Temperature,
+		WeightKg:         in.WeightKg,
+		Notes:            strings.TrimSpace(in.Notes),
+	}
+
+	newID, err := h.Repo.CreatePatientVital(c.Request.Context(), vital)
+	if err != nil {
+		log.Printf("Internal error in CreatePatientVital: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to record vital measurement"})
+		return
+	}
+
+	c.JSON(http.StatusCreated, gin.H{"id": newID})
+}
+
+func (h *Handler) GetPatientVitals(c *gin.Context) {
+	userIDVal, ok := c.Get("userID")
+	roleVal, roleOk := c.Get("role")
+	if !ok || !roleOk {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "User context missing"})
+		return
+	}
+	callerID := userIDVal.(uuid.UUID)
+	callerRole := roleVal.(string)
+
+	var targetPatientID uuid.UUID
+	if callerRole == "patient" {
+		targetPatientID = callerID
+	} else if callerRole == "doctor" {
+		patientIDStr := c.Query("patient_id")
+		if patientIDStr == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "patient_id query parameter is required for doctors"})
+			return
+		}
+		parsedID, err := uuid.Parse(patientIDStr)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid patient_id"})
+			return
+		}
+		targetPatientID = parsedID
+		hasRel, err := h.Repo.HasDoctorPatientRelationship(c.Request.Context(), callerID, targetPatientID)
+		if err != nil {
+			log.Printf("Internal error checking doctor-patient relationship: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify patient relationship"})
+			return
+		}
+		if !hasRel {
+			c.JSON(http.StatusForbidden, gin.H{"error": "Access denied: no clinical relationship with this patient"})
+			return
+		}
+	} else {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
+		return
+	}
+
+	var startDate, endDate *time.Time
+	if sStr := strings.TrimSpace(c.Query("start_date")); sStr != "" {
+		if t, err := time.Parse(time.RFC3339, sStr); err == nil {
+			startDate = &t
+		} else if t, err := time.Parse("2006-01-02", sStr); err == nil {
+			startDate = &t
+		} else {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid start_date format (RFC3339 or YYYY-MM-DD)"})
+			return
+		}
+	}
+	if eStr := strings.TrimSpace(c.Query("end_date")); eStr != "" {
+		if t, err := time.Parse(time.RFC3339, eStr); err == nil {
+			endDate = &t
+		} else if t, err := time.Parse("2006-01-02", eStr); err == nil {
+			eEnd := t.Add(24*time.Hour - time.Microsecond)
+			endDate = &eEnd
+		} else {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid end_date format (RFC3339 or YYYY-MM-DD)"})
+			return
+		}
+	}
+	if startDate != nil && endDate != nil && endDate.Before(*startDate) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "end_date cannot be before start_date"})
+		return
+	}
+
+	limit := 20
+	offset := 0
+	if lStr := c.Query("limit"); lStr != "" {
+		if l, err := strconv.Atoi(lStr); err == nil && l > 0 {
+			limit = l
+			if limit > 100 {
+				limit = 100
+			}
+		}
+	}
+	if oStr := c.Query("offset"); oStr != "" {
+		if o, err := strconv.Atoi(oStr); err == nil && o >= 0 {
+			offset = o
+		}
+	}
+
+	vitals, err := h.Repo.GetPatientVitals(c.Request.Context(), targetPatientID, startDate, endDate, limit, offset)
+	if err != nil {
+		log.Printf("Internal error in GetPatientVitals: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve vitals"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"data":   vitals,
+		"limit":  limit,
+		"offset": offset,
+	})
+}
+
+// ==========================================
+// PHASE 4: MEDICATION SCHEDULE & ADHERENCE
+// ==========================================
+
+func (h *Handler) GetPatientMedicationSchedule(c *gin.Context) {
+	userIDVal, ok := c.Get("userID")
+	roleVal, roleOk := c.Get("role")
+	if !ok || !roleOk {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "User context missing"})
+		return
+	}
+	callerID := userIDVal.(uuid.UUID)
+	callerRole := roleVal.(string)
+
+	var targetPatientID uuid.UUID
+	if callerRole == "patient" {
+		targetPatientID = callerID
+	} else if callerRole == "doctor" {
+		patientIDStr := c.Query("patient_id")
+		if patientIDStr == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "patient_id query parameter is required for doctors"})
+			return
+		}
+		parsedID, err := uuid.Parse(patientIDStr)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid patient_id"})
+			return
+		}
+		targetPatientID = parsedID
+		hasRel, err := h.Repo.HasDoctorPatientRelationship(c.Request.Context(), callerID, targetPatientID)
+		if err != nil {
+			log.Printf("Internal error checking doctor-patient relationship: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify patient relationship"})
+			return
+		}
+		if !hasRel {
+			c.JSON(http.StatusForbidden, gin.H{"error": "Access denied: no clinical relationship with this patient"})
+			return
+		}
+	} else {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
+		return
+	}
+
+	targetDate := time.Now()
+	if dateStr := strings.TrimSpace(c.Query("date")); dateStr != "" {
+		if d, err := time.Parse("2006-01-02", dateStr); err == nil {
+			targetDate = d
+		} else {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid date format: must be YYYY-MM-DD"})
+			return
+		}
+	}
+
+	items, err := h.Repo.GetActivePrescriptionItemsForPatient(c.Request.Context(), targetPatientID, targetDate)
+	if err != nil {
+		log.Printf("Internal error fetching active prescription items: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch prescription medications"})
+		return
+	}
+
+	existingLogs, err := h.Repo.GetMedicationLogsByDate(c.Request.Context(), targetPatientID, targetDate)
+	if err != nil {
+		log.Printf("Internal error fetching medication logs: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch medication logs"})
+		return
+	}
+
+	dailySchedule := schedule.BuildDailySchedule(targetPatientID, targetDate, items, existingLogs)
+
+	c.JSON(http.StatusOK, gin.H{
+		"date":       targetDate.Format("2006-01-02"),
+		"patient_id": targetPatientID,
+		"schedule":   dailySchedule,
+	})
+}
+
+type MedicationLogInput struct {
+	PrescriptionItemID uuid.UUID  `json:"prescription_item_id"`
+	ScheduledDate      string     `json:"scheduled_date"`
+	TimeOfDay          string     `json:"time_of_day"`
+	DoseNumber         int        `json:"dose_number"`
+	MealTiming         string     `json:"meal_timing,omitempty"`
+	Status             string     `json:"status"`
+	TakenAt            *time.Time `json:"taken_at,omitempty"`
+	Notes              string     `json:"notes,omitempty"`
+}
+
+func (h *Handler) LogMedicationAdherence(c *gin.Context) {
+	userIDVal, ok := c.Get("userID")
+	if !ok {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "User ID not found in context"})
+		return
+	}
+	patientID := userIDVal.(uuid.UUID)
+
+	var in MedicationLogInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+
+	if in.PrescriptionItemID == uuid.Nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "prescription_item_id is required"})
+		return
+	}
+
+	isOwner, err := h.Repo.VerifyPrescriptionItemOwnership(c.Request.Context(), in.PrescriptionItemID, patientID)
+	if err != nil {
+		log.Printf("Internal error verifying prescription item ownership: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify medication item"})
+		return
+	}
+	if !isOwner {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied: prescription item does not belong to this patient"})
+		return
+	}
+
+	if len([]rune(strings.TrimSpace(in.Notes))) > 2000 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "notes exceeds maximum length of 2000 characters"})
+		return
+	}
+
+	schedDate, err := time.Parse("2006-01-02", strings.TrimSpace(in.ScheduledDate))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid scheduled_date format: must be YYYY-MM-DD"})
+		return
+	}
+
+	if schedDate.After(time.Now().Add(24 * time.Hour)) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "scheduled_date cannot be more than 1 day in the future"})
+		return
+	}
+
+	in.TimeOfDay = strings.ToLower(strings.TrimSpace(in.TimeOfDay))
+	allowedSlots := map[string]bool{"morning": true, "afternoon": true, "evening": true, "bedtime": true, "as_needed": true}
+	if !allowedSlots[in.TimeOfDay] {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid time_of_day: must be morning, afternoon, evening, bedtime, or as_needed"})
+		return
+	}
+
+	in.Status = strings.ToLower(strings.TrimSpace(in.Status))
+	allowedStatuses := map[string]bool{"taken": true, "skipped": true, "pending": true}
+	if !allowedStatuses[in.Status] {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid status: must be taken, skipped, or pending"})
+		return
+	}
+
+	doseNum := in.DoseNumber
+	if doseNum <= 0 {
+		doseNum = 1
+	}
+
+	var takenAt *time.Time
+	if in.Status == "taken" {
+		if in.TakenAt != nil && !in.TakenAt.IsZero() {
+			if in.TakenAt.After(time.Now().Add(5 * time.Minute)) {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "taken_at cannot be in the future"})
+				return
+			}
+			takenAt = in.TakenAt
+		} else {
+			now := time.Now()
+			takenAt = &now
+		}
+	}
+
+	logEntry := models.MedicationLog{
+		PatientID:          patientID,
+		PrescriptionItemID: in.PrescriptionItemID,
+		ScheduledDate:      schedDate,
+		TimeOfDay:          in.TimeOfDay,
+		DoseNumber:         doseNum,
+		MealTiming:         strings.TrimSpace(in.MealTiming),
+		Status:             in.Status,
+		TakenAt:            takenAt,
+		Notes:              strings.TrimSpace(in.Notes),
+	}
+
+	saved, err := h.Repo.UpsertMedicationLog(c.Request.Context(), logEntry)
+	if err != nil {
+		log.Printf("Internal error in UpsertMedicationLog: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to log medication adherence"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"data": saved})
 }

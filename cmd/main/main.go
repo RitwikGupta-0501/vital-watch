@@ -32,6 +32,7 @@ import (
 	"github.com/RitwikGupta-0501/vital-watch/internal/repository"
 	"github.com/RitwikGupta-0501/vital-watch/internal/safety"
 	"github.com/RitwikGupta-0501/vital-watch/internal/storage"
+	"github.com/RitwikGupta-0501/vital-watch/internal/telehealth"
 )
 
 /*
@@ -210,10 +211,11 @@ func main() {
 	// Initialize Repository (breaks initialization cycle with River)
 	repo := repository.New(pool, nil)
 
-	// Initialize PDF Generator, DDI Safety Engine, and Real-Time SSE Broker
+	// Initialize PDF Generator, DDI Safety Engine, Real-Time SSE Broker, and Telehealth
 	pdfGen := pdf.NewStandardPDFGenerator()
 	safetyChecker := safety.NewOpenFDAChecker()
 	notifier := notifications.NewSSEBroker()
+	telehealthProv := telehealth.NewTelehealthManager(jwtSecret)
 
 	// Initialize River Task Queue & Worker
 	ocrWorker := queue.NewPrescriptionOCRWorker(repo, storageProvider, ocrManager)
@@ -240,6 +242,7 @@ func main() {
 		PDFGenerator:     pdfGen,
 		SafetyChecker:    safetyChecker,
 		Notifier:         notifier,
+		Telehealth:       telehealthProv,
 	}
 
 	// Set up Gin Router
@@ -340,6 +343,13 @@ func setupRouter(h *api.Handler, storageType string, jwtSecret []byte) *gin.Engi
 		authGroup.GET("/prescriptions/:id", h.GetPrescriptionByID)
 		authGroup.GET("/prescriptions/:id/download-url", h.DownloadPrescription)
 
+		// Phase 4: Common Telehealth, Scheduling, Vitals, and Schedules
+		authGroup.GET("/appointments/:id/meeting-room", h.GetAppointmentMeetingRoom)
+		authGroup.GET("/doctors/:id/available-slots", h.GetDoctorAvailableSlots)
+		authGroup.POST("/vitals", h.CreatePatientVital)
+		authGroup.GET("/vitals", h.GetPatientVitals)
+		authGroup.GET("/patients/medication-schedule", h.GetPatientMedicationSchedule)
+
 		// Patient-only Routes
 		patientGroup := authGroup.Group("")
 		patientGroup.Use(api.RequireRole("patient"))
@@ -349,6 +359,7 @@ func setupRouter(h *api.Handler, storageType string, jwtSecret []byte) *gin.Engi
 			patientGroup.GET("/patient/prescriptions", h.GetPatientPrescriptions)
 			patientGroup.POST("/appointments", h.CreateAppointment)
 			patientGroup.GET("/patient/prescriptions/:filename/download-url", h.DownloadPrescription)
+			patientGroup.POST("/patients/medication-schedule/log", h.LogMedicationAdherence)
 		}
 
 		// Doctor-only Routes
@@ -367,6 +378,9 @@ func setupRouter(h *api.Handler, storageType string, jwtSecret []byte) *gin.Engi
 			doctorGroup.GET("/doctor/patients/:id/appointments", h.GetPatientHistoryAppointments)
 			doctorGroup.GET("/doctor/patients/:id/prescriptions", h.GetPatientHistoryPrescriptions)
 			doctorGroup.PATCH("/appointments/:id", h.MarkAppointmentAsCompleted)
+			doctorGroup.PUT("/doctor/schedules", h.UpsertDoctorSchedule)
+			doctorGroup.GET("/doctor/schedules", h.GetDoctorSchedules)
+			doctorGroup.DELETE("/doctor/schedules/:day", h.DeleteDoctorSchedule)
 		}
 	}
 

@@ -89,6 +89,8 @@ type Appointment struct {
 	EndTime         time.Time `json:"end_time"`
 	Status          string    `json:"status"`
 	Type            string    `json:"type"`
+	MeetingLink     string    `json:"meeting_link,omitempty"`
+	MeetingID       string    `json:"meeting_id,omitempty"`
 	DoctorName      string    `json:"doctor_name,omitempty"`
 	DoctorSpecialty string    `json:"doctor_specialty,omitempty"`
 	PatientName     string    `json:"patient_name,omitempty"`
@@ -121,4 +123,59 @@ type Prescription struct {
 	UpdatedAt   time.Time          `json:"updated_at"`
 	DoctorName  string             `json:"doctor_name,omitempty"`
 	PatientName string             `json:"patient_name,omitempty"`
+}
+
+type DoctorSchedule struct {
+	ID           uuid.UUID `json:"id"`
+	DoctorID     uuid.UUID `json:"doctor_id"`
+	DayOfWeek    int       `json:"day_of_week"` // 0 = Sunday, 1 = Monday, ..., 6 = Saturday
+	StartTime    string    `json:"start_time"`  // "HH:MM" e.g. "09:00"
+	EndTime      string    `json:"end_time"`    // "HH:MM" e.g. "17:00"
+	SlotDuration int       `json:"slot_duration"`
+	Timezone     string    `json:"timezone"`
+	IsActive     bool      `json:"is_active"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+type TimeSlot struct {
+	StartTime time.Time `json:"start_time"`
+	EndTime   time.Time `json:"end_time"`
+	Available bool      `json:"available"`
+}
+
+type PatientVital struct {
+	ID               uuid.UUID `json:"id"`
+	PatientID        uuid.UUID `json:"patient_id"`
+	RecordedBy       uuid.UUID `json:"recorded_by"`
+	RecordedAt       time.Time `json:"recorded_at"`
+	SystolicBP       *int      `json:"systolic_bp,omitempty"`
+	DiastolicBP      *int      `json:"diastolic_bp,omitempty"`
+	HeartRate        *int      `json:"heart_rate,omitempty"`
+	BloodGlucose     *float64  `json:"blood_glucose,omitempty"`
+	OxygenSaturation *float64  `json:"oxygen_saturation,omitempty"`
+	Temperature      *float64  `json:"temperature,omitempty"`
+	WeightKg         *float64  `json:"weight_kg,omitempty"`
+	Notes            string    `json:"notes,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
+	RecorderName     string    `json:"recorder_name,omitempty"`
+	RecorderRole     string    `json:"recorder_role,omitempty"`
+}
+
+type MedicationLog struct {
+	ID                 uuid.UUID  `json:"id"`
+	PatientID          uuid.UUID  `json:"patient_id"`
+	PrescriptionItemID uuid.UUID  `json:"prescription_item_id"`
+	ScheduledDate      time.Time  `json:"scheduled_date"`
+	TimeOfDay          string     `json:"time_of_day"` // 'morning', 'afternoon', 'evening', 'bedtime', 'as_needed'
+	DoseNumber         int        `json:"dose_number"`
+	MealTiming         string     `json:"meal_timing,omitempty"`
+	Status             string     `json:"status"` // 'pending', 'taken', 'skipped'
+	TakenAt            *time.Time `json:"taken_at,omitempty"`
+	Notes              string     `json:"notes,omitempty"`
+	MedicationName     string     `json:"medication_name,omitempty"`
+	Dosage             string     `json:"dosage,omitempty"`
+	Timing             string     `json:"timing,omitempty"`
+	Instructions       string     `json:"instructions,omitempty"`
+	CreatedAt          time.Time  `json:"created_at"`
 }

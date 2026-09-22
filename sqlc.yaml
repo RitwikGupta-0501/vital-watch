@@ -4,6 +4,7 @@ sql:
     schema:
       - "migrations/000001_init_schema.up.sql"
       - "migrations/000002_prescriptions_dual_mode.up.sql"
+      - "migrations/000004_phase4_scheduling_vitals.up.sql"
     queries: "internal/repository/queries"
     gen:
       go:

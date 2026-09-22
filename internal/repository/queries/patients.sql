@@ -27,3 +27,10 @@ JOIN appointments a ON u.id = a.patient_id
 WHERE a.doctor_id = $1
 ORDER BY u.created_at DESC
 LIMIT $2 OFFSET $3;
+
+-- name: HasDoctorPatientRelationship :one
+SELECT (
+    EXISTS (SELECT 1 FROM appointments a WHERE a.doctor_id = $1 AND a.patient_id = $2 AND a.status != 'cancelled')
+    OR
+    EXISTS (SELECT 1 FROM prescriptions p WHERE p.doctor_id = $1 AND p.patient_id = $2)
+) AS has_relationship;

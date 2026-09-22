@@ -18,7 +18,7 @@ import (
 
 func TestCreateAppointment_InputValidation(t *testing.T) {
 	mockRepo := &repository.MockRepository{
-		CreateAppointmentFunc: func(ctx context.Context, patientID, doctorID uuid.UUID, startTime, endTime time.Time, apptType string) (uuid.UUID, error) {
+		CreateAppointmentFunc: func(ctx context.Context, id, patientID, doctorID uuid.UUID, startTime, endTime time.Time, apptType, meetingLink, meetingID string) (uuid.UUID, error) {
 			return uuid.New(), nil
 		},
 	}
