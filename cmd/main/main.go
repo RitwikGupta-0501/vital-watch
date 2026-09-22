@@ -25,6 +25,9 @@ import (
 	"github.com/joho/godotenv"
 
 	"github.com/RitwikGupta-0501/vital-watch/internal/api"
+	"github.com/RitwikGupta-0501/vital-watch/internal/audit"
+	_ "github.com/RitwikGupta-0501/vital-watch/internal/logger"
+	"github.com/RitwikGupta-0501/vital-watch/internal/middleware"
 	"github.com/RitwikGupta-0501/vital-watch/internal/notifications"
 	"github.com/RitwikGupta-0501/vital-watch/internal/ocr"
 	"github.com/RitwikGupta-0501/vital-watch/internal/pdf"
@@ -216,6 +219,7 @@ func main() {
 	safetyChecker := safety.NewOpenFDAChecker()
 	notifier := notifications.NewSSEBroker()
 	telehealthProv := telehealth.NewTelehealthManager(jwtSecret)
+	auditor := audit.NewAsyncAuditor(repo, 1000)
 
 	// Initialize River Task Queue & Worker
 	ocrWorker := queue.NewPrescriptionOCRWorker(repo, storageProvider, ocrManager)
@@ -243,6 +247,7 @@ func main() {
 		SafetyChecker:    safetyChecker,
 		Notifier:         notifier,
 		Telehealth:       telehealthProv,
+		Auditor:          auditor,
 	}
 
 	// Set up Gin Router
@@ -292,12 +297,22 @@ func main() {
 		log.Printf("River client stop error: %v", err)
 	}
 
+	// Graceful shutdown: HIPAA ePHI Auditor
+	log.Println("Flushing and shutting down HIPAA audit worker...")
+	auditShutdownCtx, auditCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer auditCancel()
+	if err := auditor.Shutdown(auditShutdownCtx); err != nil {
+		log.Printf("Auditor shutdown error: %v", err)
+	}
+
 	log.Println("Server exited gracefully.")
 }
 
 // setupRouter builds and configures the Gin engine and route tree
 func setupRouter(h *api.Handler, storageType string, jwtSecret []byte) *gin.Engine {
-	r := gin.Default()
+	r := gin.New()
+	r.Use(gin.Recovery())
+	r.Use(middleware.RequestIDMiddleware())
 
 	// Configure CORS
 	corsOrigins := os.Getenv("CORS_ALLOWED_ORIGINS")
@@ -330,6 +345,8 @@ func setupRouter(h *api.Handler, storageType string, jwtSecret []byte) *gin.Engi
 	r.GET("/api/ping", h.Ping)
 	r.POST("/api/register", h.Register)
 	r.POST("/api/login", h.Login)
+	r.POST("/api/auth/refresh", h.RefreshToken)
+	r.POST("/api/auth/logout", h.Logout)
 
 	// Real-Time Notification SSE Stream (Supports EventSource query token and Bearer header)
 	r.GET("/api/notifications/stream", api.SSEAuthMiddleware(jwtSecret), h.StreamNotifications)
@@ -342,6 +359,7 @@ func setupRouter(h *api.Handler, storageType string, jwtSecret []byte) *gin.Engi
 		authGroup.GET("/profile", h.GetUserProfile)
 		authGroup.GET("/prescriptions/:id", h.GetPrescriptionByID)
 		authGroup.GET("/prescriptions/:id/download-url", h.DownloadPrescription)
+		authGroup.GET("/compliance/audit-logs", h.GetComplianceAuditLogs)
 
 		// Phase 4: Common Telehealth, Scheduling, Vitals, and Schedules
 		authGroup.GET("/appointments/:id/meeting-room", h.GetAppointmentMeetingRoom)

@@ -1397,3 +1397,217 @@ func (r *DBRepository) HasDoctorPatientRelationship(ctx context.Context, doctorI
 	}
 	return res.Bool, nil
 }
+
+// ==========================================
+// PHASE 5: REFRESH TOKENS & SESSION MGMT
+// ==========================================
+
+func (r *DBRepository) CreateRefreshToken(ctx context.Context, userID uuid.UUID, tokenHash string, expiresAt time.Time) (models.RefreshToken, error) {
+	row, err := r.queries.CreateRefreshToken(ctx, dbgen.CreateRefreshTokenParams{
+		UserID:    userID,
+		TokenHash: tokenHash,
+		ExpiresAt: pgtype.Timestamptz{Time: expiresAt, Valid: true},
+	})
+	if err != nil {
+		return models.RefreshToken{}, err
+	}
+	var revokedAt *time.Time
+	if row.RevokedAt.Valid {
+		t := row.RevokedAt.Time
+		revokedAt = &t
+	}
+	var replacedBy *uuid.UUID
+	if row.ReplacedByTokenID.Valid {
+		u := uuid.UUID(row.ReplacedByTokenID.Bytes)
+		replacedBy = &u
+	}
+	return models.RefreshToken{
+		ID:                row.ID,
+		UserID:            row.UserID,
+		TokenHash:         row.TokenHash,
+		ExpiresAt:         row.ExpiresAt.Time,
+		RevokedAt:         revokedAt,
+		ReplacedByTokenID: replacedBy,
+		CreatedAt:         row.CreatedAt.Time,
+	}, nil
+}
+
+func (r *DBRepository) GetRefreshTokenByHash(ctx context.Context, tokenHash string) (models.RefreshToken, error) {
+	row, err := r.queries.GetRefreshTokenByHash(ctx, tokenHash)
+	if err != nil {
+		return models.RefreshToken{}, err
+	}
+	var revokedAt *time.Time
+	if row.RevokedAt.Valid {
+		t := row.RevokedAt.Time
+		revokedAt = &t
+	}
+	var replacedBy *uuid.UUID
+	if row.ReplacedByTokenID.Valid {
+		u := uuid.UUID(row.ReplacedByTokenID.Bytes)
+		replacedBy = &u
+	}
+	return models.RefreshToken{
+		ID:                row.ID,
+		UserID:            row.UserID,
+		TokenHash:         row.TokenHash,
+		ExpiresAt:         row.ExpiresAt.Time,
+		RevokedAt:         revokedAt,
+		ReplacedByTokenID: replacedBy,
+		CreatedAt:         row.CreatedAt.Time,
+	}, nil
+}
+
+func (r *DBRepository) RevokeRefreshToken(ctx context.Context, id uuid.UUID, replacedByTokenID *uuid.UUID) error {
+	var replaced pgtype.UUID
+	if replacedByTokenID != nil {
+		replaced = pgtype.UUID{Bytes: *replacedByTokenID, Valid: true}
+	}
+	return r.queries.RevokeRefreshToken(ctx, dbgen.RevokeRefreshTokenParams{
+		ID:                id,
+		ReplacedByTokenID: replaced,
+	})
+}
+
+func (r *DBRepository) RevokeAllUserRefreshTokens(ctx context.Context, userID uuid.UUID) error {
+	return r.queries.RevokeAllUserRefreshTokens(ctx, userID)
+}
+
+// ==========================================
+// PHASE 5: HIPAA ePHI AUDIT LOGGING
+// ==========================================
+
+func (r *DBRepository) CreateAuditLog(ctx context.Context, log models.PhiAuditLog) (uuid.UUID, error) {
+	var uid, rid, pid, reqID pgtype.UUID
+	if log.UserID != nil {
+		uid = pgtype.UUID{Bytes: *log.UserID, Valid: true}
+	}
+	if log.ResourceID != nil {
+		rid = pgtype.UUID{Bytes: *log.ResourceID, Valid: true}
+	}
+	if log.PatientID != nil {
+		pid = pgtype.UUID{Bytes: *log.PatientID, Valid: true}
+	}
+	if log.RequestID != nil {
+		reqID = pgtype.UUID{Bytes: *log.RequestID, Valid: true}
+	}
+
+	metaBytes := []byte(log.Metadata)
+	if len(metaBytes) == 0 {
+		metaBytes = []byte("{}")
+	}
+
+	row, err := r.queries.CreateAuditLog(ctx, dbgen.CreateAuditLogParams{
+		UserID:       uid,
+		UserRole:     pgtype.Text{String: log.UserRole, Valid: log.UserRole != ""},
+		Action:       log.Action,
+		ResourceType: log.ResourceType,
+		ResourceID:   rid,
+		PatientID:    pid,
+		IpAddress:    pgtype.Text{String: log.IPAddress, Valid: log.IPAddress != ""},
+		UserAgent:    pgtype.Text{String: log.UserAgent, Valid: log.UserAgent != ""},
+		RequestID:    reqID,
+		StatusCode:   pgtype.Int4{Int32: int32(log.StatusCode), Valid: log.StatusCode > 0},
+		Metadata:     metaBytes,
+	})
+	if err != nil {
+		return uuid.Nil, err
+	}
+	return row.ID, nil
+}
+
+func (r *DBRepository) GetAuditLogsByPatientID(ctx context.Context, patientID uuid.UUID, limit, offset int) ([]models.PhiAuditLog, error) {
+	lim, off := clampPagination(limit, offset)
+	rows, err := r.queries.GetAuditLogsByPatientID(ctx, dbgen.GetAuditLogsByPatientIDParams{
+		PatientID: pgtype.UUID{Bytes: patientID, Valid: true},
+		Limit:     int32(lim),
+		Offset:    int32(off),
+	})
+	if err != nil {
+		return nil, err
+	}
+	logs := make([]models.PhiAuditLog, 0, len(rows))
+	for _, row := range rows {
+		var uid, rid, pid, reqID *uuid.UUID
+		if row.UserID.Valid {
+			u := uuid.UUID(row.UserID.Bytes)
+			uid = &u
+		}
+		if row.ResourceID.Valid {
+			u := uuid.UUID(row.ResourceID.Bytes)
+			rid = &u
+		}
+		if row.PatientID.Valid {
+			u := uuid.UUID(row.PatientID.Bytes)
+			pid = &u
+		}
+		if row.RequestID.Valid {
+			u := uuid.UUID(row.RequestID.Bytes)
+			reqID = &u
+		}
+		logs = append(logs, models.PhiAuditLog{
+			ID:           row.ID,
+			UserID:       uid,
+			UserRole:     row.UserRole.String,
+			Action:       row.Action,
+			ResourceType: row.ResourceType,
+			ResourceID:   rid,
+			PatientID:    pid,
+			IPAddress:    row.IpAddress.String,
+			UserAgent:    row.UserAgent.String,
+			RequestID:    reqID,
+			StatusCode:   int(row.StatusCode.Int32),
+			Metadata:     string(row.Metadata),
+			CreatedAt:    row.CreatedAt.Time,
+		})
+	}
+	return logs, nil
+}
+
+func (r *DBRepository) GetAuditLogs(ctx context.Context, limit, offset int) ([]models.PhiAuditLog, error) {
+	lim, off := clampPagination(limit, offset)
+	rows, err := r.queries.GetAuditLogs(ctx, dbgen.GetAuditLogsParams{
+		Limit:  int32(lim),
+		Offset: int32(off),
+	})
+	if err != nil {
+		return nil, err
+	}
+	logs := make([]models.PhiAuditLog, 0, len(rows))
+	for _, row := range rows {
+		var uid, rid, pid, reqID *uuid.UUID
+		if row.UserID.Valid {
+			u := uuid.UUID(row.UserID.Bytes)
+			uid = &u
+		}
+		if row.ResourceID.Valid {
+			u := uuid.UUID(row.ResourceID.Bytes)
+			rid = &u
+		}
+		if row.PatientID.Valid {
+			u := uuid.UUID(row.PatientID.Bytes)
+			pid = &u
+		}
+		if row.RequestID.Valid {
+			u := uuid.UUID(row.RequestID.Bytes)
+			reqID = &u
+		}
+		logs = append(logs, models.PhiAuditLog{
+			ID:           row.ID,
+			UserID:       uid,
+			UserRole:     row.UserRole.String,
+			Action:       row.Action,
+			ResourceType: row.ResourceType,
+			ResourceID:   rid,
+			PatientID:    pid,
+			IPAddress:    row.IpAddress.String,
+			UserAgent:    row.UserAgent.String,
+			RequestID:    reqID,
+			StatusCode:   int(row.StatusCode.Int32),
+			Metadata:     string(row.Metadata),
+			CreatedAt:    row.CreatedAt.Time,
+		})
+	}
+	return logs, nil
+}
+

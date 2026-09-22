@@ -21,6 +21,10 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/RitwikGupta-0501/vital-watch/internal/models"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"github.com/RitwikGupta-0501/vital-watch/internal/audit"
 	"github.com/RitwikGupta-0501/vital-watch/internal/notifications"
 	"github.com/RitwikGupta-0501/vital-watch/internal/pdf"
 	"github.com/RitwikGupta-0501/vital-watch/internal/repository"
@@ -41,6 +45,7 @@ type Handler struct {
 	SafetyChecker    safety.Checker
 	Notifier         notifications.Broker
 	Telehealth       telehealth.Provider
+	Auditor          audit.Auditor
 }
 
 func (h *Handler) Ping(c *gin.Context) {
@@ -181,11 +186,12 @@ func (h *Handler) Login(c *gin.Context) {
 		return
 	}
 
+	// Access token lifetime: 15 minutes (SEC-09)
 	claims := jwt.MapClaims{
 		"sub":  user.GetID().String(),
 		"role": req.Role,
 		"iat":  time.Now().Unix(),
-		"exp":  time.Now().Add(time.Hour * 24 * 7).Unix(),
+		"exp":  time.Now().Add(15 * time.Minute).Unix(),
 		"iss":  "vital-watch",
 	}
 
@@ -197,8 +203,27 @@ func (h *Handler) Login(c *gin.Context) {
 		return
 	}
 
+	// Cryptographically secure refresh token (7-day validity)
+	rawRefresh, refreshHash, err := generateSecureRandomToken()
+	if err != nil {
+		log.Println("Failed to generate refresh token:", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate session tokens"})
+		return
+	}
+
+	_, err = h.Repo.CreateRefreshToken(c.Request.Context(), user.GetID(), refreshHash, time.Now().Add(7*24*time.Hour))
+	if err != nil {
+		log.Println("Failed to store refresh token:", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to store session tokens"})
+		return
+	}
+
 	c.JSON(http.StatusOK, gin.H{
-		"token": tokenString,
+		"access_token":  tokenString,
+		"refresh_token": rawRefresh,
+		"token_type":    "Bearer",
+		"expires_in":    900,
+		"token":         tokenString,
 	})
 }
 
@@ -1994,6 +2019,7 @@ func (h *Handler) CreatePatientVital(c *gin.Context) {
 		return
 	}
 
+	h.audit(c, audit.ActionRecordVitals, "vital", &newID, &targetPatientID, http.StatusCreated, nil)
 	c.JSON(http.StatusCreated, gin.H{"id": newID})
 }
 
@@ -2087,6 +2113,7 @@ func (h *Handler) GetPatientVitals(c *gin.Context) {
 		return
 	}
 
+	h.audit(c, audit.ActionViewVitals, "vital", nil, &targetPatientID, http.StatusOK, map[string]interface{}{"count": len(vitals)})
 	c.JSON(http.StatusOK, gin.H{
 		"data":   vitals,
 		"limit":  limit,
@@ -2164,6 +2191,7 @@ func (h *Handler) GetPatientMedicationSchedule(c *gin.Context) {
 
 	dailySchedule := schedule.BuildDailySchedule(targetPatientID, targetDate, items, existingLogs)
 
+	h.audit(c, audit.ActionViewMedicationSchedule, "schedule", nil, &targetPatientID, http.StatusOK, map[string]interface{}{"date": targetDate.Format("2006-01-02")})
 	c.JSON(http.StatusOK, gin.H{
 		"date":       targetDate.Format("2006-01-02"),
 		"patient_id": targetPatientID,
@@ -2280,5 +2308,216 @@ func (h *Handler) LogMedicationAdherence(c *gin.Context) {
 		return
 	}
 
+	h.audit(c, audit.ActionLogMedicationAdherence, "schedule", &saved.ID, &patientID, http.StatusOK, map[string]interface{}{"status": in.Status, "time_of_day": in.TimeOfDay})
 	c.JSON(http.StatusOK, gin.H{"data": saved})
 }
+
+// ==========================================
+// PHASE 5: TOKEN MANAGEMENT & HIPAA AUDITING
+// ==========================================
+
+func generateSecureRandomToken() (raw string, hash string, err error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", "", err
+	}
+	raw = hex.EncodeToString(b)
+	h := sha256.Sum256([]byte(raw))
+	hash = hex.EncodeToString(h[:])
+	return raw, hash, nil
+}
+
+func hashToken(raw string) string {
+	h := sha256.Sum256([]byte(strings.TrimSpace(raw)))
+	return hex.EncodeToString(h[:])
+}
+
+func (h *Handler) audit(c *gin.Context, action, resourceType string, resourceID, patientID *uuid.UUID, statusCode int, metadata map[string]interface{}) {
+	if h.Auditor == nil {
+		return
+	}
+	var uid *uuid.UUID
+	var role string
+	if uVal, ok := c.Get("userID"); ok {
+		if u, ok := uVal.(uuid.UUID); ok {
+			uid = &u
+		}
+	}
+	if rVal, ok := c.Get("role"); ok {
+		if r, ok := rVal.(string); ok {
+			role = r
+		}
+	}
+	var reqID *uuid.UUID
+	if rVal, ok := c.Get("requestID"); ok {
+		if r, ok := rVal.(uuid.UUID); ok {
+			reqID = &r
+		}
+	}
+	var metaStr string
+	if metadata != nil {
+		if b, err := json.Marshal(metadata); err == nil {
+			metaStr = string(b)
+		}
+	}
+	h.Auditor.Log(models.PhiAuditLog{
+		UserID:       uid,
+		UserRole:     role,
+		Action:       action,
+		ResourceType: resourceType,
+		ResourceID:   resourceID,
+		PatientID:    patientID,
+		IPAddress:    c.ClientIP(),
+		UserAgent:    c.Request.UserAgent(),
+		RequestID:    reqID,
+		StatusCode:   statusCode,
+		Metadata:     metaStr,
+	})
+}
+
+func (h *Handler) RefreshToken(c *gin.Context) {
+	var req struct {
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.RefreshToken) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "refresh_token is required"})
+		return
+	}
+
+	tokenHash := hashToken(req.RefreshToken)
+	existingToken, err := h.Repo.GetRefreshTokenByHash(c.Request.Context(), tokenHash)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid refresh token"})
+		return
+	}
+
+	// TOKEN THEFT DETECTION: If a previously revoked token is reused, revoke all tokens for this user
+	if existingToken.RevokedAt != nil {
+		log.Printf("SECURITY ALERT: Reuse of revoked refresh token detected for user %s! Revoking all sessions.", existingToken.UserID)
+		_ = h.Repo.RevokeAllUserRefreshTokens(c.Request.Context(), existingToken.UserID)
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Compromised token detected; all sessions have been terminated"})
+		return
+	}
+
+	if existingToken.ExpiresAt.Before(time.Now()) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Refresh token has expired"})
+		return
+	}
+
+	// Look up user role
+	var role string
+	if p, pErr := h.Repo.GetPatientByID(c.Request.Context(), existingToken.UserID); pErr == nil {
+		role = p.Role
+	} else if d, dErr := h.Repo.GetDoctorByID(c.Request.Context(), existingToken.UserID); dErr == nil {
+		role = d.Role
+	} else {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User account no longer active"})
+		return
+	}
+
+	// Generate replacement refresh token
+	newRawRefresh, newRefreshHash, err := generateSecureRandomToken()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate replacement token"})
+		return
+	}
+
+	newTok, err := h.Repo.CreateRefreshToken(c.Request.Context(), existingToken.UserID, newRefreshHash, time.Now().Add(7*24*time.Hour))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to issue new refresh token"})
+		return
+	}
+
+	// Invalidate previous token and record rotation lineage
+	_ = h.Repo.RevokeRefreshToken(c.Request.Context(), existingToken.ID, &newTok.ID)
+
+	// Issue new 15-minute access token
+	claims := jwt.MapClaims{
+		"sub":  existingToken.UserID.String(),
+		"role": role,
+		"iat":  time.Now().Unix(),
+		"exp":  time.Now().Add(15 * time.Minute).Unix(),
+		"iss":  "vital-watch",
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tokenString, err := token.SignedString(h.JWTSecret)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to sign access token"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"access_token":  tokenString,
+		"refresh_token": newRawRefresh,
+		"token_type":    "Bearer",
+		"expires_in":    900,
+		"token":         tokenString,
+	})
+}
+
+func (h *Handler) Logout(c *gin.Context) {
+	var req struct {
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.RefreshToken) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "refresh_token is required"})
+		return
+	}
+
+	tokenHash := hashToken(req.RefreshToken)
+	existingToken, err := h.Repo.GetRefreshTokenByHash(c.Request.Context(), tokenHash)
+	if err == nil && existingToken.RevokedAt == nil {
+		_ = h.Repo.RevokeRefreshToken(c.Request.Context(), existingToken.ID, nil)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Successfully logged out"})
+}
+
+func (h *Handler) GetComplianceAuditLogs(c *gin.Context) {
+	roleVal, _ := c.Get("role")
+	role, _ := roleVal.(string)
+	if role != "doctor" && role != "admin" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied: HIPAA audit logs restricted to clinical and compliance roles"})
+		return
+	}
+
+	limit := 50
+	offset := 0
+	if lStr := c.Query("limit"); lStr != "" {
+		if l, err := strconv.Atoi(lStr); err == nil && l > 0 {
+			limit = l
+		}
+	}
+	if oStr := c.Query("offset"); oStr != "" {
+		if o, err := strconv.Atoi(oStr); err == nil && o >= 0 {
+			offset = o
+		}
+	}
+
+	var logs []models.PhiAuditLog
+	var err error
+
+	if pStr := strings.TrimSpace(c.Query("patient_id")); pStr != "" {
+		pid, pErr := uuid.Parse(pStr)
+		if pErr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid patient_id"})
+			return
+		}
+		logs, err = h.Repo.GetAuditLogsByPatientID(c.Request.Context(), pid, limit, offset)
+	} else {
+		logs, err = h.Repo.GetAuditLogs(c.Request.Context(), limit, offset)
+	}
+
+	if err != nil {
+		log.Printf("Internal error fetching compliance audit logs: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve audit logs"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"data":   logs,
+		"limit":  limit,
+		"offset": offset,
+	})
+}
+

@@ -179,3 +179,30 @@ type MedicationLog struct {
 	Instructions       string     `json:"instructions,omitempty"`
 	CreatedAt          time.Time  `json:"created_at"`
 }
+
+type RefreshToken struct {
+	ID                uuid.UUID  `json:"id"`
+	UserID            uuid.UUID  `json:"user_id"`
+	TokenHash         string     `json:"-"`
+	ExpiresAt         time.Time  `json:"expires_at"`
+	RevokedAt         *time.Time `json:"revoked_at,omitempty"`
+	ReplacedByTokenID *uuid.UUID `json:"replaced_by_token_id,omitempty"`
+	CreatedAt         time.Time  `json:"created_at"`
+}
+
+type PhiAuditLog struct {
+	ID           uuid.UUID  `json:"id"`
+	UserID       *uuid.UUID `json:"user_id,omitempty"`
+	UserRole     string     `json:"user_role,omitempty"`
+	Action       string     `json:"action"`
+	ResourceType string     `json:"resource_type"`
+	ResourceID   *uuid.UUID `json:"resource_id,omitempty"`
+	PatientID    *uuid.UUID `json:"patient_id,omitempty"`
+	IPAddress    string     `json:"ip_address,omitempty"`
+	UserAgent    string     `json:"user_agent,omitempty"`
+	RequestID    *uuid.UUID `json:"request_id,omitempty"`
+	StatusCode   int        `json:"status_code"`
+	Metadata     string     `json:"metadata,omitempty"`
+	CreatedAt    time.Time  `json:"created_at"`
+}
+

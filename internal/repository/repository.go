@@ -61,4 +61,15 @@ type Repository interface {
 	GetPrescriptionByFilenameForDoctor(ctx context.Context, doctorID uuid.UUID, filename string) (models.Prescription, error)
 	GetPrescriptionByID(ctx context.Context, id uuid.UUID) (models.Prescription, error)
 	UpdatePrescriptionFileName(ctx context.Context, prescriptionID uuid.UUID, fileName string) error
+
+	// Phase 5: Refresh Tokens & Session Management
+	CreateRefreshToken(ctx context.Context, userID uuid.UUID, tokenHash string, expiresAt time.Time) (models.RefreshToken, error)
+	GetRefreshTokenByHash(ctx context.Context, tokenHash string) (models.RefreshToken, error)
+	RevokeRefreshToken(ctx context.Context, id uuid.UUID, replacedByTokenID *uuid.UUID) error
+	RevokeAllUserRefreshTokens(ctx context.Context, userID uuid.UUID) error
+
+	// Phase 5: HIPAA ePHI Audit Logging
+	CreateAuditLog(ctx context.Context, log models.PhiAuditLog) (uuid.UUID, error)
+	GetAuditLogsByPatientID(ctx context.Context, patientID uuid.UUID, limit, offset int) ([]models.PhiAuditLog, error)
+	GetAuditLogs(ctx context.Context, limit, offset int) ([]models.PhiAuditLog, error)
 }

@@ -80,6 +80,22 @@ type PatientVital struct {
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
 }
 
+type PhiAuditLog struct {
+	ID           uuid.UUID          `json:"id"`
+	UserID       pgtype.UUID        `json:"user_id"`
+	UserRole     pgtype.Text        `json:"user_role"`
+	Action       string             `json:"action"`
+	ResourceType string             `json:"resource_type"`
+	ResourceID   pgtype.UUID        `json:"resource_id"`
+	PatientID    pgtype.UUID        `json:"patient_id"`
+	IpAddress    pgtype.Text        `json:"ip_address"`
+	UserAgent    pgtype.Text        `json:"user_agent"`
+	RequestID    pgtype.UUID        `json:"request_id"`
+	StatusCode   pgtype.Int4        `json:"status_code"`
+	Metadata     []byte             `json:"metadata"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+}
+
 type Prescription struct {
 	ID          uuid.UUID          `json:"id"`
 	PatientID   uuid.UUID          `json:"patient_id"`
@@ -105,6 +121,16 @@ type PrescriptionItem struct {
 	Timing         pgtype.Text        `json:"timing"`
 	Instructions   pgtype.Text        `json:"instructions"`
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
+type RefreshToken struct {
+	ID                uuid.UUID          `json:"id"`
+	UserID            uuid.UUID          `json:"user_id"`
+	TokenHash         string             `json:"token_hash"`
+	ExpiresAt         pgtype.Timestamptz `json:"expires_at"`
+	RevokedAt         pgtype.Timestamptz `json:"revoked_at"`
+	ReplacedByTokenID pgtype.UUID        `json:"replaced_by_token_id"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
 }
 
 type User struct {
