@@ -1,15 +1,15 @@
 package safety
 
 import (
-	"fmt"
-	"strings"
-	"time"
-	"unicode/utf8"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
+	"unicode/utf8"
 )
 
 func TestCleanDrugName(t *testing.T) {
@@ -187,7 +187,7 @@ func TestReciprocalDrugDrugInteraction(t *testing.T) {
 				"results": []map[string]interface{}{
 					{
 						"contraindications": []string{},
-						"drug_interactions":  []string{},
+						"drug_interactions": []string{},
 					},
 				},
 			})

@@ -1788,7 +1788,6 @@ func (c *captureSafetyChecker) CheckPrescriptionSafety(ctx context.Context, newM
 	return &safety.SafetyReport{}, nil
 }
 
-
 func TestVerifyPrescription_PreserveUploadedFileNameAndSafetyOverride(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	doctorID := uuid.New()
@@ -1861,6 +1860,7 @@ func TestVerifyPrescription_PreserveUploadedFileNameAndSafetyOverride(t *testing
 		t.Fatalf("UpdatePrescriptionFileName was unexpectedly called for an uploaded prescription!")
 	}
 }
+
 type failingPDFGenerator struct{}
 
 func (f *failingPDFGenerator) GeneratePrescriptionPDF(data pdf.PrescriptionData) ([]byte, error) {

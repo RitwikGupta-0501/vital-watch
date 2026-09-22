@@ -40,7 +40,6 @@ func NewStandardPDFGenerator() *StandardPDFGenerator {
 	return &StandardPDFGenerator{}
 }
 
-
 // GeneratePrescriptionPDF compiles a standardized clinic-branded prescription slip
 func (g *StandardPDFGenerator) GeneratePrescriptionPDF(data PrescriptionData) ([]byte, error) {
 	pdf := gofpdf.New("P", "mm", "A4", "")

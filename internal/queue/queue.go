@@ -157,7 +157,6 @@ func (w *PrescriptionOCRWorker) Work(ctx context.Context, job *river.Job[Prescri
 	return nil
 }
 
-
 func (w *PrescriptionOCRWorker) notifyDoctor(ctx context.Context, prescriptionID uuid.UUID, message string, medCount int, provider string) {
 	if w.notifier == nil {
 		return

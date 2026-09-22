@@ -21,11 +21,33 @@ type Repository interface {
 	GetDoctorByID(ctx context.Context, id uuid.UUID) (models.Doctor, error)
 	GetDoctors(ctx context.Context, limit, offset int) ([]models.Doctor, error)
 
-	CreateAppointment(ctx context.Context, patientID, doctorID uuid.UUID, startTime, endTime time.Time, apptType string) (uuid.UUID, error)
+	CreateAppointment(ctx context.Context, id, patientID, doctorID uuid.UUID, startTime, endTime time.Time, apptType, meetingLink, meetingID string) (uuid.UUID, error)
+	GetAppointmentByID(ctx context.Context, id uuid.UUID) (models.Appointment, error)
 	GetAppointmentsByDoctorID(ctx context.Context, doctorID uuid.UUID, limit, offset int) ([]models.Appointment, error)
 	GetAppointmentsByPatientID(ctx context.Context, patientID uuid.UUID, limit, offset int) ([]models.Appointment, error)
 	GetAppointmentsForPatient(ctx context.Context, doctorID, patientID uuid.UUID, limit, offset int) ([]models.Appointment, error)
+	GetDoctorAppointmentsInRange(ctx context.Context, doctorID uuid.UUID, startTime, endTime time.Time) ([]models.Appointment, error)
 	UpdateAppointmentAsCompletedForDoctor(ctx context.Context, appointmentID, doctorID uuid.UUID) (bool, error)
+	UpdateAppointmentMeetingRoom(ctx context.Context, apptID uuid.UUID, meetingLink, meetingID string) error
+
+	// Phase 4: Doctor Working Schedules
+	UpsertDoctorSchedule(ctx context.Context, schedule models.DoctorSchedule) (models.DoctorSchedule, error)
+	UpsertDoctorSchedulesTx(ctx context.Context, doctorID uuid.UUID, schedules []models.DoctorSchedule) ([]models.DoctorSchedule, error)
+	GetDoctorSchedules(ctx context.Context, doctorID uuid.UUID) ([]models.DoctorSchedule, error)
+	GetDoctorScheduleByDay(ctx context.Context, doctorID uuid.UUID, dayOfWeek int) (models.DoctorSchedule, error)
+	DeleteDoctorScheduleByDay(ctx context.Context, doctorID uuid.UUID, dayOfWeek int) error
+
+	// Phase 4: Longitudinal Vitals
+	CreatePatientVital(ctx context.Context, vital models.PatientVital) (uuid.UUID, error)
+	GetPatientVitals(ctx context.Context, patientID uuid.UUID, startDate, endDate *time.Time, limit, offset int) ([]models.PatientVital, error)
+	GetLatestPatientVital(ctx context.Context, patientID uuid.UUID) (models.PatientVital, error)
+
+	// Phase 4: Medication Adherence & Schedules
+	GetActivePrescriptionItemsForPatient(ctx context.Context, patientID uuid.UUID, targetDate time.Time) ([]models.PrescriptionItem, error)
+	UpsertMedicationLog(ctx context.Context, log models.MedicationLog) (models.MedicationLog, error)
+	GetMedicationLogsByDate(ctx context.Context, patientID uuid.UUID, date time.Time) ([]models.MedicationLog, error)
+	VerifyPrescriptionItemOwnership(ctx context.Context, itemID, patientID uuid.UUID) (bool, error)
+	HasDoctorPatientRelationship(ctx context.Context, doctorID, patientID uuid.UUID) (bool, error)
 
 	// Prescriptions: Dual-Mode, Atomic Enqueue, and Review
 	CreateUploadedPrescriptionWithJob(ctx context.Context, patientID, doctorID uuid.UUID, fileName, notes string, ocrEnabled bool) (uuid.UUID, string, error)

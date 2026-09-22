@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -241,14 +242,72 @@ func (r *DBRepository) GetDoctors(ctx context.Context, limit, offset int) ([]mod
 }
 
 // Appointment Related Methods
-func (r *DBRepository) CreateAppointment(ctx context.Context, patientID, doctorID uuid.UUID, startTime, endTime time.Time, apptType string) (uuid.UUID, error) {
+func (r *DBRepository) CreateAppointment(ctx context.Context, id, patientID, doctorID uuid.UUID, startTime, endTime time.Time, apptType, meetingLink, meetingID string) (uuid.UUID, error) {
+	if id == uuid.Nil {
+		id = uuid.New()
+	}
 	return r.queries.CreateAppointment(ctx, dbgen.CreateAppointmentParams{
+		ID:              id,
 		PatientID:       patientID,
 		DoctorID:        doctorID,
 		StartTime:       pgtype.Timestamptz{Time: startTime, Valid: true},
 		EndTime:         pgtype.Timestamptz{Time: endTime, Valid: true},
 		AppointmentType: pgtype.Text{String: apptType, Valid: apptType != ""},
+		MeetingLink:     pgtype.Text{String: meetingLink, Valid: meetingLink != ""},
+		MeetingID:       pgtype.Text{String: meetingID, Valid: meetingID != ""},
 	})
+}
+
+func (r *DBRepository) UpdateAppointmentMeetingRoom(ctx context.Context, apptID uuid.UUID, meetingLink, meetingID string) error {
+	return r.queries.UpdateAppointmentMeetingRoom(ctx, dbgen.UpdateAppointmentMeetingRoomParams{
+		MeetingLink: pgtype.Text{String: meetingLink, Valid: meetingLink != ""},
+		MeetingID:   pgtype.Text{String: meetingID, Valid: meetingID != ""},
+		ID:          apptID,
+	})
+}
+
+func (r *DBRepository) GetAppointmentByID(ctx context.Context, id uuid.UUID) (models.Appointment, error) {
+	row, err := r.queries.GetAppointmentByID(ctx, id)
+	if err != nil {
+		return models.Appointment{}, err
+	}
+	return models.Appointment{
+		ID:              row.ID,
+		PatientID:       row.PatientID,
+		DoctorID:        row.DoctorID,
+		StartTime:       row.StartTime.Time,
+		EndTime:         row.EndTime.Time,
+		Status:          row.Status.String,
+		Type:            row.AppointmentType.String,
+		MeetingLink:     row.MeetingLink.String,
+		MeetingID:       row.MeetingID.String,
+		DoctorName:      row.DoctorFirstName + " " + row.DoctorLastName,
+		DoctorSpecialty: row.DoctorSpecialty.String,
+		PatientName:     row.PatientFirstName + " " + row.PatientLastName,
+		CreatedAt:       row.CreatedAt.Time,
+	}, nil
+}
+
+func (r *DBRepository) GetDoctorAppointmentsInRange(ctx context.Context, doctorID uuid.UUID, startTime, endTime time.Time) ([]models.Appointment, error) {
+	rows, err := r.queries.GetDoctorAppointmentsInRange(ctx, dbgen.GetDoctorAppointmentsInRangeParams{
+		DoctorID:   doctorID,
+		RangeStart: pgtype.Timestamptz{Time: startTime, Valid: true},
+		RangeEnd:   pgtype.Timestamptz{Time: endTime, Valid: true},
+	})
+	if err != nil {
+		return nil, err
+	}
+	appts := make([]models.Appointment, 0, len(rows))
+	for _, row := range rows {
+		appts = append(appts, models.Appointment{
+			ID:        row.ID,
+			DoctorID:  row.DoctorID,
+			StartTime: row.StartTime.Time,
+			EndTime:   row.EndTime.Time,
+			Status:    row.Status.String,
+		})
+	}
+	return appts, nil
 }
 
 func (r *DBRepository) GetAppointmentsByDoctorID(ctx context.Context, doctorID uuid.UUID, limit, offset int) ([]models.Appointment, error) {
@@ -272,6 +331,8 @@ func (r *DBRepository) GetAppointmentsByDoctorID(ctx context.Context, doctorID u
 			EndTime:     row.EndTime.Time,
 			Status:      row.Status.String,
 			Type:        row.AppointmentType.String,
+			MeetingLink: row.MeetingLink.String,
+			MeetingID:   row.MeetingID.String,
 			PatientName: row.FirstName + " " + row.LastName,
 			CreatedAt:   row.CreatedAt.Time,
 		})
@@ -300,6 +361,8 @@ func (r *DBRepository) GetAppointmentsByPatientID(ctx context.Context, patientID
 			EndTime:         row.EndTime.Time,
 			Status:          row.Status.String,
 			Type:            row.AppointmentType.String,
+			MeetingLink:     row.MeetingLink.String,
+			MeetingID:       row.MeetingID.String,
 			DoctorName:      row.FirstName + " " + row.LastName,
 			DoctorSpecialty: row.Specialty.String,
 			CreatedAt:       row.CreatedAt.Time,
@@ -330,6 +393,8 @@ func (r *DBRepository) GetAppointmentsForPatient(ctx context.Context, doctorID, 
 			EndTime:         row.EndTime.Time,
 			Status:          row.Status.String,
 			Type:            row.AppointmentType.String,
+			MeetingLink:     row.MeetingLink.String,
+			MeetingID:       row.MeetingID.String,
 			DoctorName:      row.FirstName + " " + row.LastName,
 			DoctorSpecialty: row.Specialty.String,
 			CreatedAt:       row.CreatedAt.Time,
@@ -398,6 +463,70 @@ func (r *DBRepository) CreateUploadedPrescriptionWithJob(ctx context.Context, pa
 	return newID, status, nil
 }
 
+
+func parseDurationString(s string) (time.Duration, bool) {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" {
+		return 0, false
+	}
+	var num int
+	var unit string
+	_, err := fmt.Sscanf(s, "%d %s", &num, &unit)
+	if err != nil || num <= 0 {
+		num = 0
+		unit = ""
+		for i, r := range s {
+			if r >= '0' && r <= '9' {
+				num = num*10 + int(r-'0')
+			} else {
+				unit = strings.TrimSpace(s[i:])
+				break
+			}
+		}
+	}
+	if num <= 0 {
+		return 0, false
+	}
+	unit = strings.TrimSpace(unit)
+	switch {
+	case strings.HasPrefix(unit, "day") || unit == "d":
+		if num > 3650 {
+			num = 3650
+		}
+		return time.Duration(num) * 24 * time.Hour, true
+	case strings.HasPrefix(unit, "week") || unit == "w" || unit == "wk" || unit == "wks":
+		if num > 520 {
+			num = 520
+		}
+		return time.Duration(num) * 7 * 24 * time.Hour, true
+	case strings.HasPrefix(unit, "month") || unit == "m" || unit == "mo" || unit == "mos":
+		if num > 120 {
+			num = 120
+		}
+		return time.Duration(num) * 30 * 24 * time.Hour, true
+	case strings.HasPrefix(unit, "year") || unit == "y" || unit == "yr" || unit == "yrs":
+		if num > 10 {
+			num = 10
+		}
+		return time.Duration(num) * 365 * 24 * time.Hour, true
+	}
+	return 0, false
+}
+
+func calculatePrescriptionExpiry(items []models.PrescriptionItem) time.Time {
+	maxDuration := 30 * 24 * time.Hour
+	foundValid := false
+	for _, item := range items {
+		if d, ok := parseDurationString(item.Duration); ok {
+			if !foundValid || d > maxDuration {
+				maxDuration = d
+			}
+			foundValid = true
+		}
+	}
+	return time.Now().Add(maxDuration)
+}
+
 func (r *DBRepository) CreateDigitalPrescription(ctx context.Context, patientID, doctorID uuid.UUID, notes string, items []models.PrescriptionItem) (uuid.UUID, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -428,6 +557,13 @@ func (r *DBRepository) CreateDigitalPrescription(ctx context.Context, patientID,
 		})
 		if err != nil {
 			return uuid.Nil, err
+		}
+	}
+
+	if len(items) > 0 {
+		exp := calculatePrescriptionExpiry(items)
+		if _, err := tx.Exec(ctx, "UPDATE prescriptions SET expires_at = $1 WHERE id = $2", exp, newID); err != nil {
+			return uuid.Nil, fmt.Errorf("failed to update prescription expiry: %w", err)
 		}
 	}
 
@@ -522,6 +658,12 @@ func (r *DBRepository) VerifyPrescription(ctx context.Context, prescriptionID, d
 			})
 			if err != nil {
 				return false, err
+			}
+		}
+		if status == "approved" && len(items) > 0 {
+			exp := calculatePrescriptionExpiry(items)
+			if _, err := tx.Exec(ctx, "UPDATE prescriptions SET expires_at = $1 WHERE id = $2", exp, prescriptionID); err != nil {
+				return false, fmt.Errorf("failed to update prescription expiry: %w", err)
 			}
 		}
 	}
@@ -775,4 +917,483 @@ func (r *DBRepository) UpdatePrescriptionFileName(ctx context.Context, prescript
 		return fmt.Errorf("prescription %s not found", prescriptionID)
 	}
 	return nil
+}
+
+// Helpers for Phase 4 conversions
+func timeToPgTime(s string) (pgtype.Time, error) {
+	t, err := time.Parse("15:04", strings.TrimSpace(s))
+	if err != nil {
+		return pgtype.Time{}, err
+	}
+	micros := int64(t.Hour())*3600*1e6 + int64(t.Minute())*60*1e6
+	return pgtype.Time{Microseconds: micros, Valid: true}, nil
+}
+
+func pgTimeToStr(t pgtype.Time) string {
+	if !t.Valid {
+		return ""
+	}
+	totalSec := t.Microseconds / 1e6
+	hours := totalSec / 3600
+	mins := (totalSec % 3600) / 60
+	return fmt.Sprintf("%02d:%02d", hours, mins)
+}
+
+func floatToNumeric(f *float64) pgtype.Numeric {
+	if f == nil {
+		return pgtype.Numeric{}
+	}
+	var num pgtype.Numeric
+	_ = num.Scan(fmt.Sprintf("%.2f", *f))
+	return num
+}
+
+func numericToFloat(num pgtype.Numeric) *float64 {
+	if !num.Valid {
+		return nil
+	}
+	val, err := num.Float64Value()
+	if err != nil || !val.Valid {
+		return nil
+	}
+	f := val.Float64
+	return &f
+}
+
+// Doctor Schedules
+func (r *DBRepository) UpsertDoctorSchedule(ctx context.Context, schedule models.DoctorSchedule) (models.DoctorSchedule, error) {
+	startTime, err := timeToPgTime(schedule.StartTime)
+	if err != nil {
+		return models.DoctorSchedule{}, fmt.Errorf("invalid start_time format (expected HH:MM): %w", err)
+	}
+	endTime, err := timeToPgTime(schedule.EndTime)
+	if err != nil {
+		return models.DoctorSchedule{}, fmt.Errorf("invalid end_time format (expected HH:MM): %w", err)
+	}
+
+	tz := schedule.Timezone
+	if tz == "" {
+		tz = "UTC"
+	}
+	slotDur := schedule.SlotDuration
+	if slotDur == 0 {
+		slotDur = 30
+	}
+
+	row, err := r.queries.UpsertDoctorSchedule(ctx, dbgen.UpsertDoctorScheduleParams{
+		DoctorID:     schedule.DoctorID,
+		DayOfWeek:    int32(schedule.DayOfWeek),
+		StartTime:    startTime,
+		EndTime:      endTime,
+		SlotDuration: int32(slotDur),
+		Timezone:     tz,
+		IsActive:     pgtype.Bool{Bool: schedule.IsActive, Valid: true},
+	})
+	if err != nil {
+		return models.DoctorSchedule{}, err
+	}
+
+	return models.DoctorSchedule{
+		ID:           row.ID,
+		DoctorID:     row.DoctorID,
+		DayOfWeek:    int(row.DayOfWeek),
+		StartTime:    pgTimeToStr(row.StartTime),
+		EndTime:      pgTimeToStr(row.EndTime),
+		SlotDuration: int(row.SlotDuration),
+		Timezone:     row.Timezone,
+		IsActive:     row.IsActive.Bool,
+		CreatedAt:    row.CreatedAt.Time,
+		UpdatedAt:    row.UpdatedAt.Time,
+	}, nil
+}
+
+func (r *DBRepository) GetDoctorSchedules(ctx context.Context, doctorID uuid.UUID) ([]models.DoctorSchedule, error) {
+	rows, err := r.queries.GetDoctorSchedules(ctx, doctorID)
+	if err != nil {
+		return nil, err
+	}
+	schedules := make([]models.DoctorSchedule, 0, len(rows))
+	for _, row := range rows {
+		schedules = append(schedules, models.DoctorSchedule{
+			ID:           row.ID,
+			DoctorID:     row.DoctorID,
+			DayOfWeek:    int(row.DayOfWeek),
+			StartTime:    pgTimeToStr(row.StartTime),
+			EndTime:      pgTimeToStr(row.EndTime),
+			SlotDuration: int(row.SlotDuration),
+			Timezone:     row.Timezone,
+			IsActive:     row.IsActive.Bool,
+			CreatedAt:    row.CreatedAt.Time,
+			UpdatedAt:    row.UpdatedAt.Time,
+		})
+	}
+	return schedules, nil
+}
+
+func (r *DBRepository) GetDoctorScheduleByDay(ctx context.Context, doctorID uuid.UUID, dayOfWeek int) (models.DoctorSchedule, error) {
+	row, err := r.queries.GetDoctorScheduleByDay(ctx, dbgen.GetDoctorScheduleByDayParams{
+		DoctorID:  doctorID,
+		DayOfWeek: int32(dayOfWeek),
+	})
+	if err != nil {
+		return models.DoctorSchedule{}, err
+	}
+	return models.DoctorSchedule{
+		ID:           row.ID,
+		DoctorID:     row.DoctorID,
+		DayOfWeek:    int(row.DayOfWeek),
+		StartTime:    pgTimeToStr(row.StartTime),
+		EndTime:      pgTimeToStr(row.EndTime),
+		SlotDuration: int(row.SlotDuration),
+		Timezone:     row.Timezone,
+		IsActive:     row.IsActive.Bool,
+		CreatedAt:    row.CreatedAt.Time,
+		UpdatedAt:    row.UpdatedAt.Time,
+	}, nil
+}
+
+func (r *DBRepository) UpsertDoctorSchedulesTx(ctx context.Context, doctorID uuid.UUID, schedules []models.DoctorSchedule) ([]models.DoctorSchedule, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin schedule transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	qtx := r.queries.WithTx(tx)
+	saved := make([]models.DoctorSchedule, 0, len(schedules))
+
+	for _, schedule := range schedules {
+		startTime, err := timeToPgTime(schedule.StartTime)
+		if err != nil {
+			return nil, fmt.Errorf("invalid start_time format (expected HH:MM): %w", err)
+		}
+		endTime, err := timeToPgTime(schedule.EndTime)
+		if err != nil {
+			return nil, fmt.Errorf("invalid end_time format (expected HH:MM): %w", err)
+		}
+
+		tz := schedule.Timezone
+		if tz == "" {
+			tz = "UTC"
+		}
+		slotDur := schedule.SlotDuration
+		if slotDur == 0 {
+			slotDur = 30
+		}
+
+		row, err := qtx.UpsertDoctorSchedule(ctx, dbgen.UpsertDoctorScheduleParams{
+			DoctorID:     doctorID,
+			DayOfWeek:    int32(schedule.DayOfWeek),
+			StartTime:    startTime,
+			EndTime:      endTime,
+			SlotDuration: int32(slotDur),
+			Timezone:     tz,
+			IsActive:     pgtype.Bool{Bool: schedule.IsActive, Valid: true},
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		saved = append(saved, models.DoctorSchedule{
+			ID:           row.ID,
+			DoctorID:     row.DoctorID,
+			DayOfWeek:    int(row.DayOfWeek),
+			StartTime:    pgTimeToStr(row.StartTime),
+			EndTime:      pgTimeToStr(row.EndTime),
+			SlotDuration: int(row.SlotDuration),
+			Timezone:     row.Timezone,
+			IsActive:     row.IsActive.Bool,
+			CreatedAt:    row.CreatedAt.Time,
+			UpdatedAt:    row.UpdatedAt.Time,
+		})
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("failed to commit schedule transaction: %w", err)
+	}
+
+	return saved, nil
+}
+
+func (r *DBRepository) DeleteDoctorScheduleByDay(ctx context.Context, doctorID uuid.UUID, dayOfWeek int) error {
+	return r.queries.DeleteDoctorScheduleByDay(ctx, dbgen.DeleteDoctorScheduleByDayParams{
+		DoctorID:  doctorID,
+		DayOfWeek: int32(dayOfWeek),
+	})
+}
+
+// Patient Vitals
+func (r *DBRepository) CreatePatientVital(ctx context.Context, vital models.PatientVital) (uuid.UUID, error) {
+	var sys, dia, hr pgtype.Int4
+	if vital.SystolicBP != nil {
+		sys = pgtype.Int4{Int32: int32(*vital.SystolicBP), Valid: true}
+	}
+	if vital.DiastolicBP != nil {
+		dia = pgtype.Int4{Int32: int32(*vital.DiastolicBP), Valid: true}
+	}
+	if vital.HeartRate != nil {
+		hr = pgtype.Int4{Int32: int32(*vital.HeartRate), Valid: true}
+	}
+
+	recAt := vital.RecordedAt
+	if recAt.IsZero() {
+		recAt = time.Now()
+	}
+
+	row, err := r.queries.CreatePatientVital(ctx, dbgen.CreatePatientVitalParams{
+		PatientID:        vital.PatientID,
+		RecordedBy:       vital.RecordedBy,
+		RecordedAt:       pgtype.Timestamptz{Time: recAt, Valid: true},
+		SystolicBp:       sys,
+		DiastolicBp:      dia,
+		HeartRate:        hr,
+		BloodGlucose:     floatToNumeric(vital.BloodGlucose),
+		OxygenSaturation: floatToNumeric(vital.OxygenSaturation),
+		Temperature:      floatToNumeric(vital.Temperature),
+		WeightKg:         floatToNumeric(vital.WeightKg),
+		Notes:            pgtype.Text{String: vital.Notes, Valid: vital.Notes != ""},
+	})
+	if err != nil {
+		return uuid.Nil, err
+	}
+	return row.ID, nil
+}
+
+func (r *DBRepository) GetPatientVitals(ctx context.Context, patientID uuid.UUID, startDate, endDate *time.Time, limit, offset int) ([]models.PatientVital, error) {
+	lim, off := clampPagination(limit, offset)
+	var startPg, endPg pgtype.Timestamptz
+	if startDate != nil {
+		startPg = pgtype.Timestamptz{Time: *startDate, Valid: true}
+	}
+	if endDate != nil {
+		endPg = pgtype.Timestamptz{Time: *endDate, Valid: true}
+	}
+
+	rows, err := r.queries.GetPatientVitals(ctx, dbgen.GetPatientVitalsParams{
+		PatientID: patientID,
+		StartDate: startPg,
+		EndDate:   endPg,
+		Limit:     int32(lim),
+		Offset:    int32(off),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	vitals := make([]models.PatientVital, 0, len(rows))
+	for _, row := range rows {
+		var sys, dia, hr *int
+		if row.SystolicBp.Valid {
+			s := int(row.SystolicBp.Int32)
+			sys = &s
+		}
+		if row.DiastolicBp.Valid {
+			d := int(row.DiastolicBp.Int32)
+			dia = &d
+		}
+		if row.HeartRate.Valid {
+			h := int(row.HeartRate.Int32)
+			hr = &h
+		}
+
+		recorderName := strings.TrimSpace(fmt.Sprintf("%s %s", row.RecorderFirstName, row.RecorderLastName))
+
+		vitals = append(vitals, models.PatientVital{
+			ID:               row.ID,
+			PatientID:        row.PatientID,
+			RecordedBy:       row.RecordedBy,
+			RecordedAt:       row.RecordedAt.Time,
+			SystolicBP:       sys,
+			DiastolicBP:      dia,
+			HeartRate:        hr,
+			BloodGlucose:     numericToFloat(row.BloodGlucose),
+			OxygenSaturation: numericToFloat(row.OxygenSaturation),
+			Temperature:      numericToFloat(row.Temperature),
+			WeightKg:         numericToFloat(row.WeightKg),
+			Notes:            row.Notes.String,
+			CreatedAt:        row.CreatedAt.Time,
+			RecorderName:     recorderName,
+			RecorderRole:     row.RecorderRole,
+		})
+	}
+	return vitals, nil
+}
+
+func (r *DBRepository) GetLatestPatientVital(ctx context.Context, patientID uuid.UUID) (models.PatientVital, error) {
+	row, err := r.queries.GetLatestPatientVital(ctx, patientID)
+	if err != nil {
+		return models.PatientVital{}, err
+	}
+
+	var sys, dia, hr *int
+	if row.SystolicBp.Valid {
+		s := int(row.SystolicBp.Int32)
+		sys = &s
+	}
+	if row.DiastolicBp.Valid {
+		d := int(row.DiastolicBp.Int32)
+		dia = &d
+	}
+	if row.HeartRate.Valid {
+		h := int(row.HeartRate.Int32)
+		hr = &h
+	}
+	recorderName := strings.TrimSpace(fmt.Sprintf("%s %s", row.RecorderFirstName, row.RecorderLastName))
+
+	return models.PatientVital{
+		ID:               row.ID,
+		PatientID:        row.PatientID,
+		RecordedBy:       row.RecordedBy,
+		RecordedAt:       row.RecordedAt.Time,
+		SystolicBP:       sys,
+		DiastolicBP:      dia,
+		HeartRate:        hr,
+		BloodGlucose:     numericToFloat(row.BloodGlucose),
+		OxygenSaturation: numericToFloat(row.OxygenSaturation),
+		Temperature:      numericToFloat(row.Temperature),
+		WeightKg:         numericToFloat(row.WeightKg),
+		Notes:            row.Notes.String,
+		CreatedAt:        row.CreatedAt.Time,
+		RecorderName:     recorderName,
+		RecorderRole:     row.RecorderRole,
+	}, nil
+}
+
+// Medication Schedules & Adherence
+func (r *DBRepository) GetActivePrescriptionItemsForPatient(ctx context.Context, patientID uuid.UUID, targetDate time.Time) ([]models.PrescriptionItem, error) {
+	if targetDate.IsZero() {
+		targetDate = time.Now()
+	}
+	rows, err := r.queries.GetActivePrescriptionItemsForPatient(ctx, dbgen.GetActivePrescriptionItemsForPatientParams{
+		PatientID:  patientID,
+		TargetDate: pgtype.Timestamptz{Time: targetDate, Valid: true},
+	})
+	if err != nil {
+		return nil, err
+	}
+	items := make([]models.PrescriptionItem, 0, len(rows))
+	for _, row := range rows {
+		items = append(items, models.PrescriptionItem{
+			ID:             row.ID,
+			PrescriptionID: row.PrescriptionID,
+			MedicationName: row.MedicationName,
+			Dosage:         row.Dosage.String,
+			Frequency:      row.Frequency.String,
+			Duration:       row.Duration.String,
+			Timing:         row.Timing.String,
+			Instructions:   row.Instructions.String,
+			CreatedAt:      row.CreatedAt.Time,
+		})
+	}
+	return items, nil
+}
+
+func (r *DBRepository) UpsertMedicationLog(ctx context.Context, log models.MedicationLog) (models.MedicationLog, error) {
+	var takenAt pgtype.Timestamptz
+	if log.TakenAt != nil {
+		takenAt = pgtype.Timestamptz{Time: *log.TakenAt, Valid: true}
+	}
+
+	datePg := pgtype.Date{
+		Time:  time.Date(log.ScheduledDate.Year(), log.ScheduledDate.Month(), log.ScheduledDate.Day(), 0, 0, 0, 0, time.UTC),
+		Valid: true,
+	}
+
+	doseNum := int32(log.DoseNumber)
+	if doseNum <= 0 {
+		doseNum = 1
+	}
+
+	row, err := r.queries.UpsertMedicationLog(ctx, dbgen.UpsertMedicationLogParams{
+		PatientID:          log.PatientID,
+		PrescriptionItemID: log.PrescriptionItemID,
+		ScheduledDate:      datePg,
+		TimeOfDay:          log.TimeOfDay,
+		DoseNumber:         doseNum,
+		MealTiming:         pgtype.Text{String: log.MealTiming, Valid: log.MealTiming != ""},
+		Status:             log.Status,
+		TakenAt:            takenAt,
+		Notes:              pgtype.Text{String: log.Notes, Valid: log.Notes != ""},
+	})
+	if err != nil {
+		return models.MedicationLog{}, err
+	}
+
+	var resTakenAt *time.Time
+	if row.TakenAt.Valid {
+		t := row.TakenAt.Time
+		resTakenAt = &t
+	}
+
+	return models.MedicationLog{
+		ID:                 row.ID,
+		PatientID:          row.PatientID,
+		PrescriptionItemID: row.PrescriptionItemID,
+		ScheduledDate:      row.ScheduledDate.Time,
+		TimeOfDay:          row.TimeOfDay,
+		DoseNumber:         int(row.DoseNumber),
+		MealTiming:         row.MealTiming.String,
+		Status:             row.Status,
+		TakenAt:            resTakenAt,
+		Notes:              row.Notes.String,
+		CreatedAt:          row.CreatedAt.Time,
+	}, nil
+}
+
+func (r *DBRepository) GetMedicationLogsByDate(ctx context.Context, patientID uuid.UUID, date time.Time) ([]models.MedicationLog, error) {
+	datePg := pgtype.Date{
+		Time:  time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, time.UTC),
+		Valid: true,
+	}
+	rows, err := r.queries.GetMedicationLogsByDate(ctx, dbgen.GetMedicationLogsByDateParams{
+		PatientID:     patientID,
+		ScheduledDate: datePg,
+	})
+	if err != nil {
+		return nil, err
+	}
+	logs := make([]models.MedicationLog, 0, len(rows))
+	for _, row := range rows {
+		var takenAt *time.Time
+		if row.TakenAt.Valid {
+			t := row.TakenAt.Time
+			takenAt = &t
+		}
+		logs = append(logs, models.MedicationLog{
+			ID:                 row.ID,
+			PatientID:          row.PatientID,
+			PrescriptionItemID: row.PrescriptionItemID,
+			ScheduledDate:      row.ScheduledDate.Time,
+			TimeOfDay:          row.TimeOfDay,
+			DoseNumber:         int(row.DoseNumber),
+			MealTiming:         row.MealTiming.String,
+			Status:             row.Status,
+			TakenAt:            takenAt,
+			Notes:              row.Notes.String,
+			MedicationName:     row.MedicationName,
+			Dosage:             row.Dosage.String,
+			Timing:             row.Timing.String,
+			Instructions:       row.Instructions.String,
+			CreatedAt:          row.CreatedAt.Time,
+		})
+	}
+	return logs, nil
+}
+
+func (r *DBRepository) VerifyPrescriptionItemOwnership(ctx context.Context, itemID, patientID uuid.UUID) (bool, error) {
+	return r.queries.VerifyPrescriptionItemOwnership(ctx, dbgen.VerifyPrescriptionItemOwnershipParams{
+		ID:        itemID,
+		PatientID: patientID,
+	})
+}
+
+func (r *DBRepository) HasDoctorPatientRelationship(ctx context.Context, doctorID, patientID uuid.UUID) (bool, error) {
+	res, err := r.queries.HasDoctorPatientRelationship(ctx, dbgen.HasDoctorPatientRelationshipParams{
+		DoctorID:  doctorID,
+		PatientID: patientID,
+	})
+	if err != nil {
+		return false, err
+	}
+	return res.Bool, nil
 }
