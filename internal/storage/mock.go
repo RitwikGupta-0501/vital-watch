@@ -3,16 +3,19 @@ package storage
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
 
 // MockProvider implements storage.Provider in-memory for testing
 type MockProvider struct {
-	mu           sync.RWMutex
-	Files        map[string][]byte
-	UploadURLs   map[string]string
-	DownloadURLs map[string]string
+	mu               sync.RWMutex
+	Files            map[string][]byte
+	UploadURLs       map[string]string
+	DownloadURLs     map[string]string
+	GetFileBytesFunc func(ctx context.Context, key string) ([]byte, string, error)
 }
 
 // NewMockProvider creates a new MockProvider instance
@@ -59,4 +62,29 @@ func (m *MockProvider) ObjectExists(ctx context.Context, key string) (bool, erro
 		return true, nil
 	}
 	return false, nil
+}
+
+func (m *MockProvider) GetFileBytes(ctx context.Context, key string) ([]byte, string, error) {
+	if m.GetFileBytesFunc != nil {
+		return m.GetFileBytesFunc(ctx, key)
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	data, ok := m.Files[key]
+	if !ok {
+		return nil, "", fmt.Errorf("file not found: %s", key)
+	}
+	if len(data) > MaxOCRFileSize {
+		return nil, "", fmt.Errorf("%w: file exceeds limit of %d bytes", ErrFileTooLarge, MaxOCRFileSize)
+	}
+	mimeType := http.DetectContentType(data)
+	mimeType = strings.ToLower(strings.TrimSpace(strings.Split(mimeType, ";")[0]))
+	return data, mimeType, nil
+}
+
+func (m *MockProvider) SaveFile(ctx context.Context, key string, data []byte, contentType string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.Files[key] = data
+	return nil
 }

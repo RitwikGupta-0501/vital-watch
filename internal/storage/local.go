@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -151,4 +153,45 @@ func (l *LocalProvider) ObjectExists(ctx context.Context, key string) (bool, err
 		return false, err
 	}
 	return !info.IsDir(), nil
+}
+
+func (l *LocalProvider) GetFileBytes(ctx context.Context, key string) ([]byte, string, error) {
+	filePath, err := l.resolvePath(key)
+	if err != nil {
+		return nil, "", err
+	}
+	info, err := os.Stat(filePath)
+	if err != nil {
+		return nil, "", err
+	}
+	if info.Size() > MaxOCRFileSize {
+		return nil, "", fmt.Errorf("%w: size %d exceeds limit of %d bytes", ErrFileTooLarge, info.Size(), MaxOCRFileSize)
+	}
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, "", err
+	}
+	defer file.Close()
+
+	data, err := io.ReadAll(io.LimitReader(file, MaxOCRFileSize+1))
+	if err != nil {
+		return nil, "", err
+	}
+	if len(data) > MaxOCRFileSize {
+		return nil, "", fmt.Errorf("%w: file exceeds limit of %d bytes", ErrFileTooLarge, MaxOCRFileSize)
+	}
+	mimeType := http.DetectContentType(data)
+	mimeType = strings.ToLower(strings.TrimSpace(strings.Split(mimeType, ";")[0]))
+	return data, mimeType, nil
+}
+
+func (l *LocalProvider) SaveFile(ctx context.Context, key string, data []byte, contentType string) error {
+	path, err := l.resolvePath(key)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fmt.Errorf("failed to create directory for local storage: %w", err)
+	}
+	return os.WriteFile(path, data, 0644)
 }

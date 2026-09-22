@@ -1,9 +1,12 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"path/filepath"
 	"strings"
 	"time"
@@ -14,7 +17,7 @@ import (
 	"github.com/aws/smithy-go"
 )
 
-// S3Provider implements storage.Provider for AWS S3 and S3-compatible object stores
+// S3Provider implements storage.Provider using AWS S3
 type S3Provider struct {
 	client        *s3.Client
 	presignClient *s3.PresignClient
@@ -35,11 +38,9 @@ func (s *S3Provider) GenerateUploadURL(ctx context.Context, key string, contentT
 		Bucket:      aws.String(s.bucket),
 		Key:         aws.String(key),
 		ContentType: aws.String(contentType),
-	}, func(opts *s3.PresignOptions) {
-		opts.Expires = expiry
-	})
+	}, s3.WithPresignExpires(expiry))
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to generate S3 pre-signed upload URL: %w", err)
 	}
 	return req.URL, nil
 }
@@ -49,12 +50,10 @@ func (s *S3Provider) GenerateDownloadURL(ctx context.Context, key string, expiry
 	req, err := s.presignClient.PresignGetObject(ctx, &s3.GetObjectInput{
 		Bucket:                     aws.String(s.bucket),
 		Key:                        aws.String(key),
-		ResponseContentDisposition: aws.String(fmt.Sprintf("attachment; filename=%q", filename)),
-	}, func(opts *s3.PresignOptions) {
-		opts.Expires = expiry
-	})
+		ResponseContentDisposition: aws.String(fmt.Sprintf("inline; filename=%q", filename)),
+	}, s3.WithPresignExpires(expiry))
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to generate S3 pre-signed download URL: %w", err)
 	}
 	return req.URL, nil
 }
@@ -64,7 +63,10 @@ func (s *S3Provider) DeleteFile(ctx context.Context, key string) error {
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(key),
 	})
-	return err
+	if err != nil {
+		return fmt.Errorf("failed to delete S3 object: %w", err)
+	}
+	return nil
 }
 
 func (s *S3Provider) ObjectExists(ctx context.Context, key string) (bool, error) {
@@ -80,14 +82,58 @@ func (s *S3Provider) ObjectExists(ctx context.Context, key string) (bool, error)
 		}
 		var apiErr smithy.APIError
 		if errors.As(err, &apiErr) {
-			if apiErr.ErrorCode() == "NotFound" || apiErr.ErrorCode() == "NoSuchKey" {
+			code := apiErr.ErrorCode()
+			if code == "NotFound" || code == "NoSuchKey" || code == "404" {
 				return false, nil
 			}
 		}
-		if strings.Contains(err.Error(), "404") || strings.Contains(err.Error(), "NotFound") {
-			return false, nil
-		}
-		return false, err
+		return false, fmt.Errorf("failed to verify S3 object existence: %w", err)
 	}
 	return true, nil
+}
+
+func (s *S3Provider) GetFileBytes(ctx context.Context, key string) ([]byte, string, error) {
+	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: &s.bucket,
+		Key:    &key,
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	defer out.Body.Close()
+
+	if out.ContentLength != nil && *out.ContentLength > MaxOCRFileSize {
+		return nil, "", fmt.Errorf("%w: size %d exceeds limit of %d bytes", ErrFileTooLarge, *out.ContentLength, MaxOCRFileSize)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(out.Body, MaxOCRFileSize+1))
+	if err != nil {
+		return nil, "", err
+	}
+	if len(data) > MaxOCRFileSize {
+		return nil, "", fmt.Errorf("%w: file exceeds limit of %d bytes", ErrFileTooLarge, MaxOCRFileSize)
+	}
+
+	mimeType := ""
+	if out.ContentType != nil {
+		mimeType = strings.ToLower(strings.TrimSpace(strings.Split(*out.ContentType, ";")[0]))
+	}
+	if mimeType == "" || mimeType == "application/octet-stream" || mimeType == "binary/octet-stream" {
+		mimeType = http.DetectContentType(data)
+		mimeType = strings.ToLower(strings.TrimSpace(strings.Split(mimeType, ";")[0]))
+	}
+	return data, mimeType, nil
+}
+
+func (s *S3Provider) SaveFile(ctx context.Context, key string, data []byte, contentType string) error {
+	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      aws.String(s.bucket),
+		Key:         aws.String(key),
+		Body:        bytes.NewReader(data),
+		ContentType: aws.String(contentType),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to save file to S3: %w", err)
+	}
+	return nil
 }

@@ -146,27 +146,44 @@
 
 ---
 
-## 🟢 Phase 3: Prescription OCR & Clinical Intelligence (P2)
+## 🟢 Phase 3: Dual-Mode Prescriptions, Vision AI OCR & Clinical Intelligence (P2)
 
-- [ ] **OCR-01: Background Task Queue Integration**
-  - *Goal*: Deploy an asynchronous job queue ([River](https://github.com/riverqueue/river) via PostgreSQL or Redis [Asynq](https://github.com/hibiken/asynq)) for non-blocking prescription analysis.
+- [x] **RX-01: Dual-Mode Prescription Schema & Database Migration**
+  - *Goal*: Refactor `prescriptions` to support both uploaded image slips and direct digital e-prescriptions. Drop `file_name NOT NULL`, add `source VARCHAR(20)` (`'uploaded'`, `'digital'`), lifecycle `status VARCHAR(20)` (`'pending_ocr'`, `'needs_review'`, `'approved'`, `'rejected'`), and structured fields: `dosage`, `frequency`, `duration`, `timing`, and `instructions`.
+  - *File*: `migrations/`, `internal/repository/queries/prescriptions.sql`, `internal/models/`
+
+- [x] **RX-02: Digital Native E-Prescribing Endpoint (Doctor-Only)**
+  - *Goal*: Create `POST /api/prescriptions/digital` protected by `RequireRole("doctor")`. Allows physicians to directly create structured prescriptions during or after appointments without paper slips, pre-validating against `SAFE-01` and committing directly with `status = 'approved'`.
+  - *File*: `internal/api/handlers.go`, `internal/repository/`
+
+- [ ] **RX-03: Automated Prescription PDF Generator**
+  - *Goal*: Auto-generate standardized, clinic-branded downloadable PDF prescription slips with doctor credentials, clinic letterhead, structured medication tables, and a verification QR code for digital prescriptions, stored directly to S3.
+  - *File*: `internal/pdf/`, `internal/api/handlers.go`
+
+- [x] **OCR-01: River Background Task Queue Integration (PostgreSQL-Backed)**
+  - *Goal*: Deploy [River](https://github.com/riverqueue/river) using the existing `jackc/pgx/v5` pool. Enforce transactional job enqueueing (insert uploaded prescription + schedule OCR job atomically in the same DB transaction to eliminate dual-write risks).
   - *File*: `internal/queue/`, `cmd/worker/`
 
-- [ ] **OCR-02: Multimodal Vision AI Prescription Parser**
-  - *Goal*: Integrate Vision AI (Gemini Vision API / AWS Textract Medical) to analyze handwritten/typed prescription images.
-  - *Output Schema*: Extract `medication_name`, `dosage`, `frequency`, `duration`, `timing`, and `special_instructions`.
+- [x] **OCR-02: Pluggable OCR Provider Interface & Gemini Vision AI Primary**
+  - *Goal*: Create `internal/ocr/` with a clean `Provider` interface (`ExtractPrescription(ctx, fileBytes, mimeType)`). Implement Gemini Vision API (`google-genai` / structured JSON response schema) as primary provider extracting: `medication_name`, `dosage`, `frequency`, `duration`, `timing`, and `special_instructions`.
   - *File*: `internal/ocr/`
 
-- [ ] **OCR-03: Human-in-the-Loop (HITL) Verification Workflow**
-  - *Goal*: Extracted prescriptions are saved as `status = 'needs_review'`. Provide doctor endpoint to review, edit, and approve extracted data.
-  - *File*: `internal/api/handlers.go`, `internal/models/`
+- [x] **OCR-03: Human-in-the-Loop (HITL) Verification Workflow**
+  - *Goal*: Uploaded prescriptions follow a database-backed lifecycle state machine: `pending_ocr` ➔ `needs_review` ➔ `approved`. Provide authenticated doctor review endpoints (`GET /api/prescriptions/pending-review`, `PATCH /api/prescriptions/:id/verify`) to inspect, adjust, and approve AI extractions before committing them to active records.
+  - *File*: `internal/api/handlers.go`, `internal/models/`, `internal/repository/`
+
+- [ ] **OCR-04: Resilient Provider Fallback Chain & BYOK (Bring Your Own Key) Vault**
+  - *Goal*: 
+    1. Composite `FallbackChain` decorator to failover across vision providers (e.g., Primary: Gemini ➔ Fallback: Claude / OpenAI) on 429 rate limits or transient 5xx outages.
+    2. Clinic-level BYOK credential storage with AES-256-GCM envelope encryption (KMS master key) allowing healthcare providers to supply their own cloud API keys for HIPAA BAA compliance and direct cost accounting.
+  - *File*: `internal/ocr/fallback.go`, `internal/crypto/`, `migrations/`
 
 - [ ] **SAFE-01: Drug-Drug Interaction (DDI) & Allergy Checker**
-  - *Goal*: Cross-reference extracted medication names against the patient's existing active medications and documented allergies using [OpenFDA Drug API](https://open.fda.gov/apis/).
+  - *Goal*: Cross-reference medications (both digitally entered and OCR-extracted) against the patient's existing active medications and documented allergies using the [OpenFDA Drug API](https://open.fda.gov/apis/).
   - *File*: `internal/safety/`
 
-- [ ] **NOTIF-01: Real-Time OCR Completion Event**
-  - *Goal*: Push WebSocket or Server-Sent Events (SSE) notification to the doctor's frontend when OCR analysis is complete.
+- [ ] **NOTIF-01: Real-Time Prescription Status Events**
+  - *Goal*: Push WebSocket or Server-Sent Events (SSE) notification to the doctor's and patient's frontend when OCR analysis is complete or a new digital prescription is issued.
   - *File*: `internal/api/`
 
 ---

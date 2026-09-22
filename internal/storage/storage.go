@@ -16,7 +16,10 @@ var (
 	ErrInvalidFileType    = errors.New("invalid file type: only PDF and image files (.png, .jpg, .jpeg) are permitted")
 	ErrInvalidContentType = errors.New("invalid content type: only application/pdf, image/png, image/jpeg are permitted")
 	ErrInvalidMagicBytes  = errors.New("file content does not match allowed types: expected PDF or image (PNG/JPEG)")
+	ErrFileTooLarge       = errors.New("file exceeds maximum allowed size of 15 MB")
 )
+
+const MaxOCRFileSize = 15 * 1024 * 1024 // 15 MB
 
 // Allowed file extensions and MIME types for prescriptions
 var allowedExtensions = map[string]bool{
@@ -100,4 +103,10 @@ type Provider interface {
 
 	// ObjectExists checks whether an object exists in the storage provider
 	ObjectExists(ctx context.Context, key string) (bool, error)
+
+	// GetFileBytes retrieves the raw file bytes and detected MIME type on the server side
+	GetFileBytes(ctx context.Context, key string) ([]byte, string, error)
+
+	// SaveFile persists raw bytes directly into storage (e.g. for generated PDFs)
+	SaveFile(ctx context.Context, key string, data []byte, contentType string) error
 }
