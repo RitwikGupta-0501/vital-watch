@@ -1,0 +1,56 @@
+name: CI / Quality Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - 'feature/**'
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  test:
+    name: Lint, Test & Build
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: vitalwatch_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+
+      - name: Verify Dependencies
+        run: go mod verify
+
+      - name: Static Analysis (go vet)
+        run: go vet ./...
+
+      - name: Unit & Integration Tests (with Race Detector)
+        env:
+          DATABASE_URL: postgres://postgres:password@localhost:5432/vitalwatch_test?sslmode=disable
+          JWT_SECRET: ci-test-secret-32bytes-for-jwt-signing!
+          DOCTOR_INVITE_CODE: ci-invite-code-1234
+        run: go test -v -race ./...
+
+      - name: Compile Binary
+        run: CGO_ENABLED=0 go build -v -ldflags="-w -s" -o /dev/null ./cmd/main

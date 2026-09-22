@@ -55,6 +55,14 @@ type MockRepository struct {
 	GetPrescriptionByFilenameForDoctorFunc func(ctx context.Context, doctorID uuid.UUID, filename string) (models.Prescription, error)
 	GetPrescriptionByIDFunc                func(ctx context.Context, id uuid.UUID) (models.Prescription, error)
 	UpdatePrescriptionFileNameFunc         func(ctx context.Context, prescriptionID uuid.UUID, fileName string) error
+
+	CreateRefreshTokenFunc          func(ctx context.Context, userID uuid.UUID, tokenHash string, expiresAt time.Time) (models.RefreshToken, error)
+	GetRefreshTokenByHashFunc       func(ctx context.Context, tokenHash string) (models.RefreshToken, error)
+	RevokeRefreshTokenFunc          func(ctx context.Context, id uuid.UUID, replacedByTokenID *uuid.UUID) error
+	RevokeAllUserRefreshTokensFunc  func(ctx context.Context, userID uuid.UUID) error
+	CreateAuditLogFunc              func(ctx context.Context, log models.PhiAuditLog) (uuid.UUID, error)
+	GetAuditLogsByPatientIDFunc     func(ctx context.Context, patientID uuid.UUID, limit, offset int) ([]models.PhiAuditLog, error)
+	GetAuditLogsFunc                func(ctx context.Context, limit, offset int) ([]models.PhiAuditLog, error)
 }
 
 func (m *MockRepository) CreatePatient(ctx context.Context, firstName, lastName, email, hashedPassword string) (uuid.UUID, error) {
@@ -353,3 +361,59 @@ func (m *MockRepository) UpdateAppointmentMeetingRoom(ctx context.Context, apptI
 	}
 	return nil
 }
+
+func (m *MockRepository) CreateRefreshToken(ctx context.Context, userID uuid.UUID, tokenHash string, expiresAt time.Time) (models.RefreshToken, error) {
+	if m.CreateRefreshTokenFunc != nil {
+		return m.CreateRefreshTokenFunc(ctx, userID, tokenHash, expiresAt)
+	}
+	return models.RefreshToken{
+		ID:        uuid.New(),
+		UserID:    userID,
+		TokenHash: tokenHash,
+		ExpiresAt: expiresAt,
+		CreatedAt: time.Now(),
+	}, nil
+}
+
+func (m *MockRepository) GetRefreshTokenByHash(ctx context.Context, tokenHash string) (models.RefreshToken, error) {
+	if m.GetRefreshTokenByHashFunc != nil {
+		return m.GetRefreshTokenByHashFunc(ctx, tokenHash)
+	}
+	return models.RefreshToken{}, sql.ErrNoRows
+}
+
+func (m *MockRepository) RevokeRefreshToken(ctx context.Context, id uuid.UUID, replacedByTokenID *uuid.UUID) error {
+	if m.RevokeRefreshTokenFunc != nil {
+		return m.RevokeRefreshTokenFunc(ctx, id, replacedByTokenID)
+	}
+	return nil
+}
+
+func (m *MockRepository) RevokeAllUserRefreshTokens(ctx context.Context, userID uuid.UUID) error {
+	if m.RevokeAllUserRefreshTokensFunc != nil {
+		return m.RevokeAllUserRefreshTokensFunc(ctx, userID)
+	}
+	return nil
+}
+
+func (m *MockRepository) CreateAuditLog(ctx context.Context, log models.PhiAuditLog) (uuid.UUID, error) {
+	if m.CreateAuditLogFunc != nil {
+		return m.CreateAuditLogFunc(ctx, log)
+	}
+	return uuid.New(), nil
+}
+
+func (m *MockRepository) GetAuditLogsByPatientID(ctx context.Context, patientID uuid.UUID, limit, offset int) ([]models.PhiAuditLog, error) {
+	if m.GetAuditLogsByPatientIDFunc != nil {
+		return m.GetAuditLogsByPatientIDFunc(ctx, patientID, limit, offset)
+	}
+	return []models.PhiAuditLog{}, nil
+}
+
+func (m *MockRepository) GetAuditLogs(ctx context.Context, limit, offset int) ([]models.PhiAuditLog, error) {
+	if m.GetAuditLogsFunc != nil {
+		return m.GetAuditLogsFunc(ctx, limit, offset)
+	}
+	return []models.PhiAuditLog{}, nil
+}
+

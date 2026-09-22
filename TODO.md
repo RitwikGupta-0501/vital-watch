@@ -156,7 +156,7 @@
   - *Goal*: Create `POST /api/prescriptions/digital` protected by `RequireRole("doctor")`. Allows physicians to directly create structured prescriptions during or after appointments without paper slips, pre-validating against `SAFE-01` and committing directly with `status = 'approved'`.
   - *File*: `internal/api/handlers.go`, `internal/repository/`
 
-- [ ] **RX-03: Automated Prescription PDF Generator**
+- [x] **RX-03: Automated Prescription PDF Generator**
   - *Goal*: Auto-generate standardized, clinic-branded downloadable PDF prescription slips with doctor credentials, clinic letterhead, structured medication tables, and a verification QR code for digital prescriptions, stored directly to S3.
   - *File*: `internal/pdf/`, `internal/api/handlers.go`
 
@@ -178,11 +178,11 @@
     2. Clinic-level BYOK credential storage with AES-256-GCM envelope encryption (KMS master key) allowing healthcare providers to supply their own cloud API keys for HIPAA BAA compliance and direct cost accounting.
   - *File*: `internal/ocr/fallback.go`, `internal/crypto/`, `migrations/`
 
-- [ ] **SAFE-01: Drug-Drug Interaction (DDI) & Allergy Checker**
+- [x] **SAFE-01: Drug-Drug Interaction (DDI) & Allergy Checker**
   - *Goal*: Cross-reference medications (both digitally entered and OCR-extracted) against the patient's existing active medications and documented allergies using the [OpenFDA Drug API](https://open.fda.gov/apis/).
   - *File*: `internal/safety/`
 
-- [ ] **NOTIF-01: Real-Time Prescription Status Events**
+- [x] **NOTIF-01: Real-Time Prescription Status Events**
   - *Goal*: Push WebSocket or Server-Sent Events (SSE) notification to the doctor's and patient's frontend when OCR analysis is complete or a new digital prescription is issued.
   - *File*: `internal/api/`
 
@@ -190,19 +190,19 @@
 
 ## 🟢 Phase 4: Advanced Scheduling & Patient Experience (P2)
 
-- [ ] **SCHED-01: Doctor Working Hours & Slot Generation**
+- [x] **SCHED-01: Doctor Working Hours & Slot Generation**
   - *Goal*: Doctors define available days, working hours (e.g., 09:00–17:00), and slot durations (15m/30m). Backend dynamically returns unbooked slots.
   - *File*: `internal/models/`, `internal/repository/`
 
-- [ ] **SCHED-02: Telehealth Video Room Integration**
+- [x] **SCHED-02: Telehealth Video Room Integration**
   - *Goal*: Auto-generate secure video meeting links (Daily.co / Twilio / Jitsi) for appointments with `type = 'virtual'`.
   - *File*: `internal/telehealth/`
 
-- [ ] **PAT-01: Longitudinal Vitals Tracking**
+- [x] **PAT-01: Longitudinal Vitals Tracking**
   - *Goal*: Add endpoints and models for logging blood pressure, heart rate, blood glucose, and body weight over time.
   - *File*: `internal/models/`, `internal/api/`
 
-- [ ] **PAT-02: Smart Medication Schedules & Reminders**
+- [x] **PAT-02: Smart Medication Schedules & Reminders**
   - *Goal*: Transform approved prescription dosages into a daily patient schedule with push/email reminder hooks.
   - *File*: `internal/schedule/`
 
@@ -218,22 +218,22 @@
   - *Goal*: End-to-end API testing with `dockertest` or ephemeral PostgreSQL test containers.
   - *File*: `tests/`
 
-- [ ] **SEC-06: HIPAA PHI Access Audit Logging**
+- [x] **SEC-06: HIPAA PHI Access Audit Logging**
   - *Goal*: Middleware logging all reads/writes to medical history, prescriptions, and appointment records with user ID, IP address, and timestamp.
   - *File*: `internal/middleware/audit.go`
 
-- [ ] **SEC-09: Token Lifetime & Revocation Strategy**
+- [x] **SEC-09: Token Lifetime & Revocation Strategy**
   - *Goal*: Shorten access token lifetime (15-30m), implement refresh token rotation and revocation blocklists for sensitive health data access.
   - *File*: `internal/api/handlers.go`
 
-- [ ] **OBS-01: Structured JSON Logging (`slog`) & Request Tracing**
+- [x] **OBS-01: Structured JSON Logging (`slog`) & Request Tracing**
   - *Goal*: Replace standard `log.Println` with Go's `log/slog` and attach unique `X-Request-ID` to all logs and responses.
   - *File*: `cmd/main/main.go`, `internal/middleware/`
 
-- [ ] **CI-01: GitHub Actions Automation Pipeline**
+- [x] **CI-01: GitHub Actions Automation Pipeline**
   - *Goal*: Workflow executing `golangci-lint`, `govulncheck`, and `go test -v -race ./...` on every pull request.
   - *File*: `.github/workflows/ci.yml`
 
-- [ ] **DOCKER-01: Container Hardening**
+- [x] **DOCKER-01: Container Hardening**
   - *Goal*: Run Docker container as non-root user (`appuser`) and install `ca-certificates tzdata` for outbound HTTPS calls.
   - *File*: `Dockerfile`

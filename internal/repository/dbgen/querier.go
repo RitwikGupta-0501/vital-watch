@@ -13,6 +13,7 @@ import (
 
 type Querier interface {
 	CreateAppointment(ctx context.Context, arg CreateAppointmentParams) (uuid.UUID, error)
+	CreateAuditLog(ctx context.Context, arg CreateAuditLogParams) (PhiAuditLog, error)
 	CreateDigitalPrescription(ctx context.Context, arg CreateDigitalPrescriptionParams) (uuid.UUID, error)
 	CreateDoctorProfile(ctx context.Context, arg CreateDoctorProfileParams) error
 	CreateDoctorUser(ctx context.Context, arg CreateDoctorUserParams) (uuid.UUID, error)
@@ -20,6 +21,7 @@ type Querier interface {
 	CreatePatientUser(ctx context.Context, arg CreatePatientUserParams) (uuid.UUID, error)
 	CreatePatientVital(ctx context.Context, arg CreatePatientVitalParams) (PatientVital, error)
 	CreatePrescription(ctx context.Context, arg CreatePrescriptionParams) (uuid.UUID, error)
+	CreateRefreshToken(ctx context.Context, arg CreateRefreshTokenParams) (RefreshToken, error)
 	DeleteDoctorScheduleByDay(ctx context.Context, arg DeleteDoctorScheduleByDayParams) error
 	DeletePrescriptionItems(ctx context.Context, prescriptionID uuid.UUID) error
 	GetActivePrescriptionItemsForPatient(ctx context.Context, arg GetActivePrescriptionItemsForPatientParams) ([]PrescriptionItem, error)
@@ -27,6 +29,8 @@ type Querier interface {
 	GetAppointmentsByDoctorID(ctx context.Context, arg GetAppointmentsByDoctorIDParams) ([]GetAppointmentsByDoctorIDRow, error)
 	GetAppointmentsByPatientID(ctx context.Context, arg GetAppointmentsByPatientIDParams) ([]GetAppointmentsByPatientIDRow, error)
 	GetAppointmentsForPatient(ctx context.Context, arg GetAppointmentsForPatientParams) ([]GetAppointmentsForPatientRow, error)
+	GetAuditLogs(ctx context.Context, arg GetAuditLogsParams) ([]PhiAuditLog, error)
+	GetAuditLogsByPatientID(ctx context.Context, arg GetAuditLogsByPatientIDParams) ([]PhiAuditLog, error)
 	GetDoctorAppointmentsInRange(ctx context.Context, arg GetDoctorAppointmentsInRangeParams) ([]GetDoctorAppointmentsInRangeRow, error)
 	GetDoctorByEmail(ctx context.Context, email string) (GetDoctorByEmailRow, error)
 	GetDoctorByID(ctx context.Context, id uuid.UUID) (GetDoctorByIDRow, error)
@@ -47,8 +51,11 @@ type Querier interface {
 	GetPrescriptionsByPatientID(ctx context.Context, arg GetPrescriptionsByPatientIDParams) ([]GetPrescriptionsByPatientIDRow, error)
 	GetPrescriptionsForPatient(ctx context.Context, arg GetPrescriptionsForPatientParams) ([]GetPrescriptionsForPatientRow, error)
 	GetPrescriptionsPendingReview(ctx context.Context, arg GetPrescriptionsPendingReviewParams) ([]GetPrescriptionsPendingReviewRow, error)
+	GetRefreshTokenByHash(ctx context.Context, tokenHash string) (RefreshToken, error)
 	HasDoctorPatientRelationship(ctx context.Context, arg HasDoctorPatientRelationshipParams) (pgtype.Bool, error)
 	InsertPrescriptionItem(ctx context.Context, arg InsertPrescriptionItemParams) (PrescriptionItem, error)
+	RevokeAllUserRefreshTokens(ctx context.Context, userID uuid.UUID) error
+	RevokeRefreshToken(ctx context.Context, arg RevokeRefreshTokenParams) error
 	UpdateAppointmentAsCompletedForDoctor(ctx context.Context, arg UpdateAppointmentAsCompletedForDoctorParams) (int64, error)
 	UpdateAppointmentMeetingRoom(ctx context.Context, arg UpdateAppointmentMeetingRoomParams) error
 	UpdatePrescriptionOCRStatus(ctx context.Context, arg UpdatePrescriptionOCRStatusParams) (int64, error)
