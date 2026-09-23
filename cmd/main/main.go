@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -80,11 +81,11 @@ func init_db(ctx context.Context) *pgxpool.Pool {
 	for i := 0; i < 5; i++ {
 		err = pool.Ping(ctx)
 		if err == nil {
-			log.Println("Successfully connected to database pool!")
+			slog.Info("Successfully connected to database pool!")
 			return pool
 		}
 		dbErr = err
-		log.Println("Failed to ping database, retrying in 2 seconds...")
+		slog.Warn("Failed to ping database, retrying in 2 seconds...", "error", err)
 		time.Sleep(2 * time.Second)
 	}
 	log.Fatal("Failed to ping database after retries:", dbErr)
@@ -97,7 +98,7 @@ func init_db(ctx context.Context) *pgxpool.Pool {
 ========================================
 */
 func run_migrations(pool *pgxpool.Pool) {
-	log.Println("Running database migrations...")
+	slog.Info("Running database migrations...")
 	sqlDB := stdlib.OpenDBFromPool(pool)
 	defer sqlDB.Close()
 	driver, err := pgxmigrate.WithInstance(sqlDB, &pgxmigrate.Config{})
@@ -117,7 +118,7 @@ func run_migrations(pool *pgxpool.Pool) {
 		log.Fatal("Failed to run migrations:", err)
 	}
 
-	log.Println("Database migrations finished successfully.")
+	slog.Info("Database migrations finished successfully.")
 }
 
 /*
@@ -129,7 +130,7 @@ func main() {
 	// Initialize environment variables
 	err := godotenv.Load()
 	if err != nil {
-		log.Println("No .env file found, relying on system environment variables")
+		slog.Info("No .env file found, relying on system environment variables")
 	}
 
 	// Validate critical environment variables
@@ -165,7 +166,7 @@ func main() {
 	var storageProvider storage.Provider
 	switch storageType {
 	case "s3":
-		log.Println("Initializing AWS Config for S3 Storage Provider...")
+		slog.Info("Initializing AWS Config for S3 Storage Provider...")
 		cfg, err := config.LoadDefaultConfig(context.TODO())
 		if err != nil {
 			log.Fatal("Failed to load AWS config:", err)
@@ -176,10 +177,10 @@ func main() {
 		}
 		s3Client := s3.NewFromConfig(cfg)
 		storageProvider = storage.NewS3Provider(s3Client, bucketName)
-		log.Println("Successfully initialized S3 Storage Provider")
+		slog.Info("Successfully initialized S3 Storage Provider")
 
 	default: // "local"
-		log.Println("Initializing Local Disk Storage Provider...")
+		slog.Info("Initializing Local Disk Storage Provider...")
 		localStorageURL := os.Getenv("LOCAL_STORAGE_BASE_URL")
 		if localStorageURL == "" {
 			localStorageURL = "http://localhost:" + port
@@ -196,7 +197,7 @@ func main() {
 			log.Fatal("Failed to initialize local storage:", err)
 		}
 		storageProvider = localProv
-		log.Println("Successfully initialized Local Storage Provider (Base URL:", localStorageURL, ")")
+		slog.Info("Successfully initialized Local Storage Provider", "base_url", localStorageURL)
 	}
 
 	// Initialize Multi-Provider Vision AI OCR Engine
@@ -206,9 +207,9 @@ func main() {
 		if providersStr == "" {
 			providersStr = "gemini,claude,openai (default)"
 		}
-		log.Printf("Vision AI OCR enabled with active providers: %s", providersStr)
+		slog.Info("Vision AI OCR enabled", "providers", providersStr)
 	} else {
-		log.Println("Vision AI OCR is disabled (zero-config / no active provider keys). Prescriptions will enter needs_review for manual clinician entry.")
+		slog.Info("Vision AI OCR is disabled (zero-config / no active provider keys). Prescriptions will enter needs_review for manual clinician entry.")
 	}
 
 	// Initialize Repository (breaks initialization cycle with River)
@@ -231,7 +232,7 @@ func main() {
 	repo.SetRiverClient(riverClient.RiverClient)
 
 	// Start River Queue Consumer
-	log.Println("Starting River task queue worker...")
+	slog.Info("Starting River task queue worker...")
 	if err := riverClient.RiverClient.Start(ctx); err != nil {
 		log.Fatalf("Failed to start River background worker: %v", err)
 	}
@@ -265,7 +266,7 @@ func main() {
 
 	// Run server in a goroutine
 	go func() {
-		log.Printf("Starting HTTP server on port %s...", port)
+		slog.Info("Starting HTTP server", "port", port)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("HTTP server listen error: %v", err)
 		}
@@ -275,37 +276,37 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-quit
-	log.Printf("Received shutdown signal (%v). Draining in-flight connections and queue workers...", sig)
+	slog.Info("Received shutdown signal. Draining in-flight connections and queue workers...", "signal", sig.String())
 
 	// Graceful shutdown: Real-time notification broker (unblocks active SSE streams so HTTP server can drain)
-	log.Println("Closing notification broker subscriptions...")
+	slog.Info("Closing notification broker subscriptions...")
 	notifier.Shutdown()
 
 	// Graceful shutdown: HTTP Server (stop accepting new requests, finish in-flight requests)
-	log.Println("Stopping HTTP server listener and draining in-flight requests...")
+	slog.Info("Stopping HTTP server listener and draining in-flight requests...")
 	httpShutdownCtx, httpCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer httpCancel()
 	if err := srv.Shutdown(httpShutdownCtx); err != nil {
-		log.Printf("Server forced to shutdown: %v", err)
+		slog.Error("Server forced to shutdown", "error", err)
 	}
 
 	// Graceful shutdown: River Task Queue (drains worker after in-flight requests finish enqueueing)
-	log.Println("Stopping River queue consumer...")
+	slog.Info("Stopping River queue consumer...")
 	riverShutdownCtx, riverCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer riverCancel()
 	if err := riverClient.RiverClient.Stop(riverShutdownCtx); err != nil {
-		log.Printf("River client stop error: %v", err)
+		slog.Error("River client stop error", "error", err)
 	}
 
 	// Graceful shutdown: HIPAA ePHI Auditor
-	log.Println("Flushing and shutting down HIPAA audit worker...")
+	slog.Info("Flushing and shutting down HIPAA audit worker...")
 	auditShutdownCtx, auditCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer auditCancel()
 	if err := auditor.Shutdown(auditShutdownCtx); err != nil {
-		log.Printf("Auditor shutdown error: %v", err)
+		slog.Error("Auditor shutdown error", "error", err)
 	}
 
-	log.Println("Server exited gracefully.")
+	slog.Info("Server exited gracefully.")
 }
 
 // setupRouter builds and configures the Gin engine and route tree

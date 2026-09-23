@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -273,9 +274,12 @@ func TestOpenFDAQueryEncoding_NoDoubleEscapePlus(t *testing.T) {
 }
 
 func TestOpenFDA_APIKeyAppended(t *testing.T) {
+	var mu sync.Mutex
 	var receivedRawQuery string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
 		receivedRawQuery = r.URL.RawQuery
+		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"results": []interface{}{}})
 	}))
@@ -292,8 +296,12 @@ func TestOpenFDA_APIKeyAppended(t *testing.T) {
 		nil,
 	)
 
-	if !strings.Contains(receivedRawQuery, "api_key=test-fda-key-12345") {
-		t.Fatalf("expected api_key in query string, got: %s", receivedRawQuery)
+	mu.Lock()
+	rawQuery := receivedRawQuery
+	mu.Unlock()
+
+	if !strings.Contains(rawQuery, "api_key=test-fda-key-12345") {
+		t.Fatalf("expected api_key in query string, got: %s", rawQuery)
 	}
 }
 
@@ -332,10 +340,13 @@ func TestCacheEvictionAtCapacity(t *testing.T) {
 }
 
 func TestNonInteractingPairs_CheckedOnce(t *testing.T) {
+	var mu sync.Mutex
 	var requestedSearches []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query().Get("search")
+		mu.Lock()
 		requestedSearches = append(requestedSearches, q)
+		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"results": []map[string]interface{}{
@@ -364,7 +375,12 @@ func TestNonInteractingPairs_CheckedOnce(t *testing.T) {
 		t.Fatalf("expected 0 interaction alerts, got %d", len(report.InteractionAlerts))
 	}
 
-	if len(requestedSearches) != 2 {
-		t.Fatalf("expected exactly 2 FDA queries for 2 distinct drugs, got %d: %v", len(requestedSearches), requestedSearches)
+	mu.Lock()
+	searchesCount := len(requestedSearches)
+	searchesCopy := append([]string{}, requestedSearches...)
+	mu.Unlock()
+
+	if searchesCount != 2 {
+		t.Fatalf("expected exactly 2 FDA queries for 2 distinct drugs, got %d: %v", searchesCount, searchesCopy)
 	}
 }

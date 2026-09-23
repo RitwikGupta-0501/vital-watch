@@ -2,7 +2,7 @@ package ocr
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"os"
 	"strings"
 )
@@ -17,7 +17,7 @@ type Manager struct {
 func NewManagerFromEnv(ctx context.Context) *Manager {
 	ocrEnabledStr := strings.ToLower(strings.TrimSpace(os.Getenv("OCR_ENABLED")))
 	if ocrEnabledStr == "false" || ocrEnabledStr == "0" {
-		log.Println("[OCR Manager] OCR processing explicitly disabled via OCR_ENABLED=false")
+		slog.Info("OCR processing explicitly disabled via OCR_ENABLED=false")
 		return &Manager{enabled: false}
 	}
 
@@ -46,29 +46,29 @@ func NewManagerFromEnv(ctx context.Context) *Manager {
 			if geminiKey != "" {
 				gp, err := NewGeminiProvider(ctx, geminiKey)
 				if err != nil {
-					log.Printf("[OCR Manager] Failed to initialize Gemini provider: %v", err)
+					slog.Error("Failed to initialize Gemini provider", "error", err)
 				} else {
 					activeProviders = append(activeProviders, gp)
-					log.Println("[OCR Manager] Registered Gemini Vision Provider (Primary/Active)")
+					slog.Info("Registered Gemini Vision Provider", "role", "Primary/Active")
 				}
 			}
 		case "claude", "anthropic":
 			if claudeKey != "" {
 				cp := NewClaudeProvider(claudeKey)
 				activeProviders = append(activeProviders, cp)
-				log.Println("[OCR Manager] Registered Anthropic Claude Vision Provider (Active)")
+				slog.Info("Registered Anthropic Claude Vision Provider", "role", "Active")
 			}
 		case "openai":
 			if openaiKey != "" {
 				op := NewOpenAIProvider(openaiKey)
 				activeProviders = append(activeProviders, op)
-				log.Println("[OCR Manager] Registered OpenAI Vision Provider (Active)")
+				slog.Info("Registered OpenAI Vision Provider", "role", "Active")
 			}
 		}
 	}
 
 	if len(activeProviders) == 0 {
-		log.Println("[OCR Manager] No OCR provider API keys configured. OCR is disabled. Uploads will transition directly to needs_review for manual clinician entry.")
+		slog.Warn("No OCR provider API keys configured. OCR is disabled. Uploads will transition directly to needs_review")
 		return &Manager{enabled: false}
 	}
 

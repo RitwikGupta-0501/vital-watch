@@ -60,6 +60,7 @@ type MockRepository struct {
 	GetRefreshTokenByHashFunc       func(ctx context.Context, tokenHash string) (models.RefreshToken, error)
 	RevokeRefreshTokenFunc          func(ctx context.Context, id uuid.UUID, replacedByTokenID *uuid.UUID) error
 	RevokeAllUserRefreshTokensFunc  func(ctx context.Context, userID uuid.UUID) error
+	RotateRefreshTokenFunc          func(ctx context.Context, oldTokenID, userID uuid.UUID, newHash string, expiresAt time.Time) (models.RefreshToken, error)
 	CreateAuditLogFunc              func(ctx context.Context, log models.PhiAuditLog) (uuid.UUID, error)
 	GetAuditLogsByPatientIDFunc     func(ctx context.Context, patientID uuid.UUID, limit, offset int) ([]models.PhiAuditLog, error)
 	GetAuditLogsFunc                func(ctx context.Context, limit, offset int) ([]models.PhiAuditLog, error)
@@ -338,6 +339,18 @@ func (m *MockRepository) HasDoctorPatientRelationship(ctx context.Context, docto
 	if m.HasDoctorPatientRelationshipFunc != nil {
 		return m.HasDoctorPatientRelationshipFunc(ctx, doctorID, patientID)
 	}
+	if m.GetAppointmentsForPatientFunc != nil {
+		appts, err := m.GetAppointmentsForPatientFunc(ctx, doctorID, patientID, 10, 0)
+		if err != nil {
+			return false, err
+		}
+		for _, a := range appts {
+			if a.Status != "cancelled" {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
 	return true, nil
 }
 
@@ -394,6 +407,23 @@ func (m *MockRepository) RevokeAllUserRefreshTokens(ctx context.Context, userID 
 		return m.RevokeAllUserRefreshTokensFunc(ctx, userID)
 	}
 	return nil
+}
+
+func (m *MockRepository) RotateRefreshToken(ctx context.Context, oldTokenID, userID uuid.UUID, newHash string, expiresAt time.Time) (models.RefreshToken, error) {
+	if m.RotateRefreshTokenFunc != nil {
+		return m.RotateRefreshTokenFunc(ctx, oldTokenID, userID, newHash, expiresAt)
+	}
+	if m.CreateRefreshTokenFunc != nil {
+		newTok, err := m.CreateRefreshTokenFunc(ctx, userID, newHash, expiresAt)
+		if err != nil {
+			return models.RefreshToken{}, err
+		}
+		if m.RevokeRefreshTokenFunc != nil {
+			_ = m.RevokeRefreshTokenFunc(ctx, oldTokenID, &newTok.ID)
+		}
+		return newTok, nil
+	}
+	return models.RefreshToken{}, nil
 }
 
 func (m *MockRepository) CreateAuditLog(ctx context.Context, log models.PhiAuditLog) (uuid.UUID, error) {

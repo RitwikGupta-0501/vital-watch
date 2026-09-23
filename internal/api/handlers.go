@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/jackc/pgx/v5"
-	"log"
+	"log/slog"
 	"math"
 	"net/http"
 	"os"
@@ -169,7 +169,8 @@ func (h *Handler) Login(c *gin.Context) {
 	switch req.Role {
 	case "patient":
 		user, err = h.Repo.GetPatientByEmail(ctx, req.Email)
-	case "doctor":
+	case "doctor", "admin":
+		// Both doctors and admins are stored in the doctors/users table with their role
 		user, err = h.Repo.GetDoctorByEmail(ctx, req.Email)
 	default:
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid role"})
@@ -177,11 +178,33 @@ func (h *Handler) Login(c *gin.Context) {
 	}
 
 	if err != nil {
+		// Audit failed login attempt (HIPAA § 164.312(b))
+		if h.Auditor != nil {
+			h.Auditor.Log(models.PhiAuditLog{
+				Action:     audit.ActionUserLogin,
+				IPAddress:  c.ClientIP(),
+				UserAgent:  c.Request.UserAgent(),
+				StatusCode: http.StatusUnauthorized,
+				Metadata:   fmt.Sprintf(`{"email":%q,"role":%q,"reason":"user_not_found"}`, req.Email, req.Role),
+			})
+		}
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
 	}
 
-	if !utils.CheckPasswordHash(req.Password, user.GetHashedPassword()) {
+	if !utils.CheckPasswordHash(req.Password, user.GetHashedPassword()) || (user.GetRole() != "" && user.GetRole() != req.Role) {
+		// Audit failed login attempt (HIPAA § 164.312(b))
+		userID := user.GetID()
+		if h.Auditor != nil {
+			h.Auditor.Log(models.PhiAuditLog{
+				UserID:     &userID,
+				Action:     audit.ActionUserLogin,
+				IPAddress:  c.ClientIP(),
+				UserAgent:  c.Request.UserAgent(),
+				StatusCode: http.StatusUnauthorized,
+				Metadata:   fmt.Sprintf(`{"email":%q,"role":%q,"reason":"bad_credentials"}`, req.Email, req.Role),
+			})
+		}
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
 	}
@@ -198,7 +221,7 @@ func (h *Handler) Login(c *gin.Context) {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	tokenString, err := token.SignedString(h.JWTSecret)
 	if err != nil {
-		log.Println("Failed to sign token:", err)
+		slog.ErrorContext(ctx, "Failed to sign access token", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
 		return
 	}
@@ -206,16 +229,30 @@ func (h *Handler) Login(c *gin.Context) {
 	// Cryptographically secure refresh token (7-day validity)
 	rawRefresh, refreshHash, err := generateSecureRandomToken()
 	if err != nil {
-		log.Println("Failed to generate refresh token:", err)
+		slog.ErrorContext(ctx, "Failed to generate refresh token", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate session tokens"})
 		return
 	}
 
 	_, err = h.Repo.CreateRefreshToken(c.Request.Context(), user.GetID(), refreshHash, time.Now().Add(7*24*time.Hour))
 	if err != nil {
-		log.Println("Failed to store refresh token:", err)
+		slog.ErrorContext(ctx, "Failed to store refresh token", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to store session tokens"})
 		return
+	}
+
+	// Audit successful login (HIPAA § 164.312(b))
+	if h.Auditor != nil {
+		successUserID := user.GetID()
+		h.Auditor.Log(models.PhiAuditLog{
+			UserID:     &successUserID,
+			UserRole:   req.Role,
+			Action:     audit.ActionUserLogin,
+			IPAddress:  c.ClientIP(),
+			UserAgent:  c.Request.UserAgent(),
+			StatusCode: http.StatusOK,
+			Metadata:   fmt.Sprintf(`{"role":%q}`, req.Role),
+		})
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -321,6 +358,7 @@ func (h *Handler) GetUserProfile(c *gin.Context) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Patient profile not found"})
 			return
 		}
+		h.audit(c, audit.ActionViewPatientProfile, "patient", &userID, &userID, http.StatusOK, nil)
 		c.JSON(http.StatusOK, patient)
 
 	case "doctor":
@@ -329,7 +367,25 @@ func (h *Handler) GetUserProfile(c *gin.Context) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Doctor profile not found"})
 			return
 		}
+		h.audit(c, audit.ActionViewPatientProfile, "doctor", &userID, nil, http.StatusOK, nil)
 		c.JSON(http.StatusOK, doctor)
+
+	case "admin":
+		doctor, err := h.Repo.GetDoctorByID(ctx, userID)
+		if err == nil {
+			c.JSON(http.StatusOK, gin.H{
+				"id":         doctor.ID,
+				"email":      doctor.Email,
+				"first_name": doctor.FirstName,
+				"last_name":  doctor.LastName,
+				"role":       "admin",
+			})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"id":   userID,
+			"role": "admin",
+		})
 
 	default:
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user role"})
@@ -361,7 +417,7 @@ func (h *Handler) GetDoctors(c *gin.Context) {
 	limit, offset := parsePagination(c)
 	doctors, err := h.Repo.GetDoctors(c.Request.Context(), limit, offset)
 	if err != nil {
-		log.Printf("Internal error in GetDoctors: %v", err)
+		slog.ErrorContext(c.Request.Context(), "Internal error in GetDoctors", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch doctors"})
 		return
 	}
@@ -383,7 +439,7 @@ func (h *Handler) GetPatientAppointments(c *gin.Context) {
 	limit, offset := parsePagination(c)
 	appointments, err := h.Repo.GetAppointmentsByPatientID(c.Request.Context(), patientID, limit, offset)
 	if err != nil {
-		log.Printf("Internal error in GetPatientAppointments: %v", err)
+		slog.ErrorContext(c.Request.Context(), "Internal error in GetPatientAppointments", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch appointments"})
 		return
 	}
@@ -405,10 +461,11 @@ func (h *Handler) GetPatientPrescriptions(c *gin.Context) {
 	limit, offset := parsePagination(c)
 	prescriptions, err := h.Repo.GetPrescriptionsByPatientID(c.Request.Context(), patientID, limit, offset)
 	if err != nil {
-		log.Printf("Internal error in GetPatientPrescriptions: %v", err)
+		slog.ErrorContext(c.Request.Context(), "Internal error in GetPatientPrescriptions", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch prescriptions"})
 		return
 	}
+	h.audit(c, audit.ActionReadPrescriptions, "prescription", nil, &patientID, http.StatusOK, map[string]interface{}{"count": len(prescriptions)})
 	c.JSON(http.StatusOK, gin.H{
 		"data":   prescriptions,
 		"limit":  limit,
@@ -481,7 +538,7 @@ func (h *Handler) CreateAppointment(c *gin.Context) {
 
 	allScheds, aErr := h.Repo.GetDoctorSchedules(c.Request.Context(), req.DoctorID)
 	if aErr != nil {
-		log.Printf("Internal error checking doctor schedules: %v", aErr)
+		slog.ErrorContext(c.Request.Context(), "Internal error checking doctor schedules", "error", aErr)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify doctor schedule"})
 		return
 	}
@@ -542,7 +599,7 @@ func (h *Handler) CreateAppointment(c *gin.Context) {
 	if req.Type == "virtual" && h.Telehealth != nil {
 		room, rErr := h.Telehealth.CreateRoom(c.Request.Context(), appointmentID, req.StartTime, req.EndTime.Sub(req.StartTime))
 		if rErr != nil {
-			log.Printf("Warning: failed to create telehealth room: %v", rErr)
+			slog.WarnContext(c.Request.Context(), "Failed to create telehealth room", "error", rErr)
 		} else if room != nil {
 			meetingLink = room.MeetingLink
 			meetingID = room.MeetingID
@@ -559,7 +616,7 @@ func (h *Handler) CreateAppointment(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid doctor ID: specified doctor does not exist"})
 			return
 		}
-		log.Printf("Internal error in CreateAppointment: %v", err)
+		slog.ErrorContext(c.Request.Context(), "Internal error in CreateAppointment", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create appointment"})
 		return
 	}
@@ -640,6 +697,9 @@ func (h *Handler) DownloadPrescription(c *gin.Context) {
 
 	ctx := c.Request.Context()
 	targetFilename := identifier
+	// auditPrescID and auditPatientID carry IDs for the HIPAA audit record.
+	var auditPrescID *uuid.UUID
+	var auditPatientID *uuid.UUID
 
 	// If identifier is a valid UUID, look up by prescription ID
 	if prescUUID, parseErr := uuid.Parse(identifier); parseErr == nil {
@@ -649,7 +709,7 @@ func (h *Handler) DownloadPrescription(c *gin.Context) {
 				c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "Prescription not found or access denied"})
 				return
 			}
-			log.Printf("Database error fetching prescription by ID: %v", err)
+			slog.ErrorContext(ctx, "Database error fetching prescription by ID", "error", err)
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Internal database error"})
 			return
 		}
@@ -661,8 +721,8 @@ func (h *Handler) DownloadPrescription(c *gin.Context) {
 			}
 		} else if role == "doctor" {
 			if presc.DoctorID != callerID {
-				appts, apptErr := h.Repo.GetAppointmentsForPatient(ctx, callerID, presc.PatientID, 1, 0)
-				if apptErr != nil || len(appts) == 0 {
+				hasRel, relErr := h.Repo.HasDoctorPatientRelationship(ctx, callerID, presc.PatientID)
+				if relErr != nil || !hasRel {
 					c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "Prescription not found or access denied"})
 					return
 				}
@@ -677,29 +737,36 @@ func (h *Handler) DownloadPrescription(c *gin.Context) {
 			return
 		}
 		targetFilename = presc.FileName
+		// Capture IDs for the audit record
+		auditPrescID = &presc.ID
+		auditPatientID = &presc.PatientID
 	} else {
 		if role == "patient" {
-			_, err := h.Repo.GetPrescriptionByFilename(ctx, callerID, identifier)
+			presc, err := h.Repo.GetPrescriptionByFilename(ctx, callerID, identifier)
 			if err != nil {
 				if errors.Is(err, sql.ErrNoRows) || errors.Is(err, pgx.ErrNoRows) {
 					c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "Prescription not found or access denied"})
 					return
 				}
-				log.Printf("Database error fetching prescription: %v", err)
+				slog.ErrorContext(ctx, "Database error fetching prescription", "error", err)
 				c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Internal database error"})
 				return
 			}
+			auditPrescID = &presc.ID
+			auditPatientID = &presc.PatientID
 		} else if role == "doctor" {
-			_, err := h.Repo.GetPrescriptionByFilenameForDoctor(ctx, callerID, identifier)
+			presc, err := h.Repo.GetPrescriptionByFilenameForDoctor(ctx, callerID, identifier)
 			if err != nil {
 				if errors.Is(err, sql.ErrNoRows) || errors.Is(err, pgx.ErrNoRows) {
 					c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "Prescription not found or access denied"})
 					return
 				}
-				log.Printf("Database error fetching prescription: %v", err)
+				slog.ErrorContext(ctx, "Database error fetching prescription", "error", err)
 				c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Internal database error"})
 				return
 			}
+			auditPrescID = &presc.ID
+			auditPatientID = &presc.PatientID
 		} else {
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "Access denied"})
 			return
@@ -708,10 +775,15 @@ func (h *Handler) DownloadPrescription(c *gin.Context) {
 
 	downloadURL, err := h.Storage.GenerateDownloadURL(ctx, targetFilename, 5*time.Minute)
 	if err != nil {
-		log.Printf("Failed to generate download URL: %v", err)
+		slog.ErrorContext(ctx, "Failed to generate download URL", "error", err, "filename", targetFilename)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate download URL"})
 		return
 	}
+
+	// auditPrescID and auditPatientID are populated by the UUID lookup path above.
+	h.audit(c, audit.ActionDownloadPrescriptionFile, "prescription_file", auditPrescID, auditPatientID, http.StatusOK, map[string]interface{}{
+		"filename": targetFilename,
+	})
 
 	c.JSON(http.StatusOK, gin.H{
 		"download_url": downloadURL,
@@ -731,7 +803,7 @@ func (h *Handler) GetDoctorAppointments(c *gin.Context) {
 	limit, offset := parsePagination(c)
 	appointments, err := h.Repo.GetAppointmentsByDoctorID(c.Request.Context(), doctorID, limit, offset)
 	if err != nil {
-		log.Printf("Internal error in GetDoctorAppointments: %v", err)
+		slog.ErrorContext(c.Request.Context(), "Internal error in GetDoctorAppointments", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch appointments"})
 		return
 	}
@@ -753,7 +825,7 @@ func (h *Handler) GetDoctorPatients(c *gin.Context) {
 	limit, offset := parsePagination(c)
 	patients, err := h.Repo.GetPatientsByDoctorID(c.Request.Context(), doctorID, limit, offset)
 	if err != nil {
-		log.Printf("Internal error in GetDoctorPatients: %v", err)
+		slog.ErrorContext(c.Request.Context(), "Internal error in GetDoctorPatients", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch patients"})
 		return
 	}
@@ -781,7 +853,7 @@ func (h *Handler) GetPatientHistoryAppointments(c *gin.Context) {
 	limit, offset := parsePagination(c)
 	appointments, err := h.Repo.GetAppointmentsForPatient(c.Request.Context(), doctorID, patientID, limit, offset)
 	if err != nil {
-		log.Printf("Internal error in GetPatientHistoryAppointments: %v", err)
+		slog.ErrorContext(c.Request.Context(), "Internal error in GetPatientHistoryAppointments", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch appointments"})
 		return
 	}
@@ -816,10 +888,15 @@ func (h *Handler) GetPatientHistoryPrescriptions(c *gin.Context) {
 	limit, offset := parsePagination(c)
 	prescriptions, err := h.Repo.GetPrescriptionsForPatient(c.Request.Context(), doctorID, patientID, status, limit, offset)
 	if err != nil {
-		log.Printf("Internal error in GetPatientHistoryPrescriptions: %v", err)
+		slog.ErrorContext(c.Request.Context(), "Internal error in GetPatientHistoryPrescriptions", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch prescriptions"})
 		return
 	}
+
+	h.audit(c, audit.ActionReadPrescriptions, "prescription", nil, &patientID, http.StatusOK, map[string]interface{}{
+		"count":  len(prescriptions),
+		"status": status,
+	})
 
 	c.JSON(http.StatusOK, gin.H{
 		"data":   prescriptions,
@@ -883,7 +960,7 @@ func (h *Handler) GetPrescriptionUploadURL(c *gin.Context) {
 	ctx := c.Request.Context()
 	uploadURL, err := h.Storage.GenerateUploadURL(ctx, uniqueFilename, req.ContentType, 5*time.Minute)
 	if err != nil {
-		log.Printf("Failed to generate upload URL: %v", err)
+		slog.ErrorContext(c.Request.Context(), "Failed to generate upload URL", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate upload URL"})
 		return
 	}
@@ -951,8 +1028,8 @@ func (h *Handler) CreatePrescription(c *gin.Context) {
 			return
 		}
 
-		appointments, err := h.Repo.GetAppointmentsForPatient(ctx, doctorID, req.PatientID, 1, 0)
-		if err != nil || len(appointments) == 0 {
+		hasRel, relErr := h.Repo.HasDoctorPatientRelationship(ctx, doctorID, req.PatientID)
+		if relErr != nil || !hasRel {
 			c.JSON(http.StatusForbidden, gin.H{"error": "You can only prescribe to patients who have booked appointments with you"})
 			return
 		}
@@ -960,7 +1037,7 @@ func (h *Handler) CreatePrescription(c *gin.Context) {
 
 	exists, err := h.Storage.ObjectExists(ctx, req.FileName)
 	if err != nil {
-		log.Printf("Storage error verifying object existence: %v", err)
+		slog.ErrorContext(c.Request.Context(), "Storage error verifying object existence", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify file upload status"})
 		return
 	}
@@ -980,18 +1057,23 @@ func (h *Handler) CreatePrescription(c *gin.Context) {
 
 	newID, status, err := h.Repo.CreateUploadedPrescriptionWithJob(ctx, req.PatientID, doctorID, req.FileName, notes, h.OCREnabled)
 	if err != nil {
-		log.Printf("Failed to create prescription in DB: %v", err)
+		slog.ErrorContext(c.Request.Context(), "Failed to create prescription in DB", "error", err)
 		// Clean up uploaded file if DB record insertion fails
 		go func() {
 			rbCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
 			if delErr := h.Storage.DeleteFile(rbCtx, req.FileName); delErr != nil {
-				log.Printf("CRITICAL: Failed to rollback storage file: %v", delErr)
+				slog.ErrorContext(rbCtx, "CRITICAL: Failed to rollback storage file", "error", delErr, "filename", req.FileName)
 			}
 		}()
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create prescription record"})
 		return
 	}
+
+	h.audit(c, audit.ActionCreatePrescription, "prescription", &newID, &req.PatientID, http.StatusCreated, map[string]interface{}{
+		"source":   "upload",
+		"filename": req.FileName,
+	})
 
 	c.JSON(http.StatusCreated, gin.H{
 		"id":       newID,
@@ -1068,9 +1150,9 @@ func (h *Handler) CreateDigitalPrescription(c *gin.Context) {
 		return
 	}
 
-	// Verify doctor has an appointment with the patient
-	appointments, err := h.Repo.GetAppointmentsForPatient(ctx, doctorID, req.PatientID, 1, 0)
-	if err != nil || len(appointments) == 0 {
+	// Verify doctor has an active clinical relationship with the patient
+	hasRel, relErr := h.Repo.HasDoctorPatientRelationship(ctx, doctorID, req.PatientID)
+	if relErr != nil || !hasRel {
 		c.JSON(http.StatusForbidden, gin.H{"error": "You can only prescribe to patients who have booked appointments with you"})
 		return
 	}
@@ -1102,7 +1184,7 @@ func (h *Handler) CreateDigitalPrescription(c *gin.Context) {
 
 	newID, err := h.Repo.CreateDigitalPrescription(ctx, req.PatientID, doctorID, notes, items)
 	if err != nil {
-		log.Printf("Failed to create digital prescription: %v", err)
+		slog.ErrorContext(c.Request.Context(), "Failed to create digital prescription", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create digital prescription"})
 		return
 	}
@@ -1113,7 +1195,7 @@ func (h *Handler) CreateDigitalPrescription(c *gin.Context) {
 		targetFileName := fmt.Sprintf("prescription-%s-%s.pdf", req.PatientID.String(), newID.String())
 		doc, docErr := h.Repo.GetDoctorByID(ctx, doctorID)
 		if docErr != nil {
-			log.Printf("Warning: Could not fetch doctor details for PDF: %v", docErr)
+			slog.WarnContext(c.Request.Context(), "Could not fetch doctor details for PDF", "error", docErr)
 		}
 		baseURL := os.Getenv("APP_BASE_URL")
 		if baseURL == "" {
@@ -1134,11 +1216,11 @@ func (h *Handler) CreateDigitalPrescription(c *gin.Context) {
 			VerificationURL: fmt.Sprintf("%s/verify/rx/%s", baseURL, newID),
 		})
 		if genErr != nil {
-			log.Printf("Warning: Failed to generate digital prescription PDF: %v", genErr)
+			slog.WarnContext(c.Request.Context(), "Failed to generate digital prescription PDF", "error", genErr)
 		} else if saveErr := h.Storage.SaveFile(ctx, targetFileName, pdfBytes, "application/pdf"); saveErr != nil {
-			log.Printf("Error: Failed to persist generated PDF to storage: %v", saveErr)
+			slog.ErrorContext(c.Request.Context(), "Failed to persist generated PDF to storage", "error", saveErr)
 		} else if updateErr := h.Repo.UpdatePrescriptionFileName(ctx, newID, targetFileName); updateErr != nil {
-			log.Printf("Error: Failed to link prescription PDF filename in DB: %v", updateErr)
+			slog.ErrorContext(c.Request.Context(), "Failed to link prescription PDF filename in DB", "error", updateErr)
 		} else {
 			linkedFileName = targetFileName
 		}
@@ -1174,6 +1256,16 @@ func (h *Handler) CreateDigitalPrescription(c *gin.Context) {
 		resp["safety_report"] = safetyReport
 	}
 
+	h.audit(c, audit.ActionCreatePrescription, "prescription", &newID, &req.PatientID, http.StatusCreated, map[string]interface{}{
+		"source":          "digital",
+		"override_safety": req.OverrideSafety,
+	})
+	if linkedFileName != "" {
+		h.audit(c, audit.ActionExportPrescriptionPDF, "prescription_pdf", &newID, &req.PatientID, http.StatusCreated, map[string]interface{}{
+			"filename": linkedFileName,
+		})
+	}
+
 	c.JSON(http.StatusCreated, resp)
 }
 
@@ -1189,10 +1281,14 @@ func (h *Handler) GetPendingReviewPrescriptions(c *gin.Context) {
 	limit, offset := parsePagination(c)
 	prescriptions, err := h.Repo.GetPrescriptionsPendingReview(c.Request.Context(), doctorID, limit, offset)
 	if err != nil {
-		log.Printf("Internal error in GetPendingReviewPrescriptions: %v", err)
+		slog.ErrorContext(c.Request.Context(), "Internal error in GetPendingReviewPrescriptions", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch pending prescriptions"})
 		return
 	}
+
+	h.audit(c, audit.ActionReadPrescriptions, "prescription", nil, nil, http.StatusOK, map[string]interface{}{
+		"count": len(prescriptions),
+	})
 
 	c.JSON(http.StatusOK, gin.H{
 		"data":   prescriptions,
@@ -1299,7 +1395,7 @@ func (h *Handler) VerifyPrescription(c *gin.Context) {
 
 	updated, err := h.Repo.VerifyPrescription(ctx, prescriptionID, doctorID, req.Status, notes, items)
 	if err != nil {
-		log.Printf("Internal error in VerifyPrescription: %v", err)
+		slog.ErrorContext(c.Request.Context(), "Internal error in VerifyPrescription", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify prescription"})
 		return
 	}
@@ -1311,8 +1407,8 @@ func (h *Handler) VerifyPrescription(c *gin.Context) {
 		if getErr == nil {
 			isAuthorized := existing.DoctorID == doctorID
 			if !isAuthorized {
-				appts, apptErr := h.Repo.GetAppointmentsForPatient(ctx, doctorID, existing.PatientID, 1, 0)
-				isAuthorized = apptErr == nil && len(appts) > 0
+				hasRel, relErr := h.Repo.HasDoctorPatientRelationship(ctx, doctorID, existing.PatientID)
+				isAuthorized = relErr == nil && hasRel
 			}
 			if isAuthorized {
 				if existing.Status == "pending_ocr" {
@@ -1344,11 +1440,11 @@ func (h *Handler) VerifyPrescription(c *gin.Context) {
 				if h.PDFGenerator != nil && h.Storage != nil {
 					doc, docErr := h.Repo.GetDoctorByID(ctx, doctorID)
 					if docErr != nil {
-						log.Printf("Warning: Failed to fetch doctor details for PDF: %v", docErr)
+						slog.WarnContext(c.Request.Context(), "Failed to fetch doctor details for PDF", "error", docErr)
 					}
 					pat, patErr := h.Repo.GetPatientByID(ctx, existing.PatientID)
 					if patErr != nil {
-						log.Printf("Warning: Failed to fetch patient details for PDF: %v", patErr)
+						slog.WarnContext(c.Request.Context(), "Failed to fetch patient details for PDF", "error", patErr)
 					}
 
 					baseURL := os.Getenv("APP_BASE_URL")
@@ -1371,14 +1467,14 @@ func (h *Handler) VerifyPrescription(c *gin.Context) {
 					})
 					if genErr == nil {
 						if saveErr := h.Storage.SaveFile(ctx, pdfFileName, pdfBytes, "application/pdf"); saveErr != nil {
-							log.Printf("Error: Failed to persist verified prescription PDF to storage: %v", saveErr)
+							slog.ErrorContext(c.Request.Context(), "Failed to persist verified prescription PDF to storage", "error", saveErr)
 						} else {
 							if updateErr := h.Repo.UpdatePrescriptionFileName(ctx, prescriptionID, pdfFileName); updateErr != nil {
-								log.Printf("Error: Failed to link verified prescription PDF filename in DB: %v", updateErr)
+								slog.ErrorContext(c.Request.Context(), "Failed to link verified prescription PDF filename in DB", "error", updateErr)
 							}
 						}
 					} else {
-						log.Printf("Warning: Failed to generate verified prescription PDF: %v", genErr)
+						slog.WarnContext(c.Request.Context(), "Failed to generate verified prescription PDF", "error", genErr)
 					}
 				}
 			}
@@ -1405,6 +1501,11 @@ func (h *Handler) VerifyPrescription(c *gin.Context) {
 		}
 	}
 
+	h.audit(c, audit.ActionVerifyPrescription, "prescription", &prescriptionID, &existing.PatientID, http.StatusOK, map[string]interface{}{
+		"status":          req.Status,
+		"override_safety": req.OverrideSafety,
+	})
+
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Prescription verified successfully",
 		"status":  req.Status,
@@ -1427,7 +1528,7 @@ func (h *Handler) MarkAppointmentAsCompleted(c *gin.Context) {
 
 	updated, err := h.Repo.UpdateAppointmentAsCompletedForDoctor(c.Request.Context(), appointmentID, doctorID)
 	if err != nil {
-		log.Printf("Internal error in MarkAppointmentAsCompleted: %v", err)
+		slog.ErrorContext(c.Request.Context(), "Internal error in MarkAppointmentAsCompleted", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to mark appointment as completed"})
 		return
 	}
@@ -1468,7 +1569,7 @@ func (h *Handler) GetPrescriptionByID(c *gin.Context) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Prescription not found or access denied"})
 			return
 		}
-		log.Printf("Internal error in GetPrescriptionByID: %v", err)
+		slog.ErrorContext(c.Request.Context(), "Internal error in GetPrescriptionByID", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch prescription"})
 		return
 	}
@@ -1480,8 +1581,8 @@ func (h *Handler) GetPrescriptionByID(c *gin.Context) {
 		}
 	} else if role == "doctor" {
 		if prescription.DoctorID != userID {
-			appts, apptErr := h.Repo.GetAppointmentsForPatient(c.Request.Context(), userID, prescription.PatientID, 1, 0)
-			if apptErr != nil || len(appts) == 0 {
+			hasRel, relErr := h.Repo.HasDoctorPatientRelationship(c.Request.Context(), userID, prescription.PatientID)
+			if relErr != nil || !hasRel {
 				c.JSON(http.StatusNotFound, gin.H{"error": "Prescription not found or access denied"})
 				return
 			}
@@ -1490,6 +1591,8 @@ func (h *Handler) GetPrescriptionByID(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
 		return
 	}
+
+	h.audit(c, audit.ActionReadPrescriptions, "prescription", &prescription.ID, &prescription.PatientID, http.StatusOK, nil)
 
 	c.JSON(http.StatusOK, prescription)
 }
@@ -1559,10 +1662,10 @@ func (h *Handler) GetAppointmentMeetingRoom(c *gin.Context) {
 			}
 			room, rErr := h.Telehealth.CreateRoom(c.Request.Context(), appt.ID, appt.StartTime, duration)
 			if rErr != nil {
-				log.Printf("Warning: failed to lazily create telehealth room: %v", rErr)
+				slog.WarnContext(c.Request.Context(), "Failed to lazily create telehealth room", "error", rErr)
 			} else if room != nil {
 				if uErr := h.Repo.UpdateAppointmentMeetingRoom(c.Request.Context(), appt.ID, room.MeetingLink, room.MeetingID); uErr != nil {
-					log.Printf("Warning: failed to persist generated telehealth meeting room: %v", uErr)
+					slog.WarnContext(c.Request.Context(), "Failed to persist generated telehealth meeting room", "error", uErr)
 				}
 				if refreshed, refErr := h.Repo.GetAppointmentByID(c.Request.Context(), appt.ID); refErr == nil && refreshed.MeetingLink != "" {
 					appt.MeetingLink = refreshed.MeetingLink
@@ -1584,7 +1687,7 @@ func (h *Handler) GetAppointmentMeetingRoom(c *gin.Context) {
 		isOwner := callerID == appt.DoctorID
 		token, tErr := tp.CreateMeetingToken(c.Request.Context(), appt.MeetingID, isOwner, appt.EndTime.Add(30*time.Minute))
 		if tErr != nil {
-			log.Printf("Error: failed to generate meeting token: %v", tErr)
+			slog.ErrorContext(c.Request.Context(), "Failed to generate meeting token", "error", tErr)
 			c.JSON(http.StatusBadGateway, gin.H{"error": "Failed to generate meeting access token for video consultation"})
 			return
 		}
@@ -1596,6 +1699,15 @@ func (h *Handler) GetAppointmentMeetingRoom(c *gin.Context) {
 			meetingLink = fmt.Sprintf("%s%st=%s", meetingLink, separator, token)
 		}
 	}
+
+	providerName := ""
+	if h.Telehealth != nil {
+		providerName = h.Telehealth.Name()
+	}
+	h.audit(c, audit.ActionAccessMeetingRoom, "appointment", &appt.ID, &appt.PatientID, http.StatusOK, map[string]interface{}{
+		"provider":   providerName,
+		"meeting_id": appt.MeetingID,
+	})
 
 	c.JSON(http.StatusOK, gin.H{
 		"meeting_link": meetingLink,
@@ -1717,7 +1829,7 @@ func (h *Handler) UpsertDoctorSchedule(c *gin.Context) {
 
 	saved, err := h.Repo.UpsertDoctorSchedulesTx(c.Request.Context(), doctorID, validated)
 	if err != nil {
-		log.Printf("Internal error in UpsertDoctorSchedule: %v", err)
+		slog.ErrorContext(c.Request.Context(), "Internal error in UpsertDoctorSchedule", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save schedule"})
 		return
 	}
@@ -1735,7 +1847,7 @@ func (h *Handler) GetDoctorSchedules(c *gin.Context) {
 
 	schedules, err := h.Repo.GetDoctorSchedules(c.Request.Context(), doctorID)
 	if err != nil {
-		log.Printf("Internal error in GetDoctorSchedules: %v", err)
+		slog.ErrorContext(c.Request.Context(), "Internal error in GetDoctorSchedules", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve schedules"})
 		return
 	}
@@ -1759,7 +1871,7 @@ func (h *Handler) DeleteDoctorSchedule(c *gin.Context) {
 	}
 
 	if err := h.Repo.DeleteDoctorScheduleByDay(c.Request.Context(), doctorID, day); err != nil {
-		log.Printf("Internal error in DeleteDoctorSchedule: %v", err)
+		slog.ErrorContext(c.Request.Context(), "Internal error in DeleteDoctorSchedule", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete schedule"})
 		return
 	}
@@ -1800,7 +1912,7 @@ func (h *Handler) GetDoctorAvailableSlots(c *gin.Context) {
 			})
 			return
 		}
-		log.Printf("Internal error in GetDoctorScheduleByDay: %v", err)
+		slog.ErrorContext(c.Request.Context(), "Internal error in GetDoctorScheduleByDay", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check doctor schedule"})
 		return
 	}
@@ -1835,7 +1947,7 @@ func (h *Handler) GetDoctorAvailableSlots(c *gin.Context) {
 
 	bookedAppts, err := h.Repo.GetDoctorAppointmentsInRange(c.Request.Context(), doctorID, windowStart, windowEnd)
 	if err != nil {
-		log.Printf("Internal error fetching doctor appointments in range: %v", err)
+		slog.ErrorContext(c.Request.Context(), "Internal error fetching doctor appointments in range", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check doctor bookings"})
 		return
 	}
@@ -1923,7 +2035,7 @@ func (h *Handler) CreatePatientVital(c *gin.Context) {
 		targetPatientID = *in.PatientID
 		hasRel, err := h.Repo.HasDoctorPatientRelationship(c.Request.Context(), callerID, targetPatientID)
 		if err != nil {
-			log.Printf("Internal error checking doctor-patient relationship: %v", err)
+			slog.ErrorContext(c.Request.Context(), "Internal error checking doctor-patient relationship", "error", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify patient relationship"})
 			return
 		}
@@ -2014,7 +2126,7 @@ func (h *Handler) CreatePatientVital(c *gin.Context) {
 
 	newID, err := h.Repo.CreatePatientVital(c.Request.Context(), vital)
 	if err != nil {
-		log.Printf("Internal error in CreatePatientVital: %v", err)
+		slog.ErrorContext(c.Request.Context(), "Internal error in CreatePatientVital", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to record vital measurement"})
 		return
 	}
@@ -2050,7 +2162,7 @@ func (h *Handler) GetPatientVitals(c *gin.Context) {
 		targetPatientID = parsedID
 		hasRel, err := h.Repo.HasDoctorPatientRelationship(c.Request.Context(), callerID, targetPatientID)
 		if err != nil {
-			log.Printf("Internal error checking doctor-patient relationship: %v", err)
+			slog.ErrorContext(c.Request.Context(), "Internal error checking doctor-patient relationship", "error", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify patient relationship"})
 			return
 		}
@@ -2108,7 +2220,7 @@ func (h *Handler) GetPatientVitals(c *gin.Context) {
 
 	vitals, err := h.Repo.GetPatientVitals(c.Request.Context(), targetPatientID, startDate, endDate, limit, offset)
 	if err != nil {
-		log.Printf("Internal error in GetPatientVitals: %v", err)
+		slog.ErrorContext(c.Request.Context(), "Internal error in GetPatientVitals", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve vitals"})
 		return
 	}
@@ -2152,7 +2264,7 @@ func (h *Handler) GetPatientMedicationSchedule(c *gin.Context) {
 		targetPatientID = parsedID
 		hasRel, err := h.Repo.HasDoctorPatientRelationship(c.Request.Context(), callerID, targetPatientID)
 		if err != nil {
-			log.Printf("Internal error checking doctor-patient relationship: %v", err)
+			slog.ErrorContext(c.Request.Context(), "Internal error checking doctor-patient relationship", "error", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify patient relationship"})
 			return
 		}
@@ -2177,14 +2289,14 @@ func (h *Handler) GetPatientMedicationSchedule(c *gin.Context) {
 
 	items, err := h.Repo.GetActivePrescriptionItemsForPatient(c.Request.Context(), targetPatientID, targetDate)
 	if err != nil {
-		log.Printf("Internal error fetching active prescription items: %v", err)
+		slog.ErrorContext(c.Request.Context(), "Internal error fetching active prescription items", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch prescription medications"})
 		return
 	}
 
 	existingLogs, err := h.Repo.GetMedicationLogsByDate(c.Request.Context(), targetPatientID, targetDate)
 	if err != nil {
-		log.Printf("Internal error fetching medication logs: %v", err)
+		slog.ErrorContext(c.Request.Context(), "Internal error fetching medication logs", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch medication logs"})
 		return
 	}
@@ -2231,7 +2343,7 @@ func (h *Handler) LogMedicationAdherence(c *gin.Context) {
 
 	isOwner, err := h.Repo.VerifyPrescriptionItemOwnership(c.Request.Context(), in.PrescriptionItemID, patientID)
 	if err != nil {
-		log.Printf("Internal error verifying prescription item ownership: %v", err)
+		slog.ErrorContext(c.Request.Context(), "Internal error verifying prescription item ownership", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify medication item"})
 		return
 	}
@@ -2303,7 +2415,7 @@ func (h *Handler) LogMedicationAdherence(c *gin.Context) {
 
 	saved, err := h.Repo.UpsertMedicationLog(c.Request.Context(), logEntry)
 	if err != nil {
-		log.Printf("Internal error in UpsertMedicationLog: %v", err)
+		slog.ErrorContext(c.Request.Context(), "Internal error in UpsertMedicationLog", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to log medication adherence"})
 		return
 	}
@@ -2393,7 +2505,24 @@ func (h *Handler) RefreshToken(c *gin.Context) {
 
 	// TOKEN THEFT DETECTION: If a previously revoked token is reused, revoke all tokens for this user
 	if existingToken.RevokedAt != nil {
-		log.Printf("SECURITY ALERT: Reuse of revoked refresh token detected for user %s! Revoking all sessions.", existingToken.UserID)
+		if time.Since(*existingToken.RevokedAt) < 10*time.Second {
+			slog.WarnContext(c.Request.Context(), "Refresh token reuse within grace window; returning conflict without session revocation", "user_id", existingToken.UserID, "token_id", existingToken.ID)
+			c.JSON(http.StatusConflict, gin.H{"error": "Token rotation in progress or already completed, please use newest token"})
+			return
+		}
+
+		slog.WarnContext(c.Request.Context(), "SECURITY ALERT: Reuse of revoked refresh token detected for user! Revoking all sessions.", "user_id", existingToken.UserID)
+		// Audit the security breach event (HIPAA § 164.312(b))
+		if h.Auditor != nil {
+			h.Auditor.Log(models.PhiAuditLog{
+				UserID:     &existingToken.UserID,
+				Action:     audit.ActionTokenReuseAlert,
+				IPAddress:  c.ClientIP(),
+				UserAgent:  c.Request.UserAgent(),
+				StatusCode: http.StatusUnauthorized,
+				Metadata:   fmt.Sprintf(`{"token_id":%q}`, existingToken.ID.String()),
+			})
+		}
 		_ = h.Repo.RevokeAllUserRefreshTokens(c.Request.Context(), existingToken.UserID)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Compromised token detected; all sessions have been terminated"})
 		return
@@ -2422,14 +2551,16 @@ func (h *Handler) RefreshToken(c *gin.Context) {
 		return
 	}
 
-	newTok, err := h.Repo.CreateRefreshToken(c.Request.Context(), existingToken.UserID, newRefreshHash, time.Now().Add(7*24*time.Hour))
+	// RotateRefreshToken atomically revokes the old token and inserts the new one
+	// in a single Postgres transaction with a SELECT FOR UPDATE lock, preventing
+	// concurrent rotation races and allowing grace-window replay for mobile retries.
+	newTok, err := h.Repo.RotateRefreshToken(c.Request.Context(), existingToken.ID, existingToken.UserID, newRefreshHash, time.Now().Add(7*24*time.Hour))
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to issue new refresh token"})
+		slog.ErrorContext(c.Request.Context(), "Failed to rotate refresh token", "error", err, "token_id", existingToken.ID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to rotate session token"})
 		return
 	}
-
-	// Invalidate previous token and record rotation lineage
-	_ = h.Repo.RevokeRefreshToken(c.Request.Context(), existingToken.ID, &newTok.ID)
+	_ = newTok
 
 	// Issue new 15-minute access token
 	claims := jwt.MapClaims{
@@ -2470,12 +2601,15 @@ func (h *Handler) Logout(c *gin.Context) {
 		_ = h.Repo.RevokeRefreshToken(c.Request.Context(), existingToken.ID, nil)
 	}
 
+	h.audit(c, audit.ActionUserLogout, "session", nil, nil, http.StatusOK, nil)
 	c.JSON(http.StatusOK, gin.H{"message": "Successfully logged out"})
 }
 
 func (h *Handler) GetComplianceAuditLogs(c *gin.Context) {
 	roleVal, _ := c.Get("role")
 	role, _ := roleVal.(string)
+	// Only administrators may query the full system audit trail.
+	// Doctors may only query logs for their own patients, with a mandatory patient_id filter.
 	if role != "doctor" && role != "admin" {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied: HIPAA audit logs restricted to clinical and compliance roles"})
 		return
@@ -2497,19 +2631,56 @@ func (h *Handler) GetComplianceAuditLogs(c *gin.Context) {
 	var logs []models.PhiAuditLog
 	var err error
 
-	if pStr := strings.TrimSpace(c.Query("patient_id")); pStr != "" {
+	pStr := strings.TrimSpace(c.Query("patient_id"))
+
+	if role == "doctor" {
+		// Doctors MUST supply a patient_id and must have a clinical relationship.
+		if pStr == "" {
+			c.JSON(http.StatusForbidden, gin.H{"error": "Doctors must supply a patient_id query parameter to filter audit logs"})
+			return
+		}
 		pid, pErr := uuid.Parse(pStr)
 		if pErr != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid patient_id"})
 			return
 		}
+		doctorIDVal, ok := c.Get("userID")
+		if !ok {
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "User ID not found in context"})
+			return
+		}
+		doctorID := doctorIDVal.(uuid.UUID)
+		hasRel, relErr := h.Repo.HasDoctorPatientRelationship(c.Request.Context(), doctorID, pid)
+		if relErr != nil {
+			slog.ErrorContext(c.Request.Context(), "Error checking doctor-patient relationship for audit log access", "error", relErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify patient relationship"})
+			return
+		}
+		if !hasRel {
+			c.JSON(http.StatusForbidden, gin.H{"error": "Access denied: you do not have a clinical relationship with this patient"})
+			return
+		}
 		logs, err = h.Repo.GetAuditLogsByPatientID(c.Request.Context(), pid, limit, offset)
+		// Audit the audit trail access itself
+		h.audit(c, audit.ActionViewAuditLogs, "patient", nil, &pid, http.StatusOK, map[string]interface{}{"queried_by_role": role})
 	} else {
-		logs, err = h.Repo.GetAuditLogs(c.Request.Context(), limit, offset)
+		// Admins may query system-wide logs or filter by patient
+		if pStr != "" {
+			pid, pErr := uuid.Parse(pStr)
+			if pErr != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid patient_id"})
+				return
+			}
+			logs, err = h.Repo.GetAuditLogsByPatientID(c.Request.Context(), pid, limit, offset)
+			h.audit(c, audit.ActionViewAuditLogs, "patient", nil, &pid, http.StatusOK, map[string]interface{}{"queried_by_role": role})
+		} else {
+			logs, err = h.Repo.GetAuditLogs(c.Request.Context(), limit, offset)
+			h.audit(c, audit.ActionViewAuditLogs, "system", nil, nil, http.StatusOK, map[string]interface{}{"queried_by_role": role})
+		}
 	}
 
 	if err != nil {
-		log.Printf("Internal error fetching compliance audit logs: %v", err)
+		slog.ErrorContext(c.Request.Context(), "Internal error fetching compliance audit logs", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve audit logs"})
 		return
 	}

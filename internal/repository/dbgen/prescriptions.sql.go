@@ -90,10 +90,10 @@ func (q *Queries) GetPrescriptionByFilename(ctx context.Context, arg GetPrescrip
 }
 
 const getPrescriptionByFilenameForDoctor = `-- name: GetPrescriptionByFilenameForDoctor :one
-SELECT p.id, p.status
+SELECT p.id, p.status, p.patient_id
 FROM prescriptions p
-LEFT JOIN appointments a ON p.patient_id = a.patient_id AND a.doctor_id = $2
-WHERE p.file_name = $1 AND (p.doctor_id = $2 OR a.doctor_id = $2)
+LEFT JOIN appointments a ON p.patient_id = a.patient_id AND a.doctor_id = $2 AND a.status != 'cancelled'
+WHERE p.file_name = $1 AND (p.doctor_id = $2 OR (a.doctor_id = $2 AND a.status != 'cancelled'))
 LIMIT 1
 `
 
@@ -103,14 +103,15 @@ type GetPrescriptionByFilenameForDoctorParams struct {
 }
 
 type GetPrescriptionByFilenameForDoctorRow struct {
-	ID     uuid.UUID `json:"id"`
-	Status string    `json:"status"`
+	ID        uuid.UUID `json:"id"`
+	Status    string    `json:"status"`
+	PatientID uuid.UUID `json:"patient_id"`
 }
 
 func (q *Queries) GetPrescriptionByFilenameForDoctor(ctx context.Context, arg GetPrescriptionByFilenameForDoctorParams) (GetPrescriptionByFilenameForDoctorRow, error) {
 	row := q.db.QueryRow(ctx, getPrescriptionByFilenameForDoctor, arg.FileName, arg.DoctorID)
 	var i GetPrescriptionByFilenameForDoctorRow
-	err := row.Scan(&i.ID, &i.Status)
+	err := row.Scan(&i.ID, &i.Status, &i.PatientID)
 	return i, err
 }
 
@@ -313,7 +314,7 @@ WHERE p.patient_id = $1
   AND (
     p.doctor_id = $2
     OR EXISTS (
-      SELECT 1 FROM appointments a WHERE a.patient_id = $1 AND a.doctor_id = $2
+      SELECT 1 FROM appointments a WHERE a.patient_id = $1 AND a.doctor_id = $2 AND a.status != 'cancelled'
     )
   )
 ORDER BY p.created_at DESC
@@ -395,7 +396,7 @@ WHERE p.status = 'needs_review'
     p.doctor_id = $1
     OR EXISTS (
       SELECT 1 FROM appointments a
-      WHERE a.patient_id = p.patient_id AND a.doctor_id = $1
+      WHERE a.patient_id = p.patient_id AND a.doctor_id = $1 AND a.status != 'cancelled'
     )
   )
 ORDER BY p.created_at DESC
@@ -550,7 +551,7 @@ WHERE p.id = $1
     p.doctor_id = $4
     OR EXISTS (
       SELECT 1 FROM appointments a
-      WHERE a.patient_id = p.patient_id AND a.doctor_id = $4
+      WHERE a.patient_id = p.patient_id AND a.doctor_id = $4 AND a.status != 'cancelled'
     )
   )
 `

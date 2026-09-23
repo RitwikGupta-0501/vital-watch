@@ -49,7 +49,6 @@ func RequestIDMiddleware() gin.HandlerFunc {
 			"status", status,
 			"duration_ms", duration.Milliseconds(),
 			"ip", c.ClientIP(),
-			"request_id", reqIDStr,
 		}
 
 		if status >= 500 {

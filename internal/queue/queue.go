@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -57,7 +57,7 @@ func (w *PrescriptionOCRWorker) Work(ctx context.Context, job *river.Job[Prescri
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 
-	log.Printf("[River Worker] Processing OCR for prescription %s (key: %s)", job.Args.PrescriptionID, job.Args.StorageKey)
+	slog.InfoContext(ctx, "Processing OCR for prescription", "prescription_id", job.Args.PrescriptionID, "key", job.Args.StorageKey)
 
 	attempt := 1
 	if job != nil && job.JobRow != nil && job.Attempt > 0 {
@@ -66,7 +66,7 @@ func (w *PrescriptionOCRWorker) Work(ctx context.Context, job *river.Job[Prescri
 
 	// 1. If OCR is disabled, cleanly transition to needs_review for manual clinician entry
 	if w.ocrManager == nil || !w.ocrManager.IsEnabled() {
-		log.Printf("[River Worker] OCR disabled. Transitioning prescription %s to needs_review", job.Args.PrescriptionID)
+		slog.InfoContext(ctx, "OCR disabled; transitioning prescription to needs_review", "prescription_id", job.Args.PrescriptionID)
 		return w.repo.UpdatePrescriptionOCRResults(ctx, job.Args.PrescriptionID, "needs_review", "[OCR disabled: manual entry required]", "", nil)
 	}
 
@@ -80,7 +80,7 @@ func (w *PrescriptionOCRWorker) Work(ctx context.Context, job *river.Job[Prescri
 			strings.Contains(err.Error(), "404")
 
 		if isPermanent {
-			log.Printf("[River Worker] Permanent storage failure for prescription %s: %v. Marking needs_review", job.Args.PrescriptionID, err)
+			slog.ErrorContext(ctx, "Permanent storage failure for prescription; marking needs_review", "prescription_id", job.Args.PrescriptionID, "error", err)
 			if updateErr := w.repo.UpdatePrescriptionOCRResults(ctx, job.Args.PrescriptionID, "needs_review", fmt.Sprintf("[Storage error: %v]", err), "", nil); updateErr != nil {
 				return fmt.Errorf("failed to update prescription status after permanent storage failure: %w", updateErr)
 			}
@@ -88,14 +88,14 @@ func (w *PrescriptionOCRWorker) Work(ctx context.Context, job *river.Job[Prescri
 		}
 
 		if attempt >= 3 {
-			log.Printf("[River Worker] Max retry attempts reached for storage retrieval of prescription %s. Marking needs_review", job.Args.PrescriptionID)
+			slog.WarnContext(ctx, "Max retry attempts reached for storage retrieval; marking needs_review", "prescription_id", job.Args.PrescriptionID)
 			if updateErr := w.repo.UpdatePrescriptionOCRResults(ctx, job.Args.PrescriptionID, "needs_review", fmt.Sprintf("[Storage failed after %d attempts: %v]", attempt, err), "", nil); updateErr != nil {
 				return fmt.Errorf("failed to update prescription status after max storage attempts: %w", updateErr)
 			}
 			return nil
 		}
 
-		log.Printf("[River Worker] Transient storage failure for prescription %s: %v. Retrying via River", job.Args.PrescriptionID, err)
+		slog.WarnContext(ctx, "Transient storage failure; retrying via River", "prescription_id", job.Args.PrescriptionID, "error", err)
 		return err
 	}
 
@@ -103,7 +103,7 @@ func (w *PrescriptionOCRWorker) Work(ctx context.Context, job *river.Job[Prescri
 	res, err := w.ocrManager.ExtractPrescription(ctx, fileBytes, mimeType)
 	if err != nil {
 		if errors.Is(err, ocr.ErrUnsupportedMIME) || errors.Is(err, ocr.ErrPermanent) {
-			log.Printf("[River Worker] Permanent unrecoverable OCR failure for prescription %s: %v. Marking needs_review", job.Args.PrescriptionID, err)
+			slog.ErrorContext(ctx, "Permanent unrecoverable OCR failure; marking needs_review", "prescription_id", job.Args.PrescriptionID, "error", err)
 			if updateErr := w.repo.UpdatePrescriptionOCRResults(ctx, job.Args.PrescriptionID, "needs_review", fmt.Sprintf("[OCR Extraction failed: %v]", err), "", nil); updateErr != nil {
 				return fmt.Errorf("failed to update prescription status after permanent OCR failure: %w", updateErr)
 			}
@@ -111,7 +111,7 @@ func (w *PrescriptionOCRWorker) Work(ctx context.Context, job *river.Job[Prescri
 			return nil // Fatal: return nil to avoid burning River retry attempts
 		}
 		if attempt >= 3 {
-			log.Printf("[River Worker] Max retry attempts reached for prescription %s. Marking needs_review", job.Args.PrescriptionID)
+			slog.WarnContext(ctx, "Max retry attempts reached for prescription OCR; marking needs_review", "prescription_id", job.Args.PrescriptionID)
 			if updateErr := w.repo.UpdatePrescriptionOCRResults(ctx, job.Args.PrescriptionID, "needs_review", fmt.Sprintf("[OCR failed after %d attempts: %v]", attempt, err), "", nil); updateErr != nil {
 				return fmt.Errorf("failed to update prescription status after max attempts: %w", updateErr)
 			}
@@ -119,7 +119,7 @@ func (w *PrescriptionOCRWorker) Work(ctx context.Context, job *river.Job[Prescri
 			return nil
 		}
 		// Transient failure: return error to River for exponential backoff retry
-		log.Printf("[River Worker] Transient OCR error for prescription %s: %v. Returning to River for retry", job.Args.PrescriptionID, err)
+		slog.WarnContext(ctx, "Transient OCR error; returning to River for retry", "prescription_id", job.Args.PrescriptionID, "error", err)
 		return err
 	}
 
@@ -147,11 +147,11 @@ func (w *PrescriptionOCRWorker) Work(ctx context.Context, job *river.Job[Prescri
 	}
 	err = w.repo.UpdatePrescriptionOCRResults(ctx, job.Args.PrescriptionID, "needs_review", notes, clampString(res.Provider, 50), items)
 	if err != nil {
-		log.Printf("[River Worker] Failed to update prescription %s with OCR results: %v", job.Args.PrescriptionID, err)
+		slog.ErrorContext(ctx, "Failed to update prescription with OCR results", "prescription_id", job.Args.PrescriptionID, "error", err)
 		return err // Transient DB error, retry
 	}
 
-	log.Printf("[River Worker] Successfully extracted %d medications for prescription %s via %s. Status: needs_review", len(items), job.Args.PrescriptionID, res.Provider)
+	slog.InfoContext(ctx, "Successfully extracted medications for prescription", "medications_count", len(items), "prescription_id", job.Args.PrescriptionID, "provider", res.Provider, "status", "needs_review")
 
 	w.notifyDoctor(ctx, job.Args.PrescriptionID, "Prescription OCR analysis ready for clinician review", len(items), res.Provider)
 	return nil

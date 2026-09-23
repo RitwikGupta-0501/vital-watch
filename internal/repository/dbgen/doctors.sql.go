@@ -55,10 +55,12 @@ func (q *Queries) CreateDoctorUser(ctx context.Context, arg CreateDoctorUserPara
 }
 
 const getDoctorByEmail = `-- name: GetDoctorByEmail :one
-SELECT u.id, u.email, d.first_name, d.last_name, d.specialty, d.experience_years, d.available, u.hashed_password, u.created_at
+SELECT u.id, u.email, COALESCE(d.first_name, 'Admin') AS first_name, COALESCE(d.last_name, 'User') AS last_name,
+       COALESCE(d.specialty, '') AS specialty, COALESCE(d.experience_years, 0) AS experience_years,
+       COALESCE(d.available, false) AS available, u.hashed_password, u.role, u.created_at
 FROM users u
-JOIN doctor_profiles d ON u.id = d.user_id
-WHERE u.email = $1 AND u.role = 'doctor' AND u.is_active = true
+LEFT JOIN doctor_profiles d ON u.id = d.user_id
+WHERE u.email =  AND u.role IN ('doctor', 'admin') AND u.is_active = true
 `
 
 type GetDoctorByEmailRow struct {
@@ -70,6 +72,7 @@ type GetDoctorByEmailRow struct {
 	ExperienceYears pgtype.Int4        `json:"experience_years"`
 	Available       pgtype.Bool        `json:"available"`
 	HashedPassword  string             `json:"hashed_password"`
+	Role            string             `json:"role"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 }
 
@@ -85,6 +88,7 @@ func (q *Queries) GetDoctorByEmail(ctx context.Context, email string) (GetDoctor
 		&i.ExperienceYears,
 		&i.Available,
 		&i.HashedPassword,
+		&i.Role,
 		&i.CreatedAt,
 	)
 	return i, err

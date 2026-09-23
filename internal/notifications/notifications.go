@@ -3,7 +3,8 @@ package notifications
 import (
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
+	"net/http"
 	"sync"
 	"time"
 
@@ -98,7 +99,7 @@ func (b *SSEBroker) Publish(event NotificationEvent) {
 				select {
 				case ch <- event:
 				default:
-					log.Printf("[SSE Warning] Notification buffer full for user %s; event %s dropped", targetID, event.Type)
+					slog.Warn("Notification buffer full; event dropped", "user_id", targetID, "event_type", event.Type)
 				}
 			}
 		}
@@ -137,6 +138,10 @@ func ServeSSE(b Broker, c *gin.Context, userID uuid.UUID) {
 	c.Writer.Header().Set("Connection", "keep-alive")
 	c.Writer.Header().Set("X-Accel-Buffering", "no")
 	c.Writer.Flush()
+
+	// Disable HTTP server write deadline for persistent SSE stream
+	rc := http.NewResponseController(c.Writer)
+	_ = rc.SetWriteDeadline(time.Time{})
 
 	eventCh, unsubscribe := b.Subscribe(userID)
 	defer unsubscribe()

@@ -2,6 +2,7 @@ package logger
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"os"
 	"strings"
@@ -13,12 +14,58 @@ const RequestIDKey contextKey = "request_id"
 
 var DefaultLogger *slog.Logger
 
+// ContextHandler wraps an slog.Handler and automatically extracts
+// contextual attributes such as request_id from context.Context.
+type ContextHandler struct {
+	handler slog.Handler
+}
+
+// NewContextHandler creates a new ContextHandler wrapping the given slog.Handler.
+func NewContextHandler(h slog.Handler) *ContextHandler {
+	return &ContextHandler{handler: h}
+}
+
+func (h *ContextHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return h.handler.Enabled(ctx, level)
+}
+
+func (h *ContextHandler) Handle(ctx context.Context, r slog.Record) error {
+	if reqID := GetRequestID(ctx); reqID != "" {
+		hasReqID := false
+		r.Attrs(func(a slog.Attr) bool {
+			if a.Key == "request_id" {
+				hasReqID = true
+				return false
+			}
+			return true
+		})
+		if !hasReqID {
+			r.AddAttrs(slog.String("request_id", reqID))
+		}
+	}
+	return h.handler.Handle(ctx, r)
+}
+
+func (h *ContextHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &ContextHandler{handler: h.handler.WithAttrs(attrs)}
+}
+
+func (h *ContextHandler) WithGroup(name string) slog.Handler {
+	return &ContextHandler{handler: h.handler.WithGroup(name)}
+}
+
 func init() {
 	DefaultLogger = InitLogger()
 	slog.SetDefault(DefaultLogger)
 }
 
+// InitLogger initializes DefaultLogger writing to stdout based on LOG_LEVEL and LOG_FORMAT.
 func InitLogger() *slog.Logger {
+	return InitLoggerWithWriter(os.Stdout)
+}
+
+// InitLoggerWithWriter initializes a structured logger with an arbitrary writer for testability.
+func InitLoggerWithWriter(w io.Writer) *slog.Logger {
 	level := slog.LevelInfo
 	if strings.ToLower(os.Getenv("LOG_LEVEL")) == "debug" {
 		level = slog.LevelDebug
@@ -32,15 +79,15 @@ func InitLogger() *slog.Logger {
 		Level: level,
 	}
 
-	var handler slog.Handler
+	var baseHandler slog.Handler
 	format := strings.ToLower(os.Getenv("LOG_FORMAT"))
 	if format == "text" {
-		handler = slog.NewTextHandler(os.Stdout, opts)
+		baseHandler = slog.NewTextHandler(w, opts)
 	} else {
-		handler = slog.NewJSONHandler(os.Stdout, opts)
+		baseHandler = slog.NewJSONHandler(w, opts)
 	}
 
-	return slog.New(handler)
+	return slog.New(NewContextHandler(baseHandler))
 }
 
 func WithRequestID(ctx context.Context, requestID string) context.Context {

@@ -23,21 +23,31 @@ const (
 	ActionLogMedicationAdherence   = "LOG_MEDICATION_ADHERENCE"
 	ActionAccessMeetingRoom        = "ACCESS_MEETING_ROOM"
 	ActionViewPatientProfile       = "VIEW_PATIENT_PROFILE"
+	// Authentication & Security Audit Events (HIPAA § 164.312(b))
+	ActionUserLogin       = "USER_LOGIN"
+	ActionUserLogout      = "USER_LOGOUT"
+	ActionTokenReuseAlert = "TOKEN_REUSE_SECURITY_ALERT"
+	// Compliance Audit Trail Access
+	ActionViewAuditLogs = "VIEW_COMPLIANCE_AUDIT_LOGS"
 )
+
+// DefaultWorkerCount is the number of concurrent goroutines draining the audit queue.
+const DefaultWorkerCount = 5
 
 type Auditor interface {
 	Log(entry models.PhiAuditLog)
 	Shutdown(ctx context.Context) error
 }
 
-// AsyncAuditor records audit logs in a non-blocking background queue
+// AsyncAuditor records audit logs in a non-blocking background queue using a
+// worker pool to prevent single-goroutine throughput bottlenecks.
 type AsyncAuditor struct {
-	repo       repository.Repository
-	logChan    chan models.PhiAuditLog
-	wg         sync.WaitGroup
-	bufferSize int
-	closed     bool
-	mu         sync.Mutex
+	repo        repository.Repository
+	logChan     chan models.PhiAuditLog
+	wg          sync.WaitGroup
+	workerCount int
+	mu          sync.RWMutex
+	closed      bool
 }
 
 func NewAsyncAuditor(repo repository.Repository, bufferSize int) *AsyncAuditor {
@@ -45,13 +55,15 @@ func NewAsyncAuditor(repo repository.Repository, bufferSize int) *AsyncAuditor {
 		bufferSize = 1000
 	}
 	a := &AsyncAuditor{
-		repo:       repo,
-		logChan:    make(chan models.PhiAuditLog, bufferSize),
-		bufferSize: bufferSize,
+		repo:        repo,
+		logChan:     make(chan models.PhiAuditLog, bufferSize),
+		workerCount: DefaultWorkerCount,
 	}
 
-	a.wg.Add(1)
-	go a.worker()
+	for i := 0; i < a.workerCount; i++ {
+		a.wg.Add(1)
+		go a.worker()
+	}
 	return a
 }
 
@@ -67,20 +79,22 @@ func (a *AsyncAuditor) worker() {
 }
 
 func (a *AsyncAuditor) Log(entry models.PhiAuditLog) {
-	a.mu.Lock()
-	if a.closed {
-		a.mu.Unlock()
-		return
-	}
-	a.mu.Unlock()
-
 	if entry.CreatedAt.IsZero() {
 		entry.CreatedAt = time.Now()
 	}
 
+	a.mu.RLock()
+	if a.closed {
+		a.mu.RUnlock()
+		return
+	}
+
 	select {
 	case a.logChan <- entry:
+		a.mu.RUnlock()
+		return
 	default:
+		a.mu.RUnlock()
 		slog.Warn("HIPAA Audit queue full; logging synchronously to prevent audit loss", "action", entry.Action)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -112,22 +126,23 @@ func (a *AsyncAuditor) Shutdown(ctx context.Context) error {
 	}
 }
 
-// MockAuditor for testing
+
+// MockAuditor provides an in-memory thread-safe implementation of Auditor for testing.
 type MockAuditor struct {
 	mu      sync.Mutex
-	Entries []models.PhiAuditLog
+	entries []models.PhiAuditLog
 }
 
 func NewMockAuditor() *MockAuditor {
 	return &MockAuditor{
-		Entries: make([]models.PhiAuditLog, 0),
+		entries: make([]models.PhiAuditLog, 0),
 	}
 }
 
 func (m *MockAuditor) Log(entry models.PhiAuditLog) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.Entries = append(m.Entries, entry)
+	m.entries = append(m.entries, entry)
 }
 
 func (m *MockAuditor) Shutdown(ctx context.Context) error {
@@ -137,7 +152,7 @@ func (m *MockAuditor) Shutdown(ctx context.Context) error {
 func (m *MockAuditor) GetEntries() []models.PhiAuditLog {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	copied := make([]models.PhiAuditLog, len(m.Entries))
-	copy(copied, m.Entries)
-	return copied
+	out := make([]models.PhiAuditLog, len(m.entries))
+	copy(out, m.entries)
+	return out
 }

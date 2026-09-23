@@ -191,7 +191,7 @@ func (r *DBRepository) GetDoctorByEmail(ctx context.Context, email string) (mode
 		Experience:     int(row.ExperienceYears.Int32),
 		Available:      row.Available.Bool,
 		HashedPassword: row.HashedPassword,
-		Role:           "doctor",
+		Role:           row.Role,
 		CreatedAt:      row.CreatedAt.Time,
 	}, nil
 }
@@ -876,8 +876,9 @@ func (r *DBRepository) GetPrescriptionByFilenameForDoctor(ctx context.Context, d
 		return models.Prescription{}, err
 	}
 	return models.Prescription{
-		ID:     row.ID,
-		Status: row.Status,
+		ID:        row.ID,
+		Status:    row.Status,
+		PatientID: row.PatientID,
 	}, nil
 }
 
@@ -1471,6 +1472,132 @@ func (r *DBRepository) RevokeRefreshToken(ctx context.Context, id uuid.UUID, rep
 
 func (r *DBRepository) RevokeAllUserRefreshTokens(ctx context.Context, userID uuid.UUID) error {
 	return r.queries.RevokeAllUserRefreshTokens(ctx, userID)
+}
+
+// RotateRefreshToken executes token rotation atomically in a single Postgres transaction:
+//  1. Selects the old token row FOR UPDATE (prevents concurrent rotation races).
+//  2. If the old token is already revoked and has a replacement, fetches and returns
+//     the existing replacement token so mobile clients that dropped the first response
+//     can recover without being permanently locked out.
+//  3. Otherwise, creates the new token and revokes the old one in the same transaction.
+func (r *DBRepository) RotateRefreshToken(ctx context.Context, oldTokenID, userID uuid.UUID, newHash string, expiresAt time.Time) (models.RefreshToken, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return models.RefreshToken{}, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	// Lock the old token row to serialise concurrent refresh attempts.
+	const lockQuery = `
+		SELECT id, user_id, token_hash, expires_at, revoked_at, replaced_by_token_id, created_at
+		FROM refresh_tokens WHERE id = $1 FOR UPDATE`
+	row := tx.QueryRow(ctx, lockQuery, oldTokenID)
+	var old struct {
+		id                uuid.UUID
+		userID            uuid.UUID
+		tokenHash         string
+		expiresAt         pgtype.Timestamptz
+		revokedAt         pgtype.Timestamptz
+		replacedByTokenID pgtype.UUID
+		createdAt         pgtype.Timestamptz
+	}
+	if err := row.Scan(&old.id, &old.userID, &old.tokenHash, &old.expiresAt,
+		&old.revokedAt, &old.replacedByTokenID, &old.createdAt); err != nil {
+		return models.RefreshToken{}, err
+	}
+
+	// Grace-window retry: old token is already revoked with a known successor.
+	if old.revokedAt.Valid {
+		if time.Since(old.revokedAt.Time) <= 10*time.Second && old.replacedByTokenID.Valid {
+			replacementID := uuid.UUID(old.replacedByTokenID.Bytes)
+			const fetchQuery = `
+				SELECT id, user_id, token_hash, expires_at, revoked_at, replaced_by_token_id, created_at
+				FROM refresh_tokens WHERE id = $1`
+			newRow := tx.QueryRow(ctx, fetchQuery, replacementID)
+			var rep struct {
+				id                uuid.UUID
+				userID            uuid.UUID
+				tokenHash         string
+				expiresAt         pgtype.Timestamptz
+				revokedAt         pgtype.Timestamptz
+				replacedByTokenID pgtype.UUID
+				createdAt         pgtype.Timestamptz
+			}
+			if scanErr := newRow.Scan(&rep.id, &rep.userID, &rep.tokenHash, &rep.expiresAt,
+				&rep.revokedAt, &rep.replacedByTokenID, &rep.createdAt); scanErr == nil {
+				if commitErr := tx.Commit(ctx); commitErr != nil {
+					return models.RefreshToken{}, commitErr
+				}
+				return rawToRefreshToken(rep.id, rep.userID, rep.tokenHash,
+					rep.expiresAt, rep.revokedAt, rep.replacedByTokenID, rep.createdAt), nil
+			}
+			return models.RefreshToken{}, fmt.Errorf("replacement token not found for revoked token %s", oldTokenID)
+		}
+		return models.RefreshToken{}, fmt.Errorf("token %s already revoked", oldTokenID)
+	}
+
+	// Create the new token.
+	const insertQuery = `
+		INSERT INTO refresh_tokens (user_id, token_hash, expires_at)
+		VALUES ($1, $2, $3)
+		RETURNING id, user_id, token_hash, expires_at, revoked_at, replaced_by_token_id, created_at`
+	var rep struct {
+		id                uuid.UUID
+		userID            uuid.UUID
+		tokenHash         string
+		expiresAt         pgtype.Timestamptz
+		revokedAt         pgtype.Timestamptz
+		replacedByTokenID pgtype.UUID
+		createdAt         pgtype.Timestamptz
+	}
+	newPgExpiry := pgtype.Timestamptz{Time: expiresAt, Valid: true}
+	if err := tx.QueryRow(ctx, insertQuery, userID, newHash, newPgExpiry).Scan(
+		&rep.id, &rep.userID, &rep.tokenHash, &rep.expiresAt,
+		&rep.revokedAt, &rep.replacedByTokenID, &rep.createdAt,
+	); err != nil {
+		return models.RefreshToken{}, err
+	}
+
+	// Revoke the old token, linking to the new one for lineage tracking.
+	const revokeQuery = `
+		UPDATE refresh_tokens
+		SET revoked_at = now(), replaced_by_token_id = $2
+		WHERE id = $1 AND revoked_at IS NULL`
+	if _, err := tx.Exec(ctx, revokeQuery, oldTokenID, pgtype.UUID{Bytes: rep.id, Valid: true}); err != nil {
+		return models.RefreshToken{}, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return models.RefreshToken{}, err
+	}
+
+	return rawToRefreshToken(rep.id, rep.userID, rep.tokenHash,
+		rep.expiresAt, rep.revokedAt, rep.replacedByTokenID, rep.createdAt), nil
+}
+
+// rawToRefreshToken builds a models.RefreshToken from raw pgx scan targets.
+func rawToRefreshToken(id, userID uuid.UUID, tokenHash string,
+	expiresAt, revokedAt pgtype.Timestamptz, replacedBy pgtype.UUID, createdAt pgtype.Timestamptz,
+) models.RefreshToken {
+	var revAt *time.Time
+	if revokedAt.Valid {
+		t := revokedAt.Time
+		revAt = &t
+	}
+	var repBy *uuid.UUID
+	if replacedBy.Valid {
+		u := uuid.UUID(replacedBy.Bytes)
+		repBy = &u
+	}
+	return models.RefreshToken{
+		ID:                id,
+		UserID:            userID,
+		TokenHash:         tokenHash,
+		ExpiresAt:         expiresAt.Time,
+		RevokedAt:         revAt,
+		ReplacedByTokenID: repBy,
+		CreatedAt:         createdAt.Time,
+	}
 }
 
 // ==========================================

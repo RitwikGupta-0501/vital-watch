@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -171,7 +171,7 @@ func (c *OpenFDAChecker) getDrugLabel(ctx context.Context, drugName string) (*ca
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		log.Printf("[OpenFDA DDI] Warning: Failed to query OpenFDA for %q: %v (failing open)", clean, err)
+		slog.WarnContext(ctx, "Failed to query OpenFDA (failing open)", "drug", clean, "error", err)
 		return nil, nil
 	}
 	defer resp.Body.Close()
@@ -184,7 +184,7 @@ func (c *OpenFDAChecker) getDrugLabel(ctx context.Context, drugName string) (*ca
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		log.Printf("[OpenFDA DDI] Non-200 from OpenFDA for %q (status %d): %s", clean, resp.StatusCode, string(body))
+		slog.WarnContext(ctx, "Non-200 from OpenFDA", "drug", clean, "status", resp.StatusCode, "response_body", string(body))
 		return nil, nil
 	}
 
@@ -258,7 +258,35 @@ func (c *OpenFDAChecker) CheckPrescriptionSafety(ctx context.Context, newMedicat
 		}
 	}
 
-	// 2. Check Drug-Drug Interactions (between new medications, and new vs active)
+	// 2. Concurrently pre-fetch OpenFDA labels for all unique medications to avoid sequential network latency
+	uniqueDrugs := make(map[string]struct{})
+	for _, m := range newMedications {
+		if cName := CleanDrugName(m); cName != "" {
+			uniqueDrugs[cName] = struct{}{}
+		}
+	}
+	for _, m := range activeMedications {
+		if cName := CleanDrugName(m); cName != "" {
+			uniqueDrugs[cName] = struct{}{}
+		}
+	}
+
+	if len(uniqueDrugs) > 0 {
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 5)
+		for drugName := range uniqueDrugs {
+			wg.Add(1)
+			go func(d string) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				_, _ = c.getDrugLabel(ctx, d)
+			}(drugName)
+		}
+		wg.Wait()
+	}
+
+	// 3. Check Drug-Drug Interactions (between new medications, and new vs active)
 	allDrugsToCompareAgainst := make([]string, 0, len(newMedications)+len(activeMedications))
 	allDrugsToCompareAgainst = append(allDrugsToCompareAgainst, activeMedications...)
 	allDrugsToCompareAgainst = append(allDrugsToCompareAgainst, newMedications...)

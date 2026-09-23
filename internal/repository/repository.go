@@ -67,6 +67,10 @@ type Repository interface {
 	GetRefreshTokenByHash(ctx context.Context, tokenHash string) (models.RefreshToken, error)
 	RevokeRefreshToken(ctx context.Context, id uuid.UUID, replacedByTokenID *uuid.UUID) error
 	RevokeAllUserRefreshTokens(ctx context.Context, userID uuid.UUID) error
+	// RotateRefreshToken atomically revokes oldTokenID and creates a new token in a single transaction.
+	// It returns the new RefreshToken. If oldTokenID is already revoked and within the grace window,
+	// it returns the existing replacement token, enabling safe retry on mobile network failures.
+	RotateRefreshToken(ctx context.Context, oldTokenID, userID uuid.UUID, newHash string, expiresAt time.Time) (models.RefreshToken, error)
 
 	// Phase 5: HIPAA ePHI Audit Logging
 	CreateAuditLog(ctx context.Context, log models.PhiAuditLog) (uuid.UUID, error)

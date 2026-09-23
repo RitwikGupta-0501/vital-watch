@@ -3,7 +3,7 @@ package ocr
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 )
 
 // FallbackChain decorates a slice of Providers, executing them in priority order
@@ -35,20 +35,20 @@ func (fc *FallbackChain) ExtractPrescription(ctx context.Context, fileBytes []by
 			return nil, ctx.Err()
 		}
 		if !p.SupportsMIME(mimeType) {
-			log.Printf("[OCR FallbackChain] Skipping provider %q: MIME type %q is not supported", p.Name(), mimeType)
+			slog.InfoContext(ctx, "Skipping OCR provider; MIME type unsupported", "provider", p.Name(), "mime_type", mimeType)
 			continue
 		}
 		anySupported = true
 
 		res, err := p.ExtractPrescription(ctx, fileBytes, mimeType)
 		if err == nil && res != nil {
-			log.Printf("[OCR FallbackChain] Extraction succeeded via provider %q (found %d medications)", p.Name(), len(res.Medications))
+			slog.InfoContext(ctx, "Extraction succeeded via OCR provider", "provider", p.Name(), "medications_count", len(res.Medications))
 			res.Provider = p.Name()
 			return res, nil
 		}
 
 		lastErr = err
-		log.Printf("[OCR FallbackChain] Provider %q failed: %v. Attempting next provider...", p.Name(), err)
+		slog.WarnContext(ctx, "OCR provider failed; attempting next provider", "provider", p.Name(), "error", err)
 	}
 
 	if !anySupported {

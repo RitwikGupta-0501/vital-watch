@@ -57,7 +57,7 @@ WHERE p.id = $1
     p.doctor_id = $4
     OR EXISTS (
       SELECT 1 FROM appointments a
-      WHERE a.patient_id = p.patient_id AND a.doctor_id = $4
+      WHERE a.patient_id = p.patient_id AND a.doctor_id = $4 AND a.status != 'cancelled'
     )
   );
 
@@ -74,7 +74,7 @@ WHERE p.status = 'needs_review'
     p.doctor_id = $1
     OR EXISTS (
       SELECT 1 FROM appointments a
-      WHERE a.patient_id = p.patient_id AND a.doctor_id = $1
+      WHERE a.patient_id = p.patient_id AND a.doctor_id = $1 AND a.status != 'cancelled'
     )
   )
 ORDER BY p.created_at DESC
@@ -103,17 +103,17 @@ WHERE p.patient_id = $1
   AND (
     p.doctor_id = $2
     OR EXISTS (
-      SELECT 1 FROM appointments a WHERE a.patient_id = $1 AND a.doctor_id = $2
+      SELECT 1 FROM appointments a WHERE a.patient_id = $1 AND a.doctor_id = $2 AND a.status != 'cancelled'
     )
   )
 ORDER BY p.created_at DESC
 LIMIT $3 OFFSET $4;
 
 -- name: GetPrescriptionByFilenameForDoctor :one
-SELECT p.id, p.status
+SELECT p.id, p.status, p.patient_id
 FROM prescriptions p
-LEFT JOIN appointments a ON p.patient_id = a.patient_id AND a.doctor_id = $2
-WHERE p.file_name = $1 AND (p.doctor_id = $2 OR a.doctor_id = $2)
+LEFT JOIN appointments a ON p.patient_id = a.patient_id AND a.doctor_id = $2 AND a.status != 'cancelled'
+WHERE p.file_name = $1 AND (p.doctor_id = $2 OR (a.doctor_id = $2 AND a.status != 'cancelled'))
 LIMIT 1;
 
 -- name: GetPrescriptionByID :one

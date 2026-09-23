@@ -45,6 +45,16 @@ jobs:
       - name: Static Analysis (go vet)
         run: go vet ./...
 
+      - name: Golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.64
+
+      - name: Vulnerability Check (govulncheck)
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
       - name: Unit & Integration Tests (with Race Detector)
         env:
           DATABASE_URL: postgres://postgres:password@localhost:5432/vitalwatch_test?sslmode=disable
