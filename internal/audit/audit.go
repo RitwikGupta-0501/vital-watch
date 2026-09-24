@@ -23,7 +23,10 @@ const (
 	ActionLogMedicationAdherence   = "LOG_MEDICATION_ADHERENCE"
 	ActionAccessMeetingRoom        = "ACCESS_MEETING_ROOM"
 	ActionViewPatientProfile       = "VIEW_PATIENT_PROFILE"
+	ActionViewDoctorProfile        = "VIEW_DOCTOR_PROFILE"
+	ActionViewAdminProfile         = "VIEW_ADMIN_PROFILE"
 	// Authentication & Security Audit Events (HIPAA § 164.312(b))
+	ActionUserRegister    = "USER_REGISTER"
 	ActionUserLogin       = "USER_LOGIN"
 	ActionUserLogout      = "USER_LOGOUT"
 	ActionTokenReuseAlert = "TOKEN_REUSE_SECURITY_ALERT"
