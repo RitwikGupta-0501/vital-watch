@@ -40,6 +40,7 @@ type Handler struct {
 	Storage          storage.Provider
 	JWTSecret        []byte
 	DoctorInviteCode string
+	AdminInviteCode  string
 	OCREnabled       bool
 	PDFGenerator     pdf.Generator
 	SafetyChecker    safety.Checker
@@ -169,9 +170,10 @@ func (h *Handler) Login(c *gin.Context) {
 	switch req.Role {
 	case "patient":
 		user, err = h.Repo.GetPatientByEmail(ctx, req.Email)
-	case "doctor", "admin":
-		// Both doctors and admins are stored in the doctors/users table with their role
+	case "doctor":
 		user, err = h.Repo.GetDoctorByEmail(ctx, req.Email)
+	case "admin":
+		user, err = h.Repo.GetAdminByEmail(ctx, req.Email)
 	default:
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid role"})
 		return
@@ -319,6 +321,21 @@ func (h *Handler) Register(c *gin.Context) {
 			return
 		}
 		newID, err = h.Repo.CreateDoctor(ctx, req.FirstName, req.LastName, req.Email, hashed, req.Specialty, req.Experience)
+	case "admin":
+		if h.AdminInviteCode == "" || req.InviteCode != h.AdminInviteCode {
+			c.JSON(http.StatusForbidden, gin.H{"error": "Admin registration is restricted or invalid invite code"})
+			return
+		}
+		hashed, err := utils.HashPassword(req.Password)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
+			return
+		}
+		dept := req.Specialty
+		if dept == "" {
+			dept = "Operations"
+		}
+		newID, err = h.Repo.CreateAdmin(ctx, req.FirstName, req.LastName, req.Email, hashed, dept)
 	default:
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid role"})
 		return
@@ -371,21 +388,13 @@ func (h *Handler) GetUserProfile(c *gin.Context) {
 		c.JSON(http.StatusOK, doctor)
 
 	case "admin":
-		doctor, err := h.Repo.GetDoctorByID(ctx, userID)
-		if err == nil {
-			c.JSON(http.StatusOK, gin.H{
-				"id":         doctor.ID,
-				"email":      doctor.Email,
-				"first_name": doctor.FirstName,
-				"last_name":  doctor.LastName,
-				"role":       "admin",
-			})
+		admin, err := h.Repo.GetAdminByID(ctx, userID)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Admin profile not found"})
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{
-			"id":   userID,
-			"role": "admin",
-		})
+		h.audit(c, audit.ActionViewPatientProfile, "admin", &userID, nil, http.StatusOK, nil)
+		c.JSON(http.StatusOK, admin)
 
 	default:
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user role"})
@@ -1159,9 +1168,13 @@ func (h *Handler) CreateDigitalPrescription(c *gin.Context) {
 
 	// Safety Pre-flight Check (DDI and Allergies)
 	safetyReport, safetyErr := h.checkSafety(ctx, req.PatientID, items)
-	if safetyErr == nil && safetyReport != nil && safetyReport.HasHighSeverityAlerts && !req.OverrideSafety {
+	if safetyErr == nil && safetyReport != nil && (safetyReport.HasHighSeverityAlerts || safetyReport.ServiceDegraded) && !req.OverrideSafety {
+		errMsg := "Critical drug interaction or allergy contraindication detected"
+		if safetyReport.ServiceDegraded {
+			errMsg = "Drug safety check service is degraded; automated interaction checks incomplete"
+		}
 		c.JSON(http.StatusConflict, gin.H{
-			"error":             "Critical drug interaction or allergy contraindication detected",
+			"error":             errMsg,
 			"safety_report":     safetyReport,
 			"requires_override": true,
 		})
@@ -1365,9 +1378,13 @@ func (h *Handler) VerifyPrescription(c *gin.Context) {
 
 		if len(itemsToCheck) > 0 {
 			safetyReport, safetyErr := h.checkSafety(ctx, existing.PatientID, itemsToCheck)
-			if safetyErr == nil && safetyReport != nil && safetyReport.HasHighSeverityAlerts && !req.OverrideSafety {
+			if safetyErr == nil && safetyReport != nil && (safetyReport.HasHighSeverityAlerts || safetyReport.ServiceDegraded) && !req.OverrideSafety {
+				errMsg := "Critical drug interaction or allergy contraindication detected"
+				if safetyReport.ServiceDegraded {
+					errMsg = "Drug safety check service is degraded; automated interaction checks incomplete"
+				}
 				c.JSON(http.StatusConflict, gin.H{
-					"error":             "Critical drug interaction or allergy contraindication detected",
+					"error":             errMsg,
 					"safety_report":     safetyReport,
 					"requires_override": true,
 				})
@@ -1660,20 +1677,21 @@ func (h *Handler) GetAppointmentMeetingRoom(c *gin.Context) {
 			if duration <= 0 {
 				duration = 30 * time.Minute
 			}
-			room, rErr := h.Telehealth.CreateRoom(c.Request.Context(), appt.ID, appt.StartTime, duration)
-			if rErr != nil {
-				slog.WarnContext(c.Request.Context(), "Failed to lazily create telehealth room", "error", rErr)
-			} else if room != nil {
-				if uErr := h.Repo.UpdateAppointmentMeetingRoom(c.Request.Context(), appt.ID, room.MeetingLink, room.MeetingID); uErr != nil {
-					slog.WarnContext(c.Request.Context(), "Failed to persist generated telehealth meeting room", "error", uErr)
+			generator := func() (string, string, error) {
+				room, rErr := h.Telehealth.CreateRoom(c.Request.Context(), appt.ID, appt.StartTime, duration)
+				if rErr != nil {
+					return "", "", rErr
 				}
-				if refreshed, refErr := h.Repo.GetAppointmentByID(c.Request.Context(), appt.ID); refErr == nil && refreshed.MeetingLink != "" {
-					appt.MeetingLink = refreshed.MeetingLink
-					appt.MeetingID = refreshed.MeetingID
-				} else {
-					appt.MeetingLink = room.MeetingLink
-					appt.MeetingID = room.MeetingID
+				if room == nil {
+					return "", "", nil
 				}
+				return room.MeetingLink, room.MeetingID, nil
+			}
+			lockedAppt, lErr := h.Repo.GetOrGenerateAppointmentMeetingRoom(c.Request.Context(), appt.ID, generator)
+			if lErr != nil {
+				slog.WarnContext(c.Request.Context(), "Failed to atomically create telehealth room", "error", lErr)
+			} else if lockedAppt.MeetingLink != "" {
+				appt = lockedAppt
 			}
 		}
 		if appt.MeetingLink == "" {
@@ -2505,27 +2523,25 @@ func (h *Handler) RefreshToken(c *gin.Context) {
 
 	// TOKEN THEFT DETECTION: If a previously revoked token is reused, revoke all tokens for this user
 	if existingToken.RevokedAt != nil {
-		if time.Since(*existingToken.RevokedAt) < 10*time.Second {
-			slog.WarnContext(c.Request.Context(), "Refresh token reuse within grace window; returning conflict without session revocation", "user_id", existingToken.UserID, "token_id", existingToken.ID)
-			c.JSON(http.StatusConflict, gin.H{"error": "Token rotation in progress or already completed, please use newest token"})
+		if time.Since(*existingToken.RevokedAt) >= 10*time.Second {
+			slog.WarnContext(c.Request.Context(), "SECURITY ALERT: Reuse of revoked refresh token outside grace window! Revoking all sessions.", "user_id", existingToken.UserID)
+			// Audit the security breach event (HIPAA § 164.312(b))
+			if h.Auditor != nil {
+				h.Auditor.Log(models.PhiAuditLog{
+					UserID:     &existingToken.UserID,
+					Action:     audit.ActionTokenReuseAlert,
+					IPAddress:  c.ClientIP(),
+					UserAgent:  c.Request.UserAgent(),
+					StatusCode: http.StatusUnauthorized,
+					Metadata:   fmt.Sprintf(`{"token_id":%q}`, existingToken.ID.String()),
+				})
+			}
+			_ = h.Repo.RevokeAllUserRefreshTokens(c.Request.Context(), existingToken.UserID)
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Compromised token detected; all sessions have been terminated"})
 			return
 		}
-
-		slog.WarnContext(c.Request.Context(), "SECURITY ALERT: Reuse of revoked refresh token detected for user! Revoking all sessions.", "user_id", existingToken.UserID)
-		// Audit the security breach event (HIPAA § 164.312(b))
-		if h.Auditor != nil {
-			h.Auditor.Log(models.PhiAuditLog{
-				UserID:     &existingToken.UserID,
-				Action:     audit.ActionTokenReuseAlert,
-				IPAddress:  c.ClientIP(),
-				UserAgent:  c.Request.UserAgent(),
-				StatusCode: http.StatusUnauthorized,
-				Metadata:   fmt.Sprintf(`{"token_id":%q}`, existingToken.ID.String()),
-			})
-		}
-		_ = h.Repo.RevokeAllUserRefreshTokens(c.Request.Context(), existingToken.UserID)
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Compromised token detected; all sessions have been terminated"})
-		return
+		// If within 10-second grace window, do not terminate immediately.
+		// RotateRefreshToken will atomically verify if the replacement token was consumed.
 	}
 
 	if existingToken.ExpiresAt.Before(time.Now()) {
@@ -2533,12 +2549,14 @@ func (h *Handler) RefreshToken(c *gin.Context) {
 		return
 	}
 
-	// Look up user role
+	// Look up user role (Patient, Doctor, or Admin)
 	var role string
 	if p, pErr := h.Repo.GetPatientByID(c.Request.Context(), existingToken.UserID); pErr == nil {
 		role = p.Role
 	} else if d, dErr := h.Repo.GetDoctorByID(c.Request.Context(), existingToken.UserID); dErr == nil {
 		role = d.Role
+	} else if a, aErr := h.Repo.GetAdminByID(c.Request.Context(), existingToken.UserID); aErr == nil {
+		role = a.Role
 	} else {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "User account no longer active"})
 		return
@@ -2553,9 +2571,25 @@ func (h *Handler) RefreshToken(c *gin.Context) {
 
 	// RotateRefreshToken atomically revokes the old token and inserts the new one
 	// in a single Postgres transaction with a SELECT FOR UPDATE lock, preventing
-	// concurrent rotation races and allowing grace-window replay for mobile retries.
+	// concurrent rotation races and recovering lost mobile retry responses if unconsumed.
 	newTok, err := h.Repo.RotateRefreshToken(c.Request.Context(), existingToken.ID, existingToken.UserID, newRefreshHash, time.Now().Add(7*24*time.Hour))
 	if err != nil {
+		if errors.Is(err, repository.ErrTokenAlreadyRotated) {
+			slog.WarnContext(c.Request.Context(), "SECURITY ALERT: Token rotation replay detected (replacement was already consumed). Revoking all sessions.", "user_id", existingToken.UserID)
+			if h.Auditor != nil {
+				h.Auditor.Log(models.PhiAuditLog{
+					UserID:     &existingToken.UserID,
+					Action:     audit.ActionTokenReuseAlert,
+					IPAddress:  c.ClientIP(),
+					UserAgent:  c.Request.UserAgent(),
+					StatusCode: http.StatusUnauthorized,
+					Metadata:   fmt.Sprintf(`{"token_id":%q}`, existingToken.ID.String()),
+				})
+			}
+			_ = h.Repo.RevokeAllUserRefreshTokens(c.Request.Context(), existingToken.UserID)
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Compromised token detected; all sessions have been terminated"})
+			return
+		}
 		slog.ErrorContext(c.Request.Context(), "Failed to rotate refresh token", "error", err, "token_id", existingToken.ID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to rotate session token"})
 		return
@@ -2692,3 +2726,52 @@ func (h *Handler) GetComplianceAuditLogs(c *gin.Context) {
 	})
 }
 
+// ListUsers returns a paginated list of all registered users across all roles (Admin-only)
+func (h *Handler) ListUsers(c *gin.Context) {
+	limit, offset := parsePagination(c)
+	users, err := h.Repo.GetAllUsers(c.Request.Context(), limit, offset)
+	if err != nil {
+		slog.ErrorContext(c.Request.Context(), "Internal error fetching users list", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch users"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"data":   users,
+		"limit":  limit,
+		"offset": offset,
+	})
+}
+
+// ToggleUserStatus activates or deactivates a user account (Admin-only)
+func (h *Handler) ToggleUserStatus(c *gin.Context) {
+	targetIDStr := c.Param("id")
+	targetID, err := uuid.Parse(targetIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID"})
+		return
+	}
+
+	var req struct {
+		IsActive bool `json:"is_active"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body: is_active boolean is required"})
+		return
+	}
+
+	if err := h.Repo.UpdateUserActiveStatus(c.Request.Context(), targetID, req.IsActive); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+			return
+		}
+		slog.ErrorContext(c.Request.Context(), "Internal error updating user active status", "error", err, "target_user_id", targetID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update user status"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"id":        targetID,
+		"is_active": req.IsActive,
+		"message":   "User status updated successfully",
+	})
+}

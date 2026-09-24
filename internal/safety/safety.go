@@ -41,6 +41,9 @@ type AllergyAlert struct {
 
 type SafetyReport struct {
 	HasHighSeverityAlerts bool               `json:"has_high_severity_alerts"`
+	ServiceDegraded       bool               `json:"service_degraded"`
+	DegradedReason        string             `json:"degraded_reason,omitempty"`
+	UncheckedDrugs        []string           `json:"unchecked_drugs,omitempty"`
 	InteractionAlerts     []InteractionAlert `json:"interaction_alerts"`
 	AllergyAlerts         []AllergyAlert     `json:"allergy_alerts"`
 }
@@ -171,8 +174,8 @@ func (c *OpenFDAChecker) getDrugLabel(ctx context.Context, drugName string) (*ca
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		slog.WarnContext(ctx, "Failed to query OpenFDA (failing open)", "drug", clean, "error", err)
-		return nil, nil
+		slog.WarnContext(ctx, "Failed to query OpenFDA", "drug", clean, "error", err)
+		return nil, err
 	}
 	defer resp.Body.Close()
 
@@ -185,7 +188,7 @@ func (c *OpenFDAChecker) getDrugLabel(ctx context.Context, drugName string) (*ca
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		slog.WarnContext(ctx, "Non-200 from OpenFDA", "drug", clean, "status", resp.StatusCode, "response_body", string(body))
-		return nil, nil
+		return nil, fmt.Errorf("openfda service returned status %d", resp.StatusCode)
 	}
 
 	var fdaResp struct {
@@ -271,6 +274,15 @@ func (c *OpenFDAChecker) CheckPrescriptionSafety(ctx context.Context, newMedicat
 		}
 	}
 
+	degradedDrugs := make(map[string]struct{})
+	var degradedMu sync.Mutex
+
+	recordDegraded := func(drugName string) {
+		degradedMu.Lock()
+		degradedDrugs[drugName] = struct{}{}
+		degradedMu.Unlock()
+	}
+
 	if len(uniqueDrugs) > 0 {
 		var wg sync.WaitGroup
 		sem := make(chan struct{}, 5)
@@ -280,7 +292,10 @@ func (c *OpenFDAChecker) CheckPrescriptionSafety(ctx context.Context, newMedicat
 				defer wg.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
-				_, _ = c.getDrugLabel(ctx, d)
+				_, err := c.getDrugLabel(ctx, d)
+				if err != nil {
+					recordDegraded(d)
+				}
 			}(drugName)
 		}
 		wg.Wait()
@@ -312,15 +327,37 @@ func (c *OpenFDAChecker) CheckPrescriptionSafety(ctx context.Context, newMedicat
 			checkedPairs[pairKey] = true
 
 			// Check label of primary drug first
-			labelPrimary, _ := c.getDrugLabel(ctx, cleanPrimary)
+			labelPrimary, errPrimary := c.getDrugLabel(ctx, cleanPrimary)
+			if errPrimary != nil {
+				recordDegraded(cleanPrimary)
+			}
 			alertFound := c.scanLabelForInteraction(report, labelPrimary, primaryDrug, secondaryDrug, cleanSecondary)
 
 			// If no interaction found in primary drug label, check reciprocal (secondary drug label)
 			if !alertFound {
-				labelSecondary, _ := c.getDrugLabel(ctx, cleanSecondary)
+				labelSecondary, errSecondary := c.getDrugLabel(ctx, cleanSecondary)
+				if errSecondary != nil {
+				recordDegraded(cleanSecondary)
+				}
 				c.scanLabelForInteraction(report, labelSecondary, secondaryDrug, primaryDrug, cleanPrimary)
 			}
 		}
+	}
+
+	if len(degradedDrugs) > 0 {
+		report.ServiceDegraded = true
+		report.HasHighSeverityAlerts = true
+		report.DegradedReason = "OpenFDA drug interaction service is unreachable or rate limited; automated interaction screening is incomplete."
+		report.UncheckedDrugs = make([]string, 0, len(degradedDrugs))
+		for d := range degradedDrugs {
+			report.UncheckedDrugs = append(report.UncheckedDrugs, d)
+		}
+		report.InteractionAlerts = append(report.InteractionAlerts, InteractionAlert{
+			DrugA:       strings.Join(report.UncheckedDrugs, ", "),
+			Severity:    SeverityHigh,
+			Description: fmt.Sprintf("CRITICAL SAFETY WARNING: Automated interaction checks could not be completed for [%s] due to external clinical API unavailability. Clinician verification and explicit override are required prior to dispensing.", strings.Join(report.UncheckedDrugs, ", ")),
+			Source:      "Clinical Safety Guardrail (Service Degraded)",
+		})
 	}
 
 	return report, nil

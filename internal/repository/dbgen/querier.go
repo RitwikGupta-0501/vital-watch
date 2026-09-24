@@ -12,6 +12,12 @@ import (
 )
 
 type Querier interface {
+	CreateAdminProfile(ctx context.Context, arg CreateAdminProfileParams) error
+	CreateAdminUser(ctx context.Context, arg CreateAdminUserParams) (uuid.UUID, error)
+	GetAdminByEmail(ctx context.Context, email string) (GetAdminByEmailRow, error)
+	GetAdminByID(ctx context.Context, id uuid.UUID) (GetAdminByIDRow, error)
+	GetAllUsers(ctx context.Context, arg GetAllUsersParams) ([]GetAllUsersRow, error)
+	UpdateUserActiveStatus(ctx context.Context, arg UpdateUserActiveStatusParams) (int64, error)
 	CreateAppointment(ctx context.Context, arg CreateAppointmentParams) (uuid.UUID, error)
 	CreateAuditLog(ctx context.Context, arg CreateAuditLogParams) (PhiAuditLog, error)
 	CreateDigitalPrescription(ctx context.Context, arg CreateDigitalPrescriptionParams) (uuid.UUID, error)

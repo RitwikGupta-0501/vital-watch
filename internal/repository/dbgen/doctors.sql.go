@@ -55,12 +55,10 @@ func (q *Queries) CreateDoctorUser(ctx context.Context, arg CreateDoctorUserPara
 }
 
 const getDoctorByEmail = `-- name: GetDoctorByEmail :one
-SELECT u.id, u.email, COALESCE(d.first_name, 'Admin') AS first_name, COALESCE(d.last_name, 'User') AS last_name,
-       COALESCE(d.specialty, '') AS specialty, COALESCE(d.experience_years, 0) AS experience_years,
-       COALESCE(d.available, false) AS available, u.hashed_password, u.role, u.created_at
+SELECT u.id, u.email, d.first_name, d.last_name, d.specialty, d.experience_years, d.available, u.hashed_password, u.role, u.created_at
 FROM users u
-LEFT JOIN doctor_profiles d ON u.id = d.user_id
-WHERE u.email =  AND u.role IN ('doctor', 'admin') AND u.is_active = true
+JOIN doctor_profiles d ON u.id = d.user_id
+WHERE u.email = $1 AND u.role = 'doctor' AND u.is_active = true
 `
 
 type GetDoctorByEmailRow struct {

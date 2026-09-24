@@ -31,6 +31,7 @@ type MockRepository struct {
 	UpsertDoctorSchedulesTxFunc               func(ctx context.Context, doctorID uuid.UUID, schedules []models.DoctorSchedule) ([]models.DoctorSchedule, error)
 	DeleteDoctorScheduleByDayFunc             func(ctx context.Context, doctorID uuid.UUID, dayOfWeek int) error
 	UpdateAppointmentMeetingRoomFunc          func(ctx context.Context, apptID uuid.UUID, meetingLink, meetingID string) error
+	GetOrGenerateAppointmentMeetingRoomFunc   func(ctx context.Context, apptID uuid.UUID, generator func() (meetingLink string, meetingID string, err error)) (models.Appointment, error)
 	CreatePatientVitalFunc                    func(ctx context.Context, vital models.PatientVital) (uuid.UUID, error)
 	GetPatientVitalsFunc                      func(ctx context.Context, patientID uuid.UUID, startDate, endDate *time.Time, limit, offset int) ([]models.PatientVital, error)
 	GetLatestPatientVitalFunc                 func(ctx context.Context, patientID uuid.UUID) (models.PatientVital, error)
@@ -64,6 +65,11 @@ type MockRepository struct {
 	CreateAuditLogFunc              func(ctx context.Context, log models.PhiAuditLog) (uuid.UUID, error)
 	GetAuditLogsByPatientIDFunc     func(ctx context.Context, patientID uuid.UUID, limit, offset int) ([]models.PhiAuditLog, error)
 	GetAuditLogsFunc                func(ctx context.Context, limit, offset int) ([]models.PhiAuditLog, error)
+	CreateAdminFunc                 func(ctx context.Context, firstName, lastName, email, hashedPassword, department string) (uuid.UUID, error)
+	GetAdminByEmailFunc             func(ctx context.Context, email string) (models.Admin, error)
+	GetAdminByIDFunc                func(ctx context.Context, id uuid.UUID) (models.Admin, error)
+	GetAllUsersFunc                 func(ctx context.Context, limit, offset int) ([]models.User, error)
+	UpdateUserActiveStatusFunc      func(ctx context.Context, id uuid.UUID, isActive bool) error
 }
 
 func (m *MockRepository) CreatePatient(ctx context.Context, firstName, lastName, email, hashedPassword string) (uuid.UUID, error) {
@@ -375,6 +381,28 @@ func (m *MockRepository) UpdateAppointmentMeetingRoom(ctx context.Context, apptI
 	return nil
 }
 
+func (m *MockRepository) GetOrGenerateAppointmentMeetingRoom(ctx context.Context, apptID uuid.UUID, generator func() (meetingLink string, meetingID string, err error)) (models.Appointment, error) {
+	if m.GetOrGenerateAppointmentMeetingRoomFunc != nil {
+		return m.GetOrGenerateAppointmentMeetingRoomFunc(ctx, apptID, generator)
+	}
+	appt, err := m.GetAppointmentByID(ctx, apptID)
+	if err != nil {
+		return models.Appointment{}, err
+	}
+	if appt.MeetingLink == "" && generator != nil {
+		link, id, gErr := generator()
+		if gErr != nil {
+			return appt, gErr
+		}
+		appt.MeetingLink = link
+		appt.MeetingID = id
+		if m.UpdateAppointmentMeetingRoomFunc != nil {
+			_ = m.UpdateAppointmentMeetingRoomFunc(ctx, apptID, link, id)
+		}
+	}
+	return appt, nil
+}
+
 func (m *MockRepository) CreateRefreshToken(ctx context.Context, userID uuid.UUID, tokenHash string, expiresAt time.Time) (models.RefreshToken, error) {
 	if m.CreateRefreshTokenFunc != nil {
 		return m.CreateRefreshTokenFunc(ctx, userID, tokenHash, expiresAt)
@@ -445,5 +473,40 @@ func (m *MockRepository) GetAuditLogs(ctx context.Context, limit, offset int) ([
 		return m.GetAuditLogsFunc(ctx, limit, offset)
 	}
 	return []models.PhiAuditLog{}, nil
+}
+
+func (m *MockRepository) CreateAdmin(ctx context.Context, firstName, lastName, email, hashedPassword, department string) (uuid.UUID, error) {
+	if m.CreateAdminFunc != nil {
+		return m.CreateAdminFunc(ctx, firstName, lastName, email, hashedPassword, department)
+	}
+	return uuid.New(), nil
+}
+
+func (m *MockRepository) GetAdminByEmail(ctx context.Context, email string) (models.Admin, error) {
+	if m.GetAdminByEmailFunc != nil {
+		return m.GetAdminByEmailFunc(ctx, email)
+	}
+	return models.Admin{}, sql.ErrNoRows
+}
+
+func (m *MockRepository) GetAdminByID(ctx context.Context, id uuid.UUID) (models.Admin, error) {
+	if m.GetAdminByIDFunc != nil {
+		return m.GetAdminByIDFunc(ctx, id)
+	}
+	return models.Admin{}, sql.ErrNoRows
+}
+
+func (m *MockRepository) GetAllUsers(ctx context.Context, limit, offset int) ([]models.User, error) {
+	if m.GetAllUsersFunc != nil {
+		return m.GetAllUsersFunc(ctx, limit, offset)
+	}
+	return []models.User{}, nil
+}
+
+func (m *MockRepository) UpdateUserActiveStatus(ctx context.Context, id uuid.UUID, isActive bool) error {
+	if m.UpdateUserActiveStatusFunc != nil {
+		return m.UpdateUserActiveStatusFunc(ctx, id, isActive)
+	}
+	return nil
 }
 

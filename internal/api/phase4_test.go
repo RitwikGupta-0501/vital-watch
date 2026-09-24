@@ -2,6 +2,8 @@ package api
 
 import (
 	"bytes"
+	"strings"
+	"sync"
 	"context"
 	"encoding/json"
 	"errors"
@@ -980,5 +982,121 @@ func TestPhase4_ReviewFixes(t *testing.T) {
 	json.Unmarshal(wClamp.Body.Bytes(), &respClamp)
 	if respClamp.Limit != 100 {
 		t.Errorf("expected limit clamped to 100, got %d", respClamp.Limit)
+	}
+}
+
+func TestTelehealth_MeetingRoomMutualExclusion(t *testing.T) {
+	patientID := uuid.New()
+	doctorID := uuid.New()
+	apptID := uuid.New()
+
+	var mu sync.Mutex
+	savedLink := ""
+	savedID := ""
+
+	mockRepo := &repository.MockRepository{
+		GetAppointmentByIDFunc: func(ctx context.Context, id uuid.UUID) (models.Appointment, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			return models.Appointment{
+				ID:          apptID,
+				PatientID:   patientID,
+				DoctorID:    doctorID,
+				Type:        "virtual",
+				Status:      "upcoming",
+				MeetingLink: savedLink,
+				MeetingID:   savedID,
+			}, nil
+		},
+		GetOrGenerateAppointmentMeetingRoomFunc: func(ctx context.Context, id uuid.UUID, generator func() (string, string, error)) (models.Appointment, error) {
+			mu.Lock()
+			defer mu.Unlock()
+
+			appt := models.Appointment{
+				ID:          apptID,
+				PatientID:   patientID,
+				DoctorID:    doctorID,
+				Type:        "virtual",
+				Status:      "upcoming",
+				MeetingLink: savedLink,
+				MeetingID:   savedID,
+			}
+			if appt.MeetingLink == "" && generator != nil {
+				link, roomID, err := generator()
+				if err != nil {
+					return appt, err
+				}
+				savedLink = link
+				savedID = roomID
+				appt.MeetingLink = link
+				appt.MeetingID = roomID
+			}
+			return appt, nil
+		},
+	}
+
+	mockTelehealth := &telehealth.MockProvider{
+		CustomLink: "https://telehealth.vitalwatch.local/room-unique-session",
+		CustomID:   "room-unique-session",
+	}
+
+	h := &Handler{
+		Repo:       mockRepo,
+		Telehealth: mockTelehealth,
+	}
+
+	r := setupPhase4TestRouter(h)
+
+	const concurrency = 6
+	var wg sync.WaitGroup
+	links := make([]string, concurrency)
+	statusCodes := make([]int, concurrency)
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodGet, "/api/appointments/"+apptID.String()+"/meeting-room", nil)
+			if idx%2 == 0 {
+				req.Header.Set("X-User-ID", patientID.String())
+				req.Header.Set("X-Role", "patient")
+			} else {
+				req.Header.Set("X-User-ID", doctorID.String())
+				req.Header.Set("X-Role", "doctor")
+			}
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			statusCodes[idx] = w.Code
+
+			var resp struct {
+				MeetingID   string `json:"meeting_id"`
+				MeetingLink string `json:"meeting_link"`
+			}
+			_ = json.Unmarshal(w.Body.Bytes(), &resp)
+			links[idx] = resp.MeetingLink
+			if resp.MeetingID != "room-unique-session" {
+				t.Errorf("request %d received incorrect meeting ID: %q", idx, resp.MeetingID)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	for i := 0; i < concurrency; i++ {
+		if statusCodes[i] != http.StatusOK {
+			t.Errorf("request %d returned status %d", i, statusCodes[i])
+		}
+		if !strings.HasPrefix(links[i], "https://telehealth.vitalwatch.local/room-unique-session") {
+			t.Errorf("request %d received divergent meeting base link: %q", i, links[i])
+		}
+		if i%2 == 0 {
+			if !strings.Contains(links[i], "t=mock-patient-token") {
+				t.Errorf("patient request %d missing patient token parameter: %q", i, links[i])
+			}
+		} else {
+			if !strings.Contains(links[i], "t=mock-owner-token") {
+				t.Errorf("doctor request %d missing owner token parameter: %q", i, links[i])
+			}
+		}
 	}
 }

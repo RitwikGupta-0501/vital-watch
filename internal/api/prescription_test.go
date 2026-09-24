@@ -1444,10 +1444,27 @@ func TestUnifiedDownloadPrescription_DoctorAccess(t *testing.T) {
 }
 
 type mockSafetyChecker struct {
-	hasAlert bool
+	hasAlert   bool
+	isDegraded bool
 }
 
 func (m *mockSafetyChecker) CheckPrescriptionSafety(ctx context.Context, newMeds, activeMeds, allergies []string) (*safety.SafetyReport, error) {
+	if m.isDegraded {
+		return &safety.SafetyReport{
+			ServiceDegraded:       true,
+			HasHighSeverityAlerts: true,
+			DegradedReason:        "OpenFDA drug interaction service is unreachable or rate limited",
+			UncheckedDrugs:        newMeds,
+			InteractionAlerts: []safety.InteractionAlert{
+				{
+					DrugA:       "Atorvastatin",
+					Severity:    safety.SeverityHigh,
+					Description: "Automated checks unavailable",
+					Source:      "Clinical Safety Guardrail (Service Degraded)",
+				},
+			},
+		}, nil
+	}
 	if m.hasAlert {
 		return &safety.SafetyReport{
 			HasHighSeverityAlerts: true,
@@ -1510,6 +1527,107 @@ func TestCreateDigitalPrescription_SafetyAndPDF(t *testing.T) {
 
 		if w.Code != http.StatusConflict {
 			t.Fatalf("expected 409 Conflict, got %d: %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("Blocked when OpenFDA Service Degraded without Doctor Override", func(t *testing.T) {
+		mockRepo := &repository.MockRepository{
+			GetPatientByIDFunc: func(ctx context.Context, id uuid.UUID) (models.Patient, error) {
+				return models.Patient{ID: id, FirstName: "Jane", LastName: "Doe"}, nil
+			},
+			GetAppointmentsForPatientFunc: func(ctx context.Context, dID, pID uuid.UUID, limit, offset int) ([]models.Appointment, error) {
+				return []models.Appointment{{ID: uuid.New(), DoctorID: dID, PatientID: pID}}, nil
+			},
+			GetPrescriptionsByPatientIDFunc: func(ctx context.Context, pID uuid.UUID, limit, offset int) ([]models.Prescription, error) {
+				return []models.Prescription{}, nil
+			},
+		}
+
+		h := &Handler{
+			Repo:          mockRepo,
+			SafetyChecker: &mockSafetyChecker{isDegraded: true},
+		}
+
+		r := gin.New()
+		r.POST("/prescriptions/digital", func(c *gin.Context) {
+			c.Set("userID", doctorID)
+			c.Set("role", "doctor")
+			h.CreateDigitalPrescription(c)
+		})
+
+		body, _ := json.Marshal(CreateDigitalPrescriptionRequest{
+			PatientID: patientID,
+			Items: []PrescriptionItemInput{
+				{MedicationName: "Atorvastatin", Dosage: "20mg"},
+			},
+			OverrideSafety: false,
+		})
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodPost, "/prescriptions/digital", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusConflict {
+			t.Fatalf("expected 409 Conflict for degraded safety check, got %d: %s", w.Code, w.Body.String())
+		}
+
+		var resp map[string]interface{}
+		_ = json.Unmarshal(w.Body.Bytes(), &resp)
+		if resp["error"] != "Drug safety check service is degraded; automated interaction checks incomplete" {
+			t.Errorf("expected degraded service error message, got %v", resp["error"])
+		}
+	})
+
+	t.Run("Allowed when OpenFDA Service Degraded with Doctor Override", func(t *testing.T) {
+		var savedNotes string
+		mockRepo := &repository.MockRepository{
+			GetPatientByIDFunc: func(ctx context.Context, id uuid.UUID) (models.Patient, error) {
+				return models.Patient{ID: id, FirstName: "Jane", LastName: "Doe"}, nil
+			},
+			GetAppointmentsForPatientFunc: func(ctx context.Context, dID, pID uuid.UUID, limit, offset int) ([]models.Appointment, error) {
+				return []models.Appointment{{ID: uuid.New(), DoctorID: dID, PatientID: pID}}, nil
+			},
+			GetPrescriptionsByPatientIDFunc: func(ctx context.Context, pID uuid.UUID, limit, offset int) ([]models.Prescription, error) {
+				return []models.Prescription{}, nil
+			},
+			CreateDigitalPrescriptionFunc: func(ctx context.Context, pID, dID uuid.UUID, notes string, items []models.PrescriptionItem) (uuid.UUID, error) {
+				savedNotes = notes
+				return uuid.New(), nil
+			},
+		}
+
+		h := &Handler{
+			Repo:          mockRepo,
+			SafetyChecker: &mockSafetyChecker{isDegraded: true},
+		}
+
+		r := gin.New()
+		r.POST("/prescriptions/digital", func(c *gin.Context) {
+			c.Set("userID", doctorID)
+			c.Set("role", "doctor")
+			h.CreateDigitalPrescription(c)
+		})
+
+		body, _ := json.Marshal(CreateDigitalPrescriptionRequest{
+			PatientID: patientID,
+			Items: []PrescriptionItemInput{
+				{MedicationName: "Atorvastatin", Dosage: "20mg"},
+			},
+			OverrideSafety: true,
+			OverrideReason: "Confirmed no prior adverse reaction; clinical review completed",
+		})
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodPost, "/prescriptions/digital", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusCreated {
+			t.Fatalf("expected 201 Created with override, got %d: %s", w.Code, w.Body.String())
+		}
+		if !strings.Contains(savedNotes, "Confirmed no prior adverse reaction") {
+			t.Errorf("expected override reason in prescription notes, got %q", savedNotes)
 		}
 	})
 

@@ -141,6 +141,115 @@ func (r *DBRepository) GetPatientsByDoctorID(ctx context.Context, doctorID uuid.
 	return patients, nil
 }
 
+// Admin Related Methods
+func (r *DBRepository) CreateAdmin(ctx context.Context, firstName, lastName, email, hashedPassword, department string) (uuid.UUID, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	qtx := r.queries.WithTx(tx)
+
+	newID, err := qtx.CreateAdminUser(ctx, dbgen.CreateAdminUserParams{
+		Email:          email,
+		HashedPassword: hashedPassword,
+	})
+	if err != nil {
+		return uuid.Nil, err
+	}
+
+	if department == "" {
+		department = "Operations"
+	}
+
+	err = qtx.CreateAdminProfile(ctx, dbgen.CreateAdminProfileParams{
+		UserID:     newID,
+		FirstName:  firstName,
+		LastName:   lastName,
+		Department: department,
+	})
+	if err != nil {
+		return uuid.Nil, err
+	}
+
+	if err = tx.Commit(ctx); err != nil {
+		return uuid.Nil, err
+	}
+
+	return newID, nil
+}
+
+func (r *DBRepository) GetAdminByEmail(ctx context.Context, email string) (models.Admin, error) {
+	row, err := r.queries.GetAdminByEmail(ctx, email)
+	if err != nil {
+		return models.Admin{}, err
+	}
+	return models.Admin{
+		ID:             row.ID,
+		Email:          row.Email,
+		FirstName:      row.FirstName,
+		LastName:       row.LastName,
+		Department:     row.Department,
+		HashedPassword: row.HashedPassword,
+		Role:           row.Role,
+		CreatedAt:      row.CreatedAt.Time,
+	}, nil
+}
+
+func (r *DBRepository) GetAdminByID(ctx context.Context, id uuid.UUID) (models.Admin, error) {
+	row, err := r.queries.GetAdminByID(ctx, id)
+	if err != nil {
+		return models.Admin{}, err
+	}
+	return models.Admin{
+		ID:         row.ID,
+		Email:      row.Email,
+		FirstName:  row.FirstName,
+		LastName:   row.LastName,
+		Department: row.Department,
+		Role:       row.Role,
+		CreatedAt:  row.CreatedAt.Time,
+	}, nil
+}
+
+func (r *DBRepository) GetAllUsers(ctx context.Context, limit, offset int) ([]models.User, error) {
+	lim, off := clampPagination(limit, offset)
+	rows, err := r.queries.GetAllUsers(ctx, dbgen.GetAllUsersParams{
+		Limit:  int32(lim),
+		Offset: int32(off),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	users := make([]models.User, 0, len(rows))
+	for _, row := range rows {
+		users = append(users, models.User{
+			ID:        row.ID,
+			Email:     row.Email,
+			Role:      row.Role,
+			IsActive:  row.IsActive.Bool,
+			CreatedAt: row.CreatedAt.Time,
+		})
+	}
+	return users, nil
+}
+
+func (r *DBRepository) UpdateUserActiveStatus(ctx context.Context, id uuid.UUID, isActive bool) error {
+	rowsAffected, err := r.queries.UpdateUserActiveStatus(ctx, dbgen.UpdateUserActiveStatusParams{
+		ID:       id,
+		IsActive: pgtype.Bool{Bool: isActive, Valid: true},
+	})
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		return pgx.ErrNoRows
+	}
+	return nil
+}
+
 // Doctor Related Methods
 func (r *DBRepository) CreateDoctor(ctx context.Context, firstName, lastName, email, hashedPassword, specialty string, experience int) (uuid.UUID, error) {
 	tx, err := r.pool.Begin(ctx)
@@ -264,6 +373,78 @@ func (r *DBRepository) UpdateAppointmentMeetingRoom(ctx context.Context, apptID 
 		MeetingID:   pgtype.Text{String: meetingID, Valid: meetingID != ""},
 		ID:          apptID,
 	})
+}
+
+func (r *DBRepository) GetOrGenerateAppointmentMeetingRoom(ctx context.Context, apptID uuid.UUID, generator func() (meetingLink string, meetingID string, err error)) (models.Appointment, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return models.Appointment{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	const lockQuery = `
+		SELECT a.id, a.patient_id, a.doctor_id, a.start_time, a.end_time, a.status, a.appointment_type,
+		       a.meeting_link, a.meeting_id,
+		       COALESCE(dp.first_name || ' ' || dp.last_name, '') as doctor_name,
+		       COALESCE(dp.specialty, '') as doctor_specialty
+		FROM appointments a
+		LEFT JOIN doctor_profiles dp ON a.doctor_id = dp.user_id
+		WHERE a.id = $1
+		FOR UPDATE OF a`
+
+	var appt models.Appointment
+	var meetingLink, meetingID pgtype.Text
+	err = tx.QueryRow(ctx, lockQuery, apptID).Scan(
+		&appt.ID,
+		&appt.PatientID,
+		&appt.DoctorID,
+		&appt.StartTime,
+		&appt.EndTime,
+		&appt.Status,
+		&appt.Type,
+		&meetingLink,
+		&meetingID,
+		&appt.DoctorName,
+		&appt.DoctorSpecialty,
+	)
+	if err != nil {
+		return models.Appointment{}, err
+	}
+	appt.MeetingLink = meetingLink.String
+	appt.MeetingID = meetingID.String
+
+	// If already populated, return immediately
+	if appt.MeetingLink != "" {
+		_ = tx.Commit(ctx)
+		return appt, nil
+	}
+
+	if generator == nil {
+		_ = tx.Commit(ctx)
+		return appt, nil
+	}
+
+	newLink, newID, genErr := generator()
+	if genErr != nil {
+		return appt, genErr
+	}
+
+	if newLink != "" {
+		const updateQuery = `
+			UPDATE appointments
+			SET meeting_link = $1, meeting_id = $2
+			WHERE id = $3`
+		if _, err := tx.Exec(ctx, updateQuery, newLink, newID, apptID); err != nil {
+			return appt, err
+		}
+		appt.MeetingLink = newLink
+		appt.MeetingID = newID
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return models.Appointment{}, err
+	}
+	return appt, nil
 }
 
 func (r *DBRepository) GetAppointmentByID(ctx context.Context, id uuid.UUID) (models.Appointment, error) {
@@ -1512,7 +1693,7 @@ func (r *DBRepository) RotateRefreshToken(ctx context.Context, oldTokenID, userI
 			replacementID := uuid.UUID(old.replacedByTokenID.Bytes)
 			const fetchQuery = `
 				SELECT id, user_id, token_hash, expires_at, revoked_at, replaced_by_token_id, created_at
-				FROM refresh_tokens WHERE id = $1`
+				FROM refresh_tokens WHERE id = $1 FOR UPDATE`
 			newRow := tx.QueryRow(ctx, fetchQuery, replacementID)
 			var rep struct {
 				id                uuid.UUID
@@ -1525,15 +1706,51 @@ func (r *DBRepository) RotateRefreshToken(ctx context.Context, oldTokenID, userI
 			}
 			if scanErr := newRow.Scan(&rep.id, &rep.userID, &rep.tokenHash, &rep.expiresAt,
 				&rep.revokedAt, &rep.replacedByTokenID, &rep.createdAt); scanErr == nil {
+				// If the replacement token was ALREADY consumed/revoked, this is a replay of an ancestor token
+				if rep.revokedAt.Valid {
+					return models.RefreshToken{}, ErrTokenAlreadyRotated
+				}
+
+				// The replacement was never consumed! Create a new token for this retry and void the unconsumed replacement.
+				const insertRetryQuery = `
+					INSERT INTO refresh_tokens (user_id, token_hash, expires_at)
+					VALUES ($1, $2, $3)
+					RETURNING id, user_id, token_hash, expires_at, revoked_at, replaced_by_token_id, created_at`
+				var created struct {
+					id                uuid.UUID
+					userID            uuid.UUID
+					tokenHash         string
+					expiresAt         pgtype.Timestamptz
+					revokedAt         pgtype.Timestamptz
+					replacedByTokenID pgtype.UUID
+					createdAt         pgtype.Timestamptz
+				}
+				newPgExpiry := pgtype.Timestamptz{Time: expiresAt, Valid: true}
+				if err := tx.QueryRow(ctx, insertRetryQuery, userID, newHash, newPgExpiry).Scan(
+					&created.id, &created.userID, &created.tokenHash, &created.expiresAt,
+					&created.revokedAt, &created.replacedByTokenID, &created.createdAt,
+				); err != nil {
+					return models.RefreshToken{}, err
+				}
+
+				// Revoke the unconsumed replacement token and link it to the newly created token
+				const revokeRepQuery = `
+					UPDATE refresh_tokens
+					SET revoked_at = now(), replaced_by_token_id = $2
+					WHERE id = $1 AND revoked_at IS NULL`
+				if _, err := tx.Exec(ctx, revokeRepQuery, rep.id, pgtype.UUID{Bytes: created.id, Valid: true}); err != nil {
+					return models.RefreshToken{}, err
+				}
+
 				if commitErr := tx.Commit(ctx); commitErr != nil {
 					return models.RefreshToken{}, commitErr
 				}
-				return rawToRefreshToken(rep.id, rep.userID, rep.tokenHash,
-					rep.expiresAt, rep.revokedAt, rep.replacedByTokenID, rep.createdAt), nil
+				return rawToRefreshToken(created.id, created.userID, created.tokenHash,
+					created.expiresAt, created.revokedAt, created.replacedByTokenID, created.createdAt), nil
 			}
 			return models.RefreshToken{}, fmt.Errorf("replacement token not found for revoked token %s", oldTokenID)
 		}
-		return models.RefreshToken{}, fmt.Errorf("token %s already revoked", oldTokenID)
+		return models.RefreshToken{}, ErrTokenAlreadyRotated
 	}
 
 	// Create the new token.

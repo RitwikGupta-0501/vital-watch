@@ -140,6 +140,7 @@ func main() {
 	}
 	jwtSecret := []byte(jwtSecretStr)
 	doctorInviteCode := os.Getenv("DOCTOR_INVITE_CODE")
+	adminInviteCode := os.Getenv("ADMIN_INVITE_CODE")
 	if doctorInviteCode == "" {
 		log.Fatal("FATAL: DOCTOR_INVITE_CODE environment variable is not set")
 	}
@@ -243,6 +244,7 @@ func main() {
 		Storage:          storageProvider,
 		JWTSecret:        jwtSecret,
 		DoctorInviteCode: doctorInviteCode,
+		AdminInviteCode:  adminInviteCode,
 		OCREnabled:       ocrManager.IsEnabled(),
 		PDFGenerator:     pdfGen,
 		SafetyChecker:    safetyChecker,
@@ -401,7 +403,19 @@ func setupRouter(h *api.Handler, storageType string, jwtSecret []byte) *gin.Engi
 			doctorGroup.GET("/doctor/schedules", h.GetDoctorSchedules)
 			doctorGroup.DELETE("/doctor/schedules/:day", h.DeleteDoctorSchedule)
 		}
+
+		// Admin-only Routes
+		adminGroup := authGroup.Group("/admin")
+		adminGroup.Use(api.RequireRole("admin"))
+		{
+			adminGroup.GET("/users", h.ListUsers)
+			adminGroup.PATCH("/users/:id/status", h.ToggleUserStatus)
+			adminGroup.GET("/audit-logs", h.GetComplianceAuditLogs)
+		}
 	}
+
+	// Public Clinical Prescription Verification (scanned via QR code on prescription PDFs)
+	r.GET("/verify/rx/:id", h.GetPrescriptionByID)
 
 	// Local development file routes with cryptographic HMAC pre-signing
 	if storageType == "local" {

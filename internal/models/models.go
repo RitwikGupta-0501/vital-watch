@@ -78,7 +78,36 @@ func (d Doctor) GetHashedPassword() string {
 }
 
 func (d Doctor) GetRole() string {
+	if d.Role != "" {
+		return d.Role
+	}
 	return "doctor"
+}
+
+type Admin struct {
+	ID             uuid.UUID `json:"id"`
+	Email          string    `json:"email"`
+	FirstName      string    `json:"first_name"`
+	LastName       string    `json:"last_name"`
+	Department     string    `json:"department"`
+	HashedPassword string    `json:"-"`
+	Role           string    `json:"role"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
+func (a Admin) GetID() uuid.UUID {
+	return a.ID
+}
+
+func (a Admin) GetHashedPassword() string {
+	return a.HashedPassword
+}
+
+func (a Admin) GetRole() string {
+	if a.Role != "" {
+		return a.Role
+	}
+	return "admin"
 }
 
 type Appointment struct {

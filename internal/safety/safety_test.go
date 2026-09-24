@@ -124,7 +124,7 @@ func TestFailOpenOnFDAError(t *testing.T) {
 	checker := NewOpenFDAChecker()
 	checker.SetBaseURL(server.URL)
 
-	// Should not fail or crash, but return a report without blocking
+	// Should not fail or crash, but flag service degradation and high severity alert
 	report, err := checker.CheckPrescriptionSafety(
 		context.Background(),
 		[]string{"Lisinopril 10mg"},
@@ -136,6 +136,42 @@ func TestFailOpenOnFDAError(t *testing.T) {
 	}
 	if report == nil {
 		t.Fatalf("expected non-nil report")
+	}
+	if !report.ServiceDegraded {
+		t.Fatalf("expected ServiceDegraded to be true on FDA 503 error")
+	}
+	if !report.HasHighSeverityAlerts {
+		t.Fatalf("expected HasHighSeverityAlerts to be true to block unverified prescribing")
+	}
+	if len(report.UncheckedDrugs) == 0 {
+		t.Fatalf("expected UncheckedDrugs to be non-empty")
+	}
+}
+
+func TestOpenFDARateLimit_FlagsDegradation(t *testing.T) {
+	// Mock OpenFDA server failing with 429 Too Many Requests
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+
+	checker := NewOpenFDAChecker()
+	checker.SetBaseURL(server.URL)
+
+	report, err := checker.CheckPrescriptionSafety(
+		context.Background(),
+		[]string{"Atorvastatin 20mg"},
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("expected nil error on FDA 429, got %v", err)
+	}
+	if !report.ServiceDegraded {
+		t.Fatalf("expected ServiceDegraded to be true on FDA 429")
+	}
+	if !report.HasHighSeverityAlerts {
+		t.Fatalf("expected HasHighSeverityAlerts to be true on rate limit")
 	}
 }
 

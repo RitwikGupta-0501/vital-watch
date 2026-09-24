@@ -2,12 +2,16 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/RitwikGupta-0501/vital-watch/internal/models"
 )
+
+// ErrTokenAlreadyRotated is returned when a revoked token is replayed and its replacement has already been consumed.
+var ErrTokenAlreadyRotated = errors.New("token rotation replay detected: replacement token already consumed")
 
 // Repository defines all database operations needed by the application handlers
 type Repository interface {
@@ -29,6 +33,7 @@ type Repository interface {
 	GetDoctorAppointmentsInRange(ctx context.Context, doctorID uuid.UUID, startTime, endTime time.Time) ([]models.Appointment, error)
 	UpdateAppointmentAsCompletedForDoctor(ctx context.Context, appointmentID, doctorID uuid.UUID) (bool, error)
 	UpdateAppointmentMeetingRoom(ctx context.Context, apptID uuid.UUID, meetingLink, meetingID string) error
+	GetOrGenerateAppointmentMeetingRoom(ctx context.Context, apptID uuid.UUID, generator func() (meetingLink string, meetingID string, err error)) (models.Appointment, error)
 
 	// Phase 4: Doctor Working Schedules
 	UpsertDoctorSchedule(ctx context.Context, schedule models.DoctorSchedule) (models.DoctorSchedule, error)
@@ -76,4 +81,11 @@ type Repository interface {
 	CreateAuditLog(ctx context.Context, log models.PhiAuditLog) (uuid.UUID, error)
 	GetAuditLogsByPatientID(ctx context.Context, patientID uuid.UUID, limit, offset int) ([]models.PhiAuditLog, error)
 	GetAuditLogs(ctx context.Context, limit, offset int) ([]models.PhiAuditLog, error)
+
+	// Administration & System Governance
+	CreateAdmin(ctx context.Context, firstName, lastName, email, hashedPassword, department string) (uuid.UUID, error)
+	GetAdminByEmail(ctx context.Context, email string) (models.Admin, error)
+	GetAdminByID(ctx context.Context, id uuid.UUID) (models.Admin, error)
+	GetAllUsers(ctx context.Context, limit, offset int) ([]models.User, error)
+	UpdateUserActiveStatus(ctx context.Context, id uuid.UUID, isActive bool) error
 }

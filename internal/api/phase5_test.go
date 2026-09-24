@@ -417,6 +417,18 @@ func TestRefreshToken_GracePeriod(t *testing.T) {
 			}
 			return models.RefreshToken{}, sql.ErrNoRows
 		},
+		GetPatientByIDFunc: func(ctx context.Context, id uuid.UUID) (models.Patient, error) {
+			return models.Patient{ID: userID, Role: "patient"}, nil
+		},
+		RotateRefreshTokenFunc: func(ctx context.Context, oldID, uID uuid.UUID, newHash string, exp time.Time) (models.RefreshToken, error) {
+			// Simulate successful grace-window retry recovery (mobile reconnection)
+			return models.RefreshToken{
+				ID:        uuid.New(),
+				UserID:    uID,
+				TokenHash: newHash,
+				ExpiresAt: exp,
+			}, nil
+		},
 		RevokeAllUserRefreshTokensFunc: func(ctx context.Context, uID uuid.UUID) error {
 			allRevokedCalled = true
 			return nil
@@ -437,14 +449,31 @@ func TestRefreshToken_GracePeriod(t *testing.T) {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusConflict {
-		t.Errorf("expected 409 Conflict within grace window, got %d", w.Code)
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 OK within grace window for unconsumed replacement retry, got %d (body: %s)", w.Code, w.Body.String())
 	}
 	if allRevokedCalled {
-		t.Error("expected RevokeAllUserRefreshTokens NOT to be called within grace window")
+		t.Error("expected RevokeAllUserRefreshTokens NOT to be called on legitimate retry within grace window")
+	}
+
+	// Test replay detection within grace window (replacement token was ALREADY consumed)
+	mockRepo.RotateRefreshTokenFunc = func(ctx context.Context, oldID, uID uuid.UUID, newHash string, exp time.Time) (models.RefreshToken, error) {
+		return models.RefreshToken{}, repository.ErrTokenAlreadyRotated
+	}
+	reqReplay := httptest.NewRequest(http.MethodPost, "/api/auth/refresh", bytes.NewReader(body))
+	reqReplay.Header.Set("Content-Type", "application/json")
+	wReplay := httptest.NewRecorder()
+	r.ServeHTTP(wReplay, reqReplay)
+
+	if wReplay.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 Unauthorized for replayed consumed token, got %d", wReplay.Code)
+	}
+	if !allRevokedCalled {
+		t.Error("expected RevokeAllUserRefreshTokens to be called on replayed consumed token")
 	}
 
 	// Now test beyond grace window (e.g. 20s ago)
+	allRevokedCalled = false
 	revokedOld := time.Now().Add(-20 * time.Second)
 	mockRepo.GetRefreshTokenByHashFunc = func(ctx context.Context, hash string) (models.RefreshToken, error) {
 		return models.RefreshToken{
