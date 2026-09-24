@@ -15,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
+	"github.com/RitwikGupta-0501/vital-watch/internal/audit"
 	"github.com/RitwikGupta-0501/vital-watch/internal/models"
 	"github.com/RitwikGupta-0501/vital-watch/internal/repository"
 	"github.com/RitwikGupta-0501/vital-watch/internal/storage"
@@ -1098,5 +1099,194 @@ func TestTelehealth_MeetingRoomMutualExclusion(t *testing.T) {
 				t.Errorf("doctor request %d missing owner token parameter: %q", i, links[i])
 			}
 		}
+	}
+}
+
+func TestPatientCare_HardeningValidations(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	patientID := uuid.New()
+
+	h := &Handler{
+		Repo: &repository.MockRepository{
+			VerifyPrescriptionItemOwnershipFunc: func(ctx context.Context, itemID, pID uuid.UUID) (bool, error) {
+				return true, nil
+			},
+			GetActivePrescriptionItemsForPatientFunc: func(ctx context.Context, pID uuid.UUID, targetDate time.Time) ([]models.PrescriptionItem, error) {
+				return []models.PrescriptionItem{}, nil
+			},
+			GetMedicationLogsByDateFunc: func(ctx context.Context, pID uuid.UUID, targetDate time.Time) ([]models.MedicationLog, error) {
+				return []models.MedicationLog{}, nil
+			},
+		},
+	}
+
+	r := gin.New()
+	r.POST("/api/vitals", func(c *gin.Context) {
+		c.Set("userID", patientID)
+		c.Set("role", "patient")
+		h.CreatePatientVital(c)
+	})
+	r.POST("/api/adherence", func(c *gin.Context) {
+		c.Set("userID", patientID)
+		c.Set("role", "patient")
+		h.LogMedicationAdherence(c)
+	})
+	r.GET("/api/schedule", func(c *gin.Context) {
+		c.Set("userID", patientID)
+		c.Set("role", "patient")
+		h.GetPatientMedicationSchedule(c)
+	})
+
+	t.Run("CreatePatientVital Rejects Timestamps Older Than 5 Years", func(t *testing.T) {
+		oldTime := time.Now().AddDate(-6, 0, 0)
+		sbp := 120
+		body, _ := json.Marshal(VitalInput{
+			RecordedAt: &oldTime,
+			SystolicBP: &sbp,
+		})
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodPost, "/api/vitals", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 Bad Request for timestamp older than 5 years, got %d: %s", w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "older than 5 years") {
+			t.Errorf("expected error message to mention 5 years, got: %s", w.Body.String())
+		}
+	})
+
+	t.Run("LogMedicationAdherence Rejects Dose Number Exceeding 24", func(t *testing.T) {
+		body, _ := json.Marshal(MedicationLogInput{
+			PrescriptionItemID: uuid.New(),
+			ScheduledDate:      time.Now().Format("2006-01-02"),
+			TimeOfDay:          "morning",
+			Status:             "taken",
+			DoseNumber:         25,
+		})
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodPost, "/api/adherence", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 Bad Request for dose_number > 24, got %d: %s", w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "cannot exceed 24 doses") {
+			t.Errorf("expected error message to mention 24 doses, got: %s", w.Body.String())
+		}
+	})
+
+	t.Run("GetPatientMedicationSchedule Rejects Dates Outside Query Horizon", func(t *testing.T) {
+		// More than 2 years in the past
+		pastDate := time.Now().AddDate(-3, 0, 0).Format("2006-01-02")
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodGet, "/api/schedule?date="+pastDate, nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 Bad Request for date 3 years ago, got %d: %s", w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "within the past 2 years and next 1 year") {
+			t.Errorf("expected horizon guard error, got: %s", w.Body.String())
+		}
+
+		// More than 1 year in the future
+		futureDate := time.Now().AddDate(2, 0, 0).Format("2006-01-02")
+		w2 := httptest.NewRecorder()
+		req2, _ := http.NewRequest(http.MethodGet, "/api/schedule?date="+futureDate, nil)
+		r.ServeHTTP(w2, req2)
+
+		if w2.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 Bad Request for date 2 years in future, got %d: %s", w2.Code, w2.Body.String())
+		}
+	})
+}
+
+func TestPatientCare_HIPAAAuditLogging(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	doctorID := uuid.New()
+	patientID := uuid.New()
+
+	mockAuditor := audit.NewMockAuditor()
+	mockRepo := &repository.MockRepository{
+		GetDoctorsFunc: func(ctx context.Context, limit, offset int) ([]models.Doctor, error) {
+			return []models.Doctor{{ID: doctorID, Specialty: "Cardiology"}}, nil
+		},
+		GetPatientsByDoctorIDFunc: func(ctx context.Context, dID uuid.UUID, limit, offset int) ([]models.Patient, error) {
+			return []models.Patient{{ID: patientID, FirstName: "Jane", LastName: "Doe"}}, nil
+		},
+		GetAppointmentsForPatientFunc: func(ctx context.Context, dID, pID uuid.UUID, limit, offset int) ([]models.Appointment, error) {
+			return []models.Appointment{{ID: uuid.New(), DoctorID: dID, PatientID: pID}}, nil
+		},
+	}
+
+	h := &Handler{
+		Repo:    mockRepo,
+		Auditor: mockAuditor,
+	}
+
+	r := gin.New()
+	r.GET("/doctors", func(c *gin.Context) {
+		c.Set("userID", patientID)
+		c.Set("role", "patient")
+		h.GetDoctors(c)
+	})
+	r.GET("/doctor/patients", func(c *gin.Context) {
+		c.Set("userID", doctorID)
+		c.Set("role", "doctor")
+		h.GetDoctorPatients(c)
+	})
+	r.GET("/doctor/patients/:id/appointments", func(c *gin.Context) {
+		c.Set("userID", doctorID)
+		c.Set("role", "doctor")
+		h.GetPatientHistoryAppointments(c)
+	})
+
+	// 1. GetDoctors audit
+	w1 := httptest.NewRecorder()
+	req1, _ := http.NewRequest(http.MethodGet, "/doctors", nil)
+	r.ServeHTTP(w1, req1)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for GetDoctors, got %d", w1.Code)
+	}
+
+	// 2. GetDoctorPatients audit
+	w2 := httptest.NewRecorder()
+	req2, _ := http.NewRequest(http.MethodGet, "/doctor/patients", nil)
+	r.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for GetDoctorPatients, got %d", w2.Code)
+	}
+
+	// 3. GetPatientHistoryAppointments audit
+	w3 := httptest.NewRecorder()
+	req3, _ := http.NewRequest(http.MethodGet, "/doctor/patients/"+patientID.String()+"/appointments", nil)
+	r.ServeHTTP(w3, req3)
+	if w3.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for GetPatientHistoryAppointments, got %d", w3.Code)
+	}
+
+	entries := mockAuditor.GetEntries()
+	if len(entries) != 3 {
+		t.Fatalf("expected 3 audit log entries, got %d", len(entries))
+	}
+
+	actions := map[string]bool{}
+	for _, entry := range entries {
+		actions[entry.Action] = true
+	}
+
+	if !actions[audit.ActionViewDoctorProfile] {
+		t.Errorf("missing ActionViewDoctorProfile audit entry")
+	}
+	if !actions[audit.ActionViewPatientProfile] {
+		t.Errorf("missing ActionViewPatientProfile audit entry")
+	}
+	if !actions[audit.ActionViewAppointments] {
+		t.Errorf("missing ActionViewAppointments audit entry")
 	}
 }
