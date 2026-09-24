@@ -1733,12 +1733,21 @@ func (r *DBRepository) RotateRefreshToken(ctx context.Context, oldTokenID, userI
 					return models.RefreshToken{}, err
 				}
 
-				// Revoke the unconsumed replacement token and link it to the newly created token
-				const revokeRepQuery = `
+				// Void the abandoned replacement token with NULL replaced_by_token_id so it cannot be replayed
+				const voidRepQuery = `
 					UPDATE refresh_tokens
-					SET revoked_at = now(), replaced_by_token_id = $2
+					SET revoked_at = now(), replaced_by_token_id = NULL
 					WHERE id = $1 AND revoked_at IS NULL`
-				if _, err := tx.Exec(ctx, revokeRepQuery, rep.id, pgtype.UUID{Bytes: created.id, Valid: true}); err != nil {
+				if _, err := tx.Exec(ctx, voidRepQuery, rep.id); err != nil {
+					return models.RefreshToken{}, err
+				}
+
+				// Update old token lineage to point to the newly issued retry token
+				const updateOldQuery = `
+					UPDATE refresh_tokens
+					SET replaced_by_token_id = $2
+					WHERE id = $1`
+				if _, err := tx.Exec(ctx, updateOldQuery, oldTokenID, pgtype.UUID{Bytes: created.id, Valid: true}); err != nil {
 					return models.RefreshToken{}, err
 				}
 

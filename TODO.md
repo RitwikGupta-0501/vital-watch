@@ -214,7 +214,7 @@
   - *Goal*: Test password hashing, JWT claims validation, and RBAC middleware (`*_test.go`).
   - *File*: `utils/utils_test.go`, `internal/api/auth_test.go`
 
-- [ ] **TEST-02: Integration Test Suite**
+- [x] **TEST-02: Integration Test Suite**
   - *Goal*: End-to-end API testing with `dockertest` or ephemeral PostgreSQL test containers.
   - *File*: `tests/`
 
