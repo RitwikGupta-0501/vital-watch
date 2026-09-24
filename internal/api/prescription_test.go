@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -2134,5 +2135,188 @@ func TestVerifyPrescription_ApprovedNonExistent_Returns404Fast(t *testing.T) {
 	}
 	if verifyCalled {
 		t.Fatalf("VerifyPrescription should not have been called when prescription does not exist")
+	}
+}
+
+func TestGetPrescriptionByID_PublicQRVerification(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	doctorID := uuid.New()
+	patientID := uuid.New()
+	prescID := uuid.New()
+
+	t.Run("Public QR Verification - Approved Prescription", func(t *testing.T) {
+		mockRepo := &repository.MockRepository{
+			GetPrescriptionByIDFunc: func(ctx context.Context, id uuid.UUID) (models.Prescription, error) {
+				return models.Prescription{
+					ID:        prescID,
+					PatientID: patientID,
+					DoctorID:  doctorID,
+					Status:    "approved",
+					Items: []models.PrescriptionItem{
+						{MedicationName: "Amoxicillin", Dosage: "500mg"},
+					},
+					Notes: "Take after meals",
+				}, nil
+			},
+		}
+
+		h := &Handler{Repo: mockRepo}
+		r := gin.New()
+		// Public route without AuthMiddleware
+		r.GET("/verify/rx/:id", h.GetPrescriptionByID)
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodGet, "/verify/rx/"+prescID.String(), nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK for public approved verification, got %d: %s", w.Code, w.Body.String())
+		}
+
+		var resp map[string]interface{}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to decode response JSON: %v", err)
+		}
+		if resp["verified"] != true {
+			t.Errorf("expected verified == true, got %v", resp["verified"])
+		}
+		if resp["status"] != "approved" {
+			t.Errorf("expected status == approved, got %v", resp["status"])
+		}
+	})
+
+	t.Run("Public QR Verification - Unapproved Prescription (Needs Review)", func(t *testing.T) {
+		mockRepo := &repository.MockRepository{
+			GetPrescriptionByIDFunc: func(ctx context.Context, id uuid.UUID) (models.Prescription, error) {
+				return models.Prescription{
+					ID:        prescID,
+					PatientID: patientID,
+					DoctorID:  doctorID,
+					Status:    "needs_review",
+				}, nil
+			},
+		}
+
+		h := &Handler{Repo: mockRepo}
+		r := gin.New()
+		r.GET("/verify/rx/:id", h.GetPrescriptionByID)
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodGet, "/verify/rx/"+prescID.String(), nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("expected 404 Not Found for unapproved prescription in public mode, got %d", w.Code)
+		}
+	})
+
+	t.Run("Public QR Verification - Invalid UUID", func(t *testing.T) {
+		h := &Handler{}
+		r := gin.New()
+		r.GET("/verify/rx/:id", h.GetPrescriptionByID)
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodGet, "/verify/rx/invalid-uuid", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 Bad Request, got %d", w.Code)
+		}
+	})
+}
+
+func TestCreateDigitalPrescription_ItemBoundCeilings(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	doctorID := uuid.New()
+	patientID := uuid.New()
+
+	mockRepo := &repository.MockRepository{
+		GetPatientByIDFunc: func(ctx context.Context, id uuid.UUID) (models.Patient, error) {
+			return models.Patient{ID: id}, nil
+		},
+		HasDoctorPatientRelationshipFunc: func(ctx context.Context, dID, pID uuid.UUID) (bool, error) {
+			return true, nil
+		},
+	}
+
+	h := &Handler{Repo: mockRepo}
+	r := gin.New()
+	r.POST("/prescriptions/digital", func(c *gin.Context) {
+		c.Set("userID", doctorID)
+		c.Set("role", "doctor")
+		h.CreateDigitalPrescription(c)
+	})
+
+	t.Run("Reject Empty Items List", func(t *testing.T) {
+		body, _ := json.Marshal(CreateDigitalPrescriptionRequest{
+			PatientID: patientID,
+			Items:     []PrescriptionItemInput{},
+		})
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodPost, "/prescriptions/digital", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 Bad Request for 0 items, got %d: %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("Reject Items Exceeding 50 Count Ceiling", func(t *testing.T) {
+		tooManyItems := make([]PrescriptionItemInput, 51)
+		for i := 0; i < 51; i++ {
+			tooManyItems[i] = PrescriptionItemInput{
+				MedicationName: fmt.Sprintf("Medication-%d", i),
+				Dosage:         "10mg",
+			}
+		}
+
+		body, _ := json.Marshal(CreateDigitalPrescriptionRequest{
+			PatientID: patientID,
+			Items:     tooManyItems,
+		})
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodPost, "/prescriptions/digital", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 Bad Request for 51 items, got %d: %s", w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "more than 50 medication items") {
+			t.Errorf("expected error message to mention 50 items ceiling, got: %s", w.Body.String())
+		}
+	})
+}
+
+func TestDownloadPrescription_PathTraversalSanitization(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	patientID := uuid.New()
+
+	h := &Handler{}
+
+	traversalPayloads := []string{
+		"../../etc/passwd",
+		"..",
+		"sub/folder/file.pdf",
+		"../secret.txt",
+		"file..pdf",
+	}
+
+	for _, payload := range traversalPayloads {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodGet, "/download", nil)
+		c.Params = gin.Params{{Key: "filename", Value: payload}}
+		c.Set("userID", patientID)
+		c.Set("role", "patient")
+
+		h.DownloadPrescription(c)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("payload %q: expected 400 Bad Request, got %d", payload, w.Code)
+		}
 	}
 }
