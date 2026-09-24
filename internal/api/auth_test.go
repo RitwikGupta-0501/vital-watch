@@ -418,3 +418,31 @@ func TestLogoutAllDevices(t *testing.T) {
 		t.Fatalf("expected RevokeAllUserRefreshTokens to be called when all_devices is true")
 	}
 }
+
+func TestAuthMiddleware_EmptySecretPanics(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatalf("expected AuthMiddleware(nil) to panic, but it did not")
+		}
+		if r != "api: jwtSecret cannot be empty" {
+			t.Fatalf("unexpected panic message: %v", r)
+		}
+	}()
+
+	AuthMiddleware(nil)
+}
+
+func TestSSEAuthMiddleware_EmptySecretPanics(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatalf("expected SSEAuthMiddleware([]byte(\"\")) to panic, but it did not")
+		}
+		if r != "api: jwtSecret cannot be empty" {
+			t.Fatalf("unexpected panic message: %v", r)
+		}
+	}()
+
+	SSEAuthMiddleware([]byte(""))
+}

@@ -48,6 +48,9 @@ func SSEAuthMiddleware(jwtSecret []byte) gin.HandlerFunc {
 }
 
 func parseTokenMiddleware(jwtSecret []byte, allowQueryToken bool) gin.HandlerFunc {
+	if len(jwtSecret) == 0 {
+		panic("api: jwtSecret cannot be empty")
+	}
 	return func(c *gin.Context) {
 		authHeader := c.GetHeader("Authorization")
 		tokenString := ""

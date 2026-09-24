@@ -594,7 +594,8 @@ func TestRefreshToken_ConcurrentRace(t *testing.T) {
 					ExpiresAt: time.Now().Add(1 * time.Hour),
 				}
 				if isRevoked {
-					tok.RevokedAt = &revokedTime
+					rtCopy := revokedTime
+					tok.RevokedAt = &rtCopy
 				}
 				return tok, nil
 			}
