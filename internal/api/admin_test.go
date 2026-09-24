@@ -1,6 +1,8 @@
 package api
 
 import (
+	"github.com/RitwikGupta-0501/vital-watch/internal/audit"
+
 	"github.com/golang-jwt/jwt/v5"
 	"database/sql"
 	"bytes"
@@ -490,5 +492,157 @@ func TestRefreshToken_AdminRole(t *testing.T) {
 	claims := token.Claims.(jwt.MapClaims)
 	if claims["role"] != "admin" {
 		t.Errorf("expected role admin in refreshed access token, got %v", claims["role"])
+	}
+}
+
+
+func TestToggleUserStatus_SelfDeactivationPrevented(t *testing.T) {
+	adminID := uuid.New()
+	mockRepo := &repository.MockRepository{}
+
+	h := &Handler{
+		Repo: mockRepo,
+	}
+
+	r := gin.New()
+	r.PATCH("/api/admin/users/:id/status", func(c *gin.Context) {
+		c.Set("userID", adminID)
+		c.Set("role", "admin")
+		h.ToggleUserStatus(c)
+	})
+
+	bodyBytes, _ := json.Marshal(map[string]bool{"is_active": false})
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPatch, "/api/admin/users/"+adminID.String()+"/status", bytes.NewReader(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for self-deactivation, got %d. Body: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestToggleUserStatus_DeactivationRevokesAllSessions(t *testing.T) {
+	adminID := uuid.New()
+	targetUserID := uuid.New()
+	revokedSessions := false
+
+	mockRepo := &repository.MockRepository{
+		UpdateUserActiveStatusFunc: func(ctx context.Context, id uuid.UUID, isActive bool) error {
+			if id != targetUserID || isActive != false {
+				t.Errorf("unexpected status update: %s -> %v", id, isActive)
+			}
+			return nil
+		},
+		RevokeAllUserRefreshTokensFunc: func(ctx context.Context, userID uuid.UUID) error {
+			if userID == targetUserID {
+				revokedSessions = true
+			}
+			return nil
+		},
+	}
+
+	h := &Handler{
+		Repo: mockRepo,
+	}
+
+	r := gin.New()
+	r.PATCH("/api/admin/users/:id/status", func(c *gin.Context) {
+		c.Set("userID", adminID)
+		c.Set("role", "admin")
+		h.ToggleUserStatus(c)
+	})
+
+	bodyBytes, _ := json.Marshal(map[string]bool{"is_active": false})
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPatch, "/api/admin/users/"+targetUserID.String()+"/status", bytes.NewReader(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on user deactivation, got %d. Body: %s", w.Code, w.Body.String())
+	}
+	if !revokedSessions {
+		t.Fatalf("expected RevokeAllUserRefreshTokens to be called upon deactivating user")
+	}
+}
+
+func TestListUsers_AuditLogged(t *testing.T) {
+	adminID := uuid.New()
+	mockAuditor := audit.NewMockAuditor()
+
+	mockRepo := &repository.MockRepository{
+		GetAllUsersFunc: func(ctx context.Context, limit, offset int) ([]models.User, error) {
+			return []models.User{
+				{ID: uuid.New(), Email: "u1@hospital.org", Role: "patient", IsActive: true},
+			}, nil
+		},
+	}
+
+	h := &Handler{
+		Repo:    mockRepo,
+		Auditor: mockAuditor,
+	}
+
+	r := gin.New()
+	r.GET("/api/admin/users", func(c *gin.Context) {
+		c.Set("userID", adminID)
+		c.Set("role", "admin")
+		h.ListUsers(c)
+	})
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/admin/users", nil)
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", w.Code)
+	}
+
+	entries := mockAuditor.GetEntries()
+	found := false
+	for _, entry := range entries {
+		if entry.Action == audit.ActionViewUserDirectory {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected ActionViewUserDirectory in audit log, got: %+v", entries)
+	}
+}
+
+func TestGetComplianceAuditLogs_LimitCapped(t *testing.T) {
+	adminID := uuid.New()
+	capturedLimit := 0
+
+	mockRepo := &repository.MockRepository{
+		GetAuditLogsFunc: func(ctx context.Context, limit, offset int) ([]models.PhiAuditLog, error) {
+			capturedLimit = limit
+			return []models.PhiAuditLog{}, nil
+		},
+	}
+
+	h := &Handler{
+		Repo: mockRepo,
+	}
+
+	r := gin.New()
+	r.GET("/api/compliance/audit-logs", func(c *gin.Context) {
+		c.Set("userID", adminID)
+		c.Set("role", "admin")
+		h.GetComplianceAuditLogs(c)
+	})
+
+	// Query with limit=500 -> must be capped to 100
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/compliance/audit-logs?limit=500", nil)
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", w.Code)
+	}
+	if capturedLimit != 100 {
+		t.Fatalf("expected limit to be clamped to 100, got %d", capturedLimit)
 	}
 }
