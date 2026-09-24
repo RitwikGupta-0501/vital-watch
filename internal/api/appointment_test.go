@@ -1,6 +1,9 @@
 package api
 
 import (
+	"database/sql"
+	"github.com/RitwikGupta-0501/vital-watch/internal/models"
+
 	"bytes"
 	"context"
 	"encoding/json"
@@ -141,6 +144,28 @@ func TestCreateAppointment_InputValidation(t *testing.T) {
 			wantStatus: http.StatusBadRequest,
 			wantError:  "Doctor ID is required",
 		},
+		{
+			name: "Advance booking > 365 days rejected",
+			payload: map[string]interface{}{
+				"doctor_id":  doctorID.String(),
+				"start_time": now.Add(400 * 24 * time.Hour).Format(time.RFC3339),
+				"end_time":   now.Add(400*24*time.Hour + 30*time.Minute).Format(time.RFC3339),
+				"type":       "in_person",
+			},
+			wantStatus: http.StatusBadRequest,
+			wantError:  "Appointment cannot be booked more than 1 year in advance",
+		},
+		{
+			name: "Self-booking with own doctor ID rejected",
+			payload: map[string]interface{}{
+				"doctor_id":  patientID.String(),
+				"start_time": now.Add(2 * time.Hour).Format(time.RFC3339),
+				"end_time":   now.Add(2*time.Hour + 30*time.Minute).Format(time.RFC3339),
+				"type":       "in_person",
+			},
+			wantStatus: http.StatusBadRequest,
+			wantError:  "Cannot book an appointment with yourself",
+		},
 	}
 
 	for _, tt := range tests {
@@ -163,5 +188,119 @@ func TestCreateAppointment_InputValidation(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+
+func TestMarkAppointmentAsCompleted_Guards(t *testing.T) {
+	doctorID := uuid.New()
+	apptIDFuture := uuid.New()
+	apptIDPast := uuid.New()
+
+	mockRepo := &repository.MockRepository{
+		GetAppointmentByIDFunc: func(ctx context.Context, id uuid.UUID) (models.Appointment, error) {
+			if id == apptIDFuture {
+				return models.Appointment{
+					ID:        apptIDFuture,
+					DoctorID:  doctorID,
+					StartTime: time.Now().Add(2 * time.Hour),
+					EndTime:   time.Now().Add(3 * time.Hour),
+					Status:    "upcoming",
+				}, nil
+			}
+			if id == apptIDPast {
+				return models.Appointment{
+					ID:        apptIDPast,
+					DoctorID:  doctorID,
+					StartTime: time.Now().Add(-1 * time.Hour),
+					EndTime:   time.Now().Add(-30 * time.Minute),
+					Status:    "upcoming",
+				}, nil
+			}
+			return models.Appointment{}, sql.ErrNoRows
+		},
+		UpdateAppointmentAsCompletedForDoctorFunc: func(ctx context.Context, apptID, docID uuid.UUID) (bool, error) {
+			return apptID == apptIDPast && docID == doctorID, nil
+		},
+	}
+
+	h := &Handler{
+		Repo: mockRepo,
+	}
+
+	r := gin.New()
+	r.PATCH("/api/appointments/:id", func(c *gin.Context) {
+		c.Set("userID", doctorID)
+		c.Set("role", "doctor")
+		h.MarkAppointmentAsCompleted(c)
+	})
+
+	// 1. Completing future appointment rejected
+	w1 := httptest.NewRecorder()
+	req1, _ := http.NewRequest(http.MethodPatch, "/api/appointments/"+apptIDFuture.String(), nil)
+	r.ServeHTTP(w1, req1)
+	if w1.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for completing future appointment, got %d. Body: %s", w1.Code, w1.Body.String())
+	}
+
+	// 2. Completing appointment that has already started succeeds
+	w2 := httptest.NewRecorder()
+	req2, _ := http.NewRequest(http.MethodPatch, "/api/appointments/"+apptIDPast.String(), nil)
+	r.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for past appointment completion, got %d. Body: %s", w2.Code, w2.Body.String())
+	}
+}
+
+func TestGetAppointmentMeetingRoom_CompletedRejected(t *testing.T) {
+	patientID := uuid.New()
+	doctorID := uuid.New()
+	apptID := uuid.New()
+
+	mockRepo := &repository.MockRepository{
+		GetAppointmentByIDFunc: func(ctx context.Context, id uuid.UUID) (models.Appointment, error) {
+			return models.Appointment{
+				ID:          apptID,
+				PatientID:   patientID,
+				DoctorID:    doctorID,
+				Type:        "virtual",
+				MeetingLink: "https://telehealth.vitalwatch.local/room-test",
+				MeetingID:   "room-test",
+				Status:      "completed",
+			}, nil
+		},
+	}
+
+	h := &Handler{
+		Repo: mockRepo,
+	}
+
+	r := gin.New()
+	r.GET("/api/appointments/:id/meeting-room", func(c *gin.Context) {
+		c.Set("userID", patientID)
+		c.Set("role", "patient")
+		h.GetAppointmentMeetingRoom(c)
+	})
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/appointments/"+apptID.String()+"/meeting-room", nil)
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for completed appointment meeting room, got %d. Body: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestDoctorSchedule_WindowValidation(t *testing.T) {
+	in := ScheduleInput{
+		DayOfWeek:    1,
+		StartTime:    "09:00",
+		EndTime:      "09:15",
+		SlotDuration: 30, // 30 min duration > 15 min window
+	}
+
+	_, err := validateScheduleInput(in)
+	if err == nil {
+		t.Fatalf("expected error when working window is smaller than slot duration, got nil")
 	}
 }
