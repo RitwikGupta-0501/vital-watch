@@ -1,10 +1,13 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
@@ -20,6 +23,15 @@ import (
 	"github.com/RitwikGupta-0501/vital-watch/internal/telehealth"
 )
 
+type activeCacheEntry struct {
+	active    bool
+	checkedAt time.Time
+}
+
+type userActiveChecker interface {
+	IsUserActive(ctx context.Context, userID uuid.UUID, role string) bool
+}
+
 type Handler struct {
 	Repo             repository.Repository
 	Storage          storage.Provider
@@ -32,6 +44,48 @@ type Handler struct {
 	Notifier         notifications.Broker
 	Telehealth       telehealth.Provider
 	Auditor          audit.Auditor
+	activeUserCache  sync.Map // uuid.UUID -> activeCacheEntry
+}
+
+// InvalidateUserActiveCache clears the cached active status of a user upon administrative deactivation/reactivation.
+func (h *Handler) InvalidateUserActiveCache(userID uuid.UUID) {
+	h.activeUserCache.Delete(userID)
+}
+
+// IsUserActive determines whether an account is active, using a thread-safe 30s TTL in-memory cache
+// to prevent per-request database lookup overhead while guaranteeing fast lockout.
+func (h *Handler) IsUserActive(ctx context.Context, userID uuid.UUID, role string) bool {
+	if h == nil || h.Repo == nil {
+		return true
+	}
+
+	if val, ok := h.activeUserCache.Load(userID); ok {
+		entry := val.(activeCacheEntry)
+		if time.Since(entry.checkedAt) < 30*time.Second {
+			return entry.active
+		}
+	}
+
+	var active bool
+	switch role {
+	case "patient":
+		_, err := h.Repo.GetPatientByID(ctx, userID)
+		active = (err == nil)
+	case "doctor":
+		_, err := h.Repo.GetDoctorByID(ctx, userID)
+		active = (err == nil)
+	case "admin":
+		_, err := h.Repo.GetAdminByID(ctx, userID)
+		active = (err == nil)
+	default:
+		active = false
+	}
+
+	h.activeUserCache.Store(userID, activeCacheEntry{
+		active:    active,
+		checkedAt: time.Now(),
+	})
+	return active
 }
 
 func (h *Handler) Ping(c *gin.Context) {
@@ -39,15 +93,25 @@ func (h *Handler) Ping(c *gin.Context) {
 }
 
 func AuthMiddleware(jwtSecret []byte) gin.HandlerFunc {
-	return parseTokenMiddleware(jwtSecret, false)
+	return parseTokenMiddleware(jwtSecret, false, nil)
 }
 
 // SSEAuthMiddleware allows JWT authentication via Authorization header or ?token= query parameter, specifically for EventSource connections
 func SSEAuthMiddleware(jwtSecret []byte) gin.HandlerFunc {
-	return parseTokenMiddleware(jwtSecret, true)
+	return parseTokenMiddleware(jwtSecret, true, nil)
 }
 
-func parseTokenMiddleware(jwtSecret []byte, allowQueryToken bool) gin.HandlerFunc {
+// AuthMiddleware on Handler enforces JWT verification and immediate user active status verification
+func (h *Handler) AuthMiddleware() gin.HandlerFunc {
+	return parseTokenMiddleware(h.JWTSecret, false, h)
+}
+
+// SSEAuthMiddleware on Handler enforces query/header JWT verification and immediate user active status verification
+func (h *Handler) SSEAuthMiddleware() gin.HandlerFunc {
+	return parseTokenMiddleware(h.JWTSecret, true, h)
+}
+
+func parseTokenMiddleware(jwtSecret []byte, allowQueryToken bool, checker userActiveChecker) gin.HandlerFunc {
 	if len(jwtSecret) == 0 {
 		panic("api: jwtSecret cannot be empty")
 	}
@@ -73,11 +137,11 @@ func parseTokenMiddleware(jwtSecret []byte, allowQueryToken bool) gin.HandlerFun
 		}
 
 		token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			if token.Method.Alg() != jwt.SigningMethodHS256.Alg() {
 				return nil, jwt.ErrSignatureInvalid
 			}
 			return jwtSecret, nil
-		})
+		}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
 
 		if err != nil || !token.Valid {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
@@ -85,6 +149,12 @@ func parseTokenMiddleware(jwtSecret []byte, allowQueryToken bool) gin.HandlerFun
 		}
 
 		if claims, ok := token.Claims.(jwt.MapClaims); ok {
+			// Validate issuer if present
+			if iss, hasIss := claims["iss"].(string); hasIss && iss != "" && iss != "vital-watch" {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid token issuer"})
+				return
+			}
+
 			subStr, ok := claims["sub"].(string)
 			if !ok {
 				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid token claims (sub)"})
@@ -100,6 +170,12 @@ func parseTokenMiddleware(jwtSecret []byte, allowQueryToken bool) gin.HandlerFun
 			role, ok := claims["role"].(string)
 			if !ok {
 				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid token claims (role)"})
+				return
+			}
+
+			// Active account check: immediate rejection of soft-deactivated users
+			if checker != nil && !checker.IsUserActive(c.Request.Context(), userID, role) {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Account is inactive or deactivated"})
 				return
 			}
 

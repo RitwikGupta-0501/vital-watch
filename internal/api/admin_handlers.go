@@ -75,7 +75,8 @@ func (h *Handler) ToggleUserStatus(c *gin.Context) {
 		return
 	}
 
-	// Immediate Session Invalidation: Terminate all active sessions on deactivation
+	// Immediate Session Invalidation: Terminate all active sessions on deactivation and clear memory cache
+	h.InvalidateUserActiveCache(targetID)
 	if !req.IsActive {
 		if revokeErr := h.Repo.RevokeAllUserRefreshTokens(c.Request.Context(), targetID); revokeErr != nil {
 			slog.WarnContext(c.Request.Context(), "Failed to revoke tokens on account deactivation", "error", revokeErr, "target_user_id", targetID)

@@ -118,7 +118,7 @@ func TestAdminRegister_InvalidInviteCode(t *testing.T) {
 		"first_name":  "Intruder",
 		"last_name":   "User",
 		"email":       "intruder@evil.corp",
-		"password":    "Password123!",
+		"password":    "Tr0ub4dor&3",
 		"invite_code": "wrong-code",
 	}
 	bodyBytes, _ := json.Marshal(body)

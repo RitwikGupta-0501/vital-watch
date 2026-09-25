@@ -1,8 +1,9 @@
 package api
 
 import (
-	"database/sql"
 	"context"
+	"database/sql"
+	"fmt"
 	"github.com/RitwikGupta-0501/vital-watch/internal/models"
 	"github.com/RitwikGupta-0501/vital-watch/internal/repository"
 	"github.com/RitwikGupta-0501/vital-watch/utils"
@@ -445,4 +446,164 @@ func TestSSEAuthMiddleware_EmptySecretPanics(t *testing.T) {
 	}()
 
 	SSEAuthMiddleware([]byte(""))
+}
+
+func TestRegister_PasswordComplexityRejection(t *testing.T) {
+	mockRepo := &repository.MockRepository{
+		CreatePatientFunc: func(ctx context.Context, firstName, lastName, email, hashedPassword string) (uuid.UUID, error) {
+			return uuid.New(), nil
+		},
+	}
+	h := &Handler{Repo: mockRepo}
+
+	r := gin.New()
+	r.POST("/register", h.Register)
+
+	invalidPasswords := []struct {
+		name string
+		pass string
+	}{
+		{"Too short", "Ab1!"},
+		{"No upper", "weakpass123!"},
+		{"No lower", "WEAKPASS123!"},
+		{"No digits", "WeakPassword!"},
+		{"No special", "WeakPassword123"},
+		{"Common dictionary weak", "Password123!"},
+		{"Common admin weak", "Admin1234!"},
+	}
+
+	for _, tc := range invalidPasswords {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			body := strings.NewReader(fmt.Sprintf(`{"role":"patient","first_name":"Jane","last_name":"Doe","email":"jane%s@hospital.org","password":%q}`, uuid.New().String()[:6], tc.pass))
+			req, _ := http.NewRequest(http.MethodPost, "/register", body)
+			req.Header.Set("Content-Type", "application/json")
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 for password %q (%s), got %d: %s", tc.pass, tc.name, w.Code, w.Body.String())
+			}
+		})
+	}
+
+	// Valid strong password passes
+	wGood := httptest.NewRecorder()
+	bodyGood := strings.NewReader(`{"role":"patient","first_name":"Jane","last_name":"Doe","email":"jane.strong@hospital.org","password":"ValidSecure#Pass2026"}`)
+	reqGood, _ := http.NewRequest(http.MethodPost, "/register", bodyGood)
+	reqGood.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(wGood, reqGood)
+
+	if wGood.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created for compliant password, got %d: %s", wGood.Code, wGood.Body.String())
+	}
+}
+
+func TestAuthMiddleware_StrictAlgorithmAndIssuerValidation(t *testing.T) {
+	testSecret := []byte("test-secret-key-32-bytes-secure!")
+	userID := uuid.New()
+
+	r := gin.New()
+	r.Use(AuthMiddleware(testSecret))
+	r.GET("/protected", func(c *gin.Context) {
+		c.String(http.StatusOK, "ok")
+	})
+
+	// 1. Token with invalid issuer
+	claimsWrongIss := jwt.MapClaims{
+		"sub":  userID.String(),
+		"role": "doctor",
+		"iss":  "malicious-third-party",
+		"exp":  time.Now().Add(time.Hour).Unix(),
+	}
+	tokWrongIss := jwt.NewWithClaims(jwt.SigningMethodHS256, claimsWrongIss)
+	tokWrongIssStr, _ := tokWrongIss.SignedString(testSecret)
+
+	w1 := httptest.NewRecorder()
+	req1, _ := http.NewRequest(http.MethodGet, "/protected", nil)
+	req1.Header.Set("Authorization", "Bearer "+tokWrongIssStr)
+	r.ServeHTTP(w1, req1)
+	if w1.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for wrong issuer, got %d", w1.Code)
+	}
+
+	// 2. Token with algorithm "none"
+	tokenNone := jwt.NewWithClaims(jwt.SigningMethodNone, jwt.MapClaims{
+		"sub":  userID.String(),
+		"role": "doctor",
+		"iss":  "vital-watch",
+		"exp":  time.Now().Add(time.Hour).Unix(),
+	})
+	tokNoneStr, _ := tokenNone.SignedString(jwt.UnsafeAllowNoneSignatureType)
+
+	w2 := httptest.NewRecorder()
+	req2, _ := http.NewRequest(http.MethodGet, "/protected", nil)
+	req2.Header.Set("Authorization", "Bearer "+tokNoneStr)
+	r.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for alg:none attack, got %d", w2.Code)
+	}
+
+	// 3. Valid token with matching issuer and HS256
+	validTok := generateTestToken(testSecret, userID, "doctor", false)
+	w3 := httptest.NewRecorder()
+	req3, _ := http.NewRequest(http.MethodGet, "/protected", nil)
+	req3.Header.Set("Authorization", "Bearer "+validTok)
+	r.ServeHTTP(w3, req3)
+	if w3.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for valid token, got %d: %s", w3.Code, w3.Body.String())
+	}
+}
+
+func TestAuthMiddleware_DeactivatedUserRejected(t *testing.T) {
+	testSecret := []byte("test-secret-key-32-bytes-secure!")
+	userID := uuid.New()
+	isActive := true
+
+	mockRepo := &repository.MockRepository{
+		GetPatientByIDFunc: func(ctx context.Context, id uuid.UUID) (models.Patient, error) {
+			if id == userID && isActive {
+				return models.Patient{ID: userID, Role: "patient"}, nil
+			}
+			return models.Patient{}, sql.ErrNoRows
+		},
+	}
+
+	h := &Handler{
+		Repo:      mockRepo,
+		JWTSecret: testSecret,
+	}
+
+	r := gin.New()
+	r.Use(h.AuthMiddleware())
+	r.GET("/api/profile-test", func(c *gin.Context) {
+		c.String(http.StatusOK, "ok")
+	})
+
+	token := generateTestToken(testSecret, userID, "patient", false)
+
+	// 1. Initial request when user is active -> 200 OK
+	w1 := httptest.NewRecorder()
+	req1, _ := http.NewRequest(http.MethodGet, "/api/profile-test", nil)
+	req1.Header.Set("Authorization", "Bearer "+token)
+	r.ServeHTTP(w1, req1)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK while active, got %d", w1.Code)
+	}
+
+	// 2. Administrator deactivates user and invalidates cache
+	isActive = false
+	h.InvalidateUserActiveCache(userID)
+
+	// 3. Request with the EXACT SAME non-expired JWT is now immediately rejected!
+	w2 := httptest.NewRecorder()
+	req2, _ := http.NewRequest(http.MethodGet, "/api/profile-test", nil)
+	req2.Header.Set("Authorization", "Bearer "+token)
+	r.ServeHTTP(w2, req2)
+
+	if w2.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized for deactivated user, got %d: %s", w2.Code, w2.Body.String())
+	}
+	if !strings.Contains(w2.Body.String(), "inactive or deactivated") {
+		t.Errorf("expected error message to mention deactivated account, got %s", w2.Body.String())
+	}
 }

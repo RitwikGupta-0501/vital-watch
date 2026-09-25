@@ -31,10 +31,11 @@ const (
 	ActionViewDoctorProfile        = "VIEW_DOCTOR_PROFILE"
 	ActionViewAdminProfile         = "VIEW_ADMIN_PROFILE"
 	// Authentication & Security Audit Events (HIPAA § 164.312(b))
-	ActionUserRegister    = "USER_REGISTER"
-	ActionUserLogin       = "USER_LOGIN"
-	ActionUserLogout      = "USER_LOGOUT"
-	ActionTokenReuseAlert = "TOKEN_REUSE_SECURITY_ALERT"
+	ActionUserRegister        = "USER_REGISTER"
+	ActionUserLogin           = "USER_LOGIN"
+	ActionUserLogout          = "USER_LOGOUT"
+	ActionTokenReuseAlert     = "TOKEN_REUSE_SECURITY_ALERT"
+	ActionRateLimitExceeded   = "RATE_LIMIT_EXCEEDED"
 	// Administration & Governance Audit Events (HIPAA § 164.312(a)(2)(i))
 	ActionViewUserDirectory = "VIEW_USER_DIRECTORY"
 	ActionToggleUserStatus  = "TOGGLE_USER_STATUS"

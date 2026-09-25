@@ -102,12 +102,8 @@ func (h *Handler) Register(c *gin.Context) {
 	}
 	req.Email = strings.ToLower(parsedAddr.Address)
 
-	if len(req.Password) < 8 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Password must be at least 8 characters long"})
-		return
-	}
-	if len(req.Password) > 72 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Password cannot exceed 72 bytes"})
+	if err := utils.ValidatePassword(req.Password); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 

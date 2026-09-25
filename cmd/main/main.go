@@ -138,11 +138,23 @@ func main() {
 	if jwtSecretStr == "" {
 		log.Fatal("FATAL: JWT_SECRET environment variable is not set")
 	}
+	if len(jwtSecretStr) < 32 {
+		log.Fatal("FATAL: JWT_SECRET must contain at least 32 bytes (256 bits) of entropy")
+	}
 	jwtSecret := []byte(jwtSecretStr)
 	doctorInviteCode := os.Getenv("DOCTOR_INVITE_CODE")
 	adminInviteCode := os.Getenv("ADMIN_INVITE_CODE")
 	if doctorInviteCode == "" {
 		log.Fatal("FATAL: DOCTOR_INVITE_CODE environment variable is not set")
+	}
+	if len(doctorInviteCode) < 12 {
+		log.Fatal("FATAL: DOCTOR_INVITE_CODE must contain at least 12 characters of entropy")
+	}
+	if adminInviteCode == "" {
+		log.Fatal("FATAL: ADMIN_INVITE_CODE environment variable is not set")
+	}
+	if len(adminInviteCode) < 12 {
+		log.Fatal("FATAL: ADMIN_INVITE_CODE must contain at least 12 characters of entropy")
 	}
 
 	// Initialize DB Pool
@@ -313,9 +325,19 @@ func main() {
 
 // setupRouter builds and configures the Gin engine and route tree
 func setupRouter(h *api.Handler, storageType string, jwtSecret []byte) *gin.Engine {
+	if len(h.JWTSecret) == 0 && len(jwtSecret) > 0 {
+		h.JWTSecret = jwtSecret
+	}
+
 	r := gin.New()
 	r.Use(gin.Recovery())
 	r.Use(middleware.RequestIDMiddleware())
+	r.Use(middleware.SecurityHeadersMiddleware())
+
+	// Rate Limiting: 120 req/min general, 10 req/min for authentication endpoints
+	generalLimiter := middleware.NewRateLimiter(120, time.Minute, h.Auditor)
+	authLimiter := middleware.NewRateLimiter(10, time.Minute, h.Auditor)
+	r.Use(generalLimiter.Middleware())
 
 	// Configure CORS
 	corsOrigins := os.Getenv("CORS_ALLOWED_ORIGINS")
@@ -346,17 +368,18 @@ func setupRouter(h *api.Handler, storageType string, jwtSecret []byte) *gin.Engi
 	// -       Routes        -
 	// -----------------------
 	r.GET("/api/ping", h.Ping)
-	r.POST("/api/register", h.Register)
-	r.POST("/api/login", h.Login)
-	r.POST("/api/auth/refresh", h.RefreshToken)
+	r.POST("/api/register", authLimiter.Middleware(), h.Register)
+	r.POST("/api/login", authLimiter.Middleware(), h.Login)
+	r.POST("/api/auth/refresh", authLimiter.Middleware(), h.RefreshToken)
 	r.POST("/api/auth/logout", h.Logout)
 
 	// Real-Time Notification SSE Stream (Supports EventSource query token and Bearer header)
-	r.GET("/api/notifications/stream", api.SSEAuthMiddleware(jwtSecret), h.StreamNotifications)
+	r.GET("/api/notifications/stream", h.SSEAuthMiddleware(), h.StreamNotifications)
 
 	// --- Protected Routes (Strict Bearer Header Authentication) ---
 	authGroup := r.Group("/api")
-	authGroup.Use(api.AuthMiddleware(jwtSecret))
+	authGroup.Use(middleware.SensitiveCacheControlMiddleware())
+	authGroup.Use(h.AuthMiddleware())
 	{
 		// Common Profile & Prescription Routes (Accessible to Patients & Authorized Doctors)
 		authGroup.GET("/profile", h.GetUserProfile)
