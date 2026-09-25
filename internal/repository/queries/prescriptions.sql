@@ -4,8 +4,8 @@ VALUES ($1, $2, 'uploaded', $3, $4, $5)
 RETURNING id;
 
 -- name: CreateDigitalPrescription :one
-INSERT INTO prescriptions (patient_id, doctor_id, source, status, notes)
-VALUES ($1, $2, 'digital', 'approved', $3)
+INSERT INTO prescriptions (patient_id, doctor_id, source, status, notes, expires_at)
+VALUES ($1, $2, 'digital', 'approved', $3, $4)
 RETURNING id;
 
 -- name: InsertPrescriptionItem :one
@@ -47,7 +47,7 @@ UPDATE prescriptions p
 SET status = $2,
     notes = CASE
         WHEN $3 IS NOT NULL THEN $3
-        WHEN $2 = 'approved' THEN TRIM(regexp_replace(COALESCE(notes, ''), E'\s*\[(OCR|Storage)[^\]]+\]', '', 'g'))
+        WHEN $2 = 'approved' THEN TRIM(regexp_replace(COALESCE(notes, ''), E'\\s*\\[(OCR|Storage)[^\\]]+\\]', '', 'g'))
         ELSE notes
     END,
     updated_at = now()
@@ -77,7 +77,7 @@ WHERE p.status = 'needs_review'
       WHERE a.patient_id = p.patient_id AND a.doctor_id = $1 AND a.status != 'cancelled'
     )
   )
-ORDER BY p.created_at DESC
+ORDER BY p.created_at DESC, p.id DESC
 LIMIT $2 OFFSET $3;
 
 -- name: GetPrescriptionsByPatientID :many
@@ -86,7 +86,7 @@ FROM prescriptions p
 JOIN doctor_profiles d ON p.doctor_id = d.user_id
 WHERE p.patient_id = $1
   AND p.status = 'approved'
-ORDER BY p.created_at DESC
+ORDER BY p.created_at DESC, p.id DESC
 LIMIT $2 OFFSET $3;
 
 -- name: GetPrescriptionByFilename :one
@@ -106,14 +106,20 @@ WHERE p.patient_id = $1
       SELECT 1 FROM appointments a WHERE a.patient_id = $1 AND a.doctor_id = $2 AND a.status != 'cancelled'
     )
   )
-ORDER BY p.created_at DESC
+ORDER BY p.created_at DESC, p.id DESC
 LIMIT $3 OFFSET $4;
 
 -- name: GetPrescriptionByFilenameForDoctor :one
 SELECT p.id, p.status, p.patient_id
 FROM prescriptions p
-LEFT JOIN appointments a ON p.patient_id = a.patient_id AND a.doctor_id = $2 AND a.status != 'cancelled'
-WHERE p.file_name = $1 AND (p.doctor_id = $2 OR (a.doctor_id = $2 AND a.status != 'cancelled'))
+WHERE p.file_name = $1
+  AND (
+    p.doctor_id = $2
+    OR EXISTS (
+      SELECT 1 FROM appointments a
+      WHERE a.patient_id = p.patient_id AND a.doctor_id = $2 AND a.status != 'cancelled'
+    )
+  )
 LIMIT 1;
 
 -- name: GetPrescriptionByID :one
@@ -125,3 +131,14 @@ FROM prescriptions p
 JOIN doctor_profiles d ON p.doctor_id = d.user_id
 JOIN patient_profiles pat ON p.patient_id = pat.user_id
 WHERE p.id = $1;
+
+-- name: UpdatePrescriptionExpiry :exec
+UPDATE prescriptions
+SET expires_at = $1, updated_at = now()
+WHERE id = $2;
+
+-- name: UpdatePrescriptionFileName :exec
+UPDATE prescriptions
+SET file_name = $1, updated_at = now()
+WHERE id = $2;
+

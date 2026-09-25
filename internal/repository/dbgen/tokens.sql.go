@@ -60,6 +60,33 @@ func (q *Queries) GetRefreshTokenByHash(ctx context.Context, tokenHash string) (
 	return i, err
 }
 
+const lockRefreshTokenForRotation = `-- name: LockRefreshTokenForRotation :one
+SELECT id, user_id, token_hash, expires_at, revoked_at, replaced_by_token_id, created_at
+FROM refresh_tokens
+WHERE id = $1 AND user_id = $2
+FOR UPDATE
+`
+
+type LockRefreshTokenForRotationParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+func (q *Queries) LockRefreshTokenForRotation(ctx context.Context, arg LockRefreshTokenForRotationParams) (RefreshToken, error) {
+	row := q.db.QueryRow(ctx, lockRefreshTokenForRotation, arg.ID, arg.UserID)
+	var i RefreshToken
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.TokenHash,
+		&i.ExpiresAt,
+		&i.RevokedAt,
+		&i.ReplacedByTokenID,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const revokeAllUserRefreshTokens = `-- name: RevokeAllUserRefreshTokens :exec
 UPDATE refresh_tokens
 SET revoked_at = now()

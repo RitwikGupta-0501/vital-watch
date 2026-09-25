@@ -72,7 +72,7 @@ const getAuditLogs = `-- name: GetAuditLogs :many
 SELECT id, user_id, user_role, action, resource_type, resource_id, patient_id, 
     ip_address, user_agent, request_id, status_code, metadata, created_at
 FROM phi_audit_logs
-ORDER BY created_at DESC
+ORDER BY created_at DESC, id DESC
 LIMIT $1 OFFSET $2
 `
 
@@ -120,7 +120,7 @@ SELECT id, user_id, user_role, action, resource_type, resource_id, patient_id,
     ip_address, user_agent, request_id, status_code, metadata, created_at
 FROM phi_audit_logs
 WHERE patient_id = $1
-ORDER BY created_at DESC
+ORDER BY created_at DESC, id DESC
 LIMIT $2 OFFSET $3
 `
 

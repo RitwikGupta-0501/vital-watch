@@ -12,16 +12,17 @@ SELECT
     v.id, v.patient_id, v.recorded_by, v.recorded_at, v.systolic_bp, v.diastolic_bp, v.heart_rate, 
     v.blood_glucose, v.oxygen_saturation, v.temperature, v.weight_kg, v.notes, v.created_at,
     u.role AS recorder_role,
-    COALESCE(dp.first_name, pp.first_name, '') AS recorder_first_name,
-    COALESCE(dp.last_name, pp.last_name, '') AS recorder_last_name
+    COALESCE(dp.first_name, pp.first_name, ap.first_name, '') AS recorder_first_name,
+    COALESCE(dp.last_name, pp.last_name, ap.last_name, '') AS recorder_last_name
 FROM patient_vitals v
 JOIN users u ON v.recorded_by = u.id
 LEFT JOIN doctor_profiles dp ON u.id = dp.user_id
 LEFT JOIN patient_profiles pp ON u.id = pp.user_id
+LEFT JOIN admin_profiles ap ON u.id = ap.user_id
 WHERE v.patient_id = $1
   AND (sqlc.narg('start_date')::timestamptz IS NULL OR v.recorded_at >= sqlc.narg('start_date'))
   AND (sqlc.narg('end_date')::timestamptz IS NULL OR v.recorded_at <= sqlc.narg('end_date'))
-ORDER BY v.recorded_at DESC
+ORDER BY v.recorded_at DESC, v.id DESC
 LIMIT $2 OFFSET $3;
 
 -- name: GetLatestPatientVital :one
@@ -29,12 +30,14 @@ SELECT
     v.id, v.patient_id, v.recorded_by, v.recorded_at, v.systolic_bp, v.diastolic_bp, v.heart_rate, 
     v.blood_glucose, v.oxygen_saturation, v.temperature, v.weight_kg, v.notes, v.created_at,
     u.role AS recorder_role,
-    COALESCE(dp.first_name, pp.first_name, '') AS recorder_first_name,
-    COALESCE(dp.last_name, pp.last_name, '') AS recorder_last_name
+    COALESCE(dp.first_name, pp.first_name, ap.first_name, '') AS recorder_first_name,
+    COALESCE(dp.last_name, pp.last_name, ap.last_name, '') AS recorder_last_name
 FROM patient_vitals v
 JOIN users u ON v.recorded_by = u.id
 LEFT JOIN doctor_profiles dp ON u.id = dp.user_id
 LEFT JOIN patient_profiles pp ON u.id = pp.user_id
+LEFT JOIN admin_profiles ap ON u.id = ap.user_id
 WHERE v.patient_id = $1
-ORDER BY v.recorded_at DESC
+ORDER BY v.recorded_at DESC, v.id DESC
 LIMIT 1;
+

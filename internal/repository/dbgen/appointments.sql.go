@@ -24,7 +24,7 @@ type CreateAppointmentParams struct {
 	DoctorID        uuid.UUID          `json:"doctor_id"`
 	StartTime       pgtype.Timestamptz `json:"start_time"`
 	EndTime         pgtype.Timestamptz `json:"end_time"`
-	AppointmentType pgtype.Text        `json:"appointment_type"`
+	AppointmentType string             `json:"appointment_type"`
 	MeetingLink     pgtype.Text        `json:"meeting_link"`
 	MeetingID       pgtype.Text        `json:"meeting_id"`
 }
@@ -63,8 +63,8 @@ type GetAppointmentByIDRow struct {
 	DoctorID         uuid.UUID          `json:"doctor_id"`
 	StartTime        pgtype.Timestamptz `json:"start_time"`
 	EndTime          pgtype.Timestamptz `json:"end_time"`
-	Status           pgtype.Text        `json:"status"`
-	AppointmentType  pgtype.Text        `json:"appointment_type"`
+	Status           string             `json:"status"`
+	AppointmentType  string             `json:"appointment_type"`
 	MeetingLink      pgtype.Text        `json:"meeting_link"`
 	MeetingID        pgtype.Text        `json:"meeting_id"`
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
@@ -106,7 +106,7 @@ SELECT
 FROM appointments a
 JOIN patient_profiles p ON a.patient_id = p.user_id
 WHERE a.doctor_id = $1
-ORDER BY a.start_time DESC
+ORDER BY a.start_time DESC, a.id DESC
 LIMIT $2 OFFSET $3
 `
 
@@ -122,8 +122,8 @@ type GetAppointmentsByDoctorIDRow struct {
 	DoctorID        uuid.UUID          `json:"doctor_id"`
 	StartTime       pgtype.Timestamptz `json:"start_time"`
 	EndTime         pgtype.Timestamptz `json:"end_time"`
-	Status          pgtype.Text        `json:"status"`
-	AppointmentType pgtype.Text        `json:"appointment_type"`
+	Status          string             `json:"status"`
+	AppointmentType string             `json:"appointment_type"`
 	MeetingLink     pgtype.Text        `json:"meeting_link"`
 	MeetingID       pgtype.Text        `json:"meeting_id"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
@@ -172,7 +172,7 @@ SELECT
 FROM appointments a
 JOIN doctor_profiles d ON a.doctor_id = d.user_id
 WHERE a.patient_id = $1
-ORDER BY a.start_time DESC
+ORDER BY a.start_time DESC, a.id DESC
 LIMIT $2 OFFSET $3
 `
 
@@ -188,8 +188,8 @@ type GetAppointmentsByPatientIDRow struct {
 	DoctorID        uuid.UUID          `json:"doctor_id"`
 	StartTime       pgtype.Timestamptz `json:"start_time"`
 	EndTime         pgtype.Timestamptz `json:"end_time"`
-	Status          pgtype.Text        `json:"status"`
-	AppointmentType pgtype.Text        `json:"appointment_type"`
+	Status          string             `json:"status"`
+	AppointmentType string             `json:"appointment_type"`
 	MeetingLink     pgtype.Text        `json:"meeting_link"`
 	MeetingID       pgtype.Text        `json:"meeting_id"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
@@ -240,7 +240,7 @@ SELECT
 FROM appointments a
 JOIN doctor_profiles d ON a.doctor_id = d.user_id
 WHERE a.patient_id = $1 AND a.doctor_id = $2
-ORDER BY a.start_time DESC
+ORDER BY a.start_time DESC, a.id DESC
 LIMIT $3 OFFSET $4
 `
 
@@ -257,8 +257,8 @@ type GetAppointmentsForPatientRow struct {
 	DoctorID        uuid.UUID          `json:"doctor_id"`
 	StartTime       pgtype.Timestamptz `json:"start_time"`
 	EndTime         pgtype.Timestamptz `json:"end_time"`
-	Status          pgtype.Text        `json:"status"`
-	AppointmentType pgtype.Text        `json:"appointment_type"`
+	Status          string             `json:"status"`
+	AppointmentType string             `json:"appointment_type"`
 	MeetingLink     pgtype.Text        `json:"meeting_link"`
 	MeetingID       pgtype.Text        `json:"meeting_id"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
@@ -313,7 +313,7 @@ WHERE a.doctor_id = $1
   AND a.status != 'cancelled'
   AND a.start_time < $2::timestamptz 
   AND a.end_time > $3::timestamptz
-ORDER BY a.start_time ASC
+ORDER BY a.start_time ASC, a.id ASC
 `
 
 type GetDoctorAppointmentsInRangeParams struct {
@@ -327,7 +327,7 @@ type GetDoctorAppointmentsInRangeRow struct {
 	DoctorID  uuid.UUID          `json:"doctor_id"`
 	StartTime pgtype.Timestamptz `json:"start_time"`
 	EndTime   pgtype.Timestamptz `json:"end_time"`
-	Status    pgtype.Text        `json:"status"`
+	Status    string             `json:"status"`
 }
 
 func (q *Queries) GetDoctorAppointmentsInRange(ctx context.Context, arg GetDoctorAppointmentsInRangeParams) ([]GetDoctorAppointmentsInRangeRow, error) {
@@ -358,8 +358,8 @@ func (q *Queries) GetDoctorAppointmentsInRange(ctx context.Context, arg GetDocto
 
 const updateAppointmentAsCompletedForDoctor = `-- name: UpdateAppointmentAsCompletedForDoctor :execrows
 UPDATE appointments 
-SET status = 'completed' 
-WHERE id = $1 AND doctor_id = $2
+SET status = 'completed', updated_at = now()
+WHERE id = $1 AND doctor_id = $2 AND status = 'upcoming'
 `
 
 type UpdateAppointmentAsCompletedForDoctorParams struct {
@@ -377,7 +377,7 @@ func (q *Queries) UpdateAppointmentAsCompletedForDoctor(ctx context.Context, arg
 
 const updateAppointmentMeetingRoom = `-- name: UpdateAppointmentMeetingRoom :exec
 UPDATE appointments 
-SET meeting_link = $1, meeting_id = $2
+SET meeting_link = $1, meeting_id = $2, updated_at = now()
 WHERE id = $3 AND (meeting_link IS NULL OR meeting_link = '')
 `
 

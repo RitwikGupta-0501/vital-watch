@@ -13,19 +13,25 @@ import (
 )
 
 const createDigitalPrescription = `-- name: CreateDigitalPrescription :one
-INSERT INTO prescriptions (patient_id, doctor_id, source, status, notes)
-VALUES ($1, $2, 'digital', 'approved', $3)
+INSERT INTO prescriptions (patient_id, doctor_id, source, status, notes, expires_at)
+VALUES ($1, $2, 'digital', 'approved', $3, $4)
 RETURNING id
 `
 
 type CreateDigitalPrescriptionParams struct {
-	PatientID uuid.UUID   `json:"patient_id"`
-	DoctorID  uuid.UUID   `json:"doctor_id"`
-	Notes     pgtype.Text `json:"notes"`
+	PatientID uuid.UUID          `json:"patient_id"`
+	DoctorID  uuid.UUID          `json:"doctor_id"`
+	Notes     pgtype.Text        `json:"notes"`
+	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
 }
 
 func (q *Queries) CreateDigitalPrescription(ctx context.Context, arg CreateDigitalPrescriptionParams) (uuid.UUID, error) {
-	row := q.db.QueryRow(ctx, createDigitalPrescription, arg.PatientID, arg.DoctorID, arg.Notes)
+	row := q.db.QueryRow(ctx, createDigitalPrescription,
+		arg.PatientID,
+		arg.DoctorID,
+		arg.Notes,
+		arg.ExpiresAt,
+	)
 	var id uuid.UUID
 	err := row.Scan(&id)
 	return id, err
@@ -92,8 +98,14 @@ func (q *Queries) GetPrescriptionByFilename(ctx context.Context, arg GetPrescrip
 const getPrescriptionByFilenameForDoctor = `-- name: GetPrescriptionByFilenameForDoctor :one
 SELECT p.id, p.status, p.patient_id
 FROM prescriptions p
-LEFT JOIN appointments a ON p.patient_id = a.patient_id AND a.doctor_id = $2 AND a.status != 'cancelled'
-WHERE p.file_name = $1 AND (p.doctor_id = $2 OR (a.doctor_id = $2 AND a.status != 'cancelled'))
+WHERE p.file_name = $1
+  AND (
+    p.doctor_id = $2
+    OR EXISTS (
+      SELECT 1 FROM appointments a
+      WHERE a.patient_id = p.patient_id AND a.doctor_id = $2 AND a.status != 'cancelled'
+    )
+  )
 LIMIT 1
 `
 
@@ -245,7 +257,7 @@ FROM prescriptions p
 JOIN doctor_profiles d ON p.doctor_id = d.user_id
 WHERE p.patient_id = $1
   AND p.status = 'approved'
-ORDER BY p.created_at DESC
+ORDER BY p.created_at DESC, p.id DESC
 LIMIT $2 OFFSET $3
 `
 
@@ -317,7 +329,7 @@ WHERE p.patient_id = $1
       SELECT 1 FROM appointments a WHERE a.patient_id = $1 AND a.doctor_id = $2 AND a.status != 'cancelled'
     )
   )
-ORDER BY p.created_at DESC
+ORDER BY p.created_at DESC, p.id DESC
 LIMIT $3 OFFSET $4
 `
 
@@ -399,7 +411,7 @@ WHERE p.status = 'needs_review'
       WHERE a.patient_id = p.patient_id AND a.doctor_id = $1 AND a.status != 'cancelled'
     )
   )
-ORDER BY p.created_at DESC
+ORDER BY p.created_at DESC, p.id DESC
 LIMIT $2 OFFSET $3
 `
 
@@ -502,6 +514,38 @@ func (q *Queries) InsertPrescriptionItem(ctx context.Context, arg InsertPrescrip
 	return i, err
 }
 
+const updatePrescriptionExpiry = `-- name: UpdatePrescriptionExpiry :exec
+UPDATE prescriptions
+SET expires_at = $1, updated_at = now()
+WHERE id = $2
+`
+
+type UpdatePrescriptionExpiryParams struct {
+	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
+	ID        uuid.UUID          `json:"id"`
+}
+
+func (q *Queries) UpdatePrescriptionExpiry(ctx context.Context, arg UpdatePrescriptionExpiryParams) error {
+	_, err := q.db.Exec(ctx, updatePrescriptionExpiry, arg.ExpiresAt, arg.ID)
+	return err
+}
+
+const updatePrescriptionFileName = `-- name: UpdatePrescriptionFileName :exec
+UPDATE prescriptions
+SET file_name = $1, updated_at = now()
+WHERE id = $2
+`
+
+type UpdatePrescriptionFileNameParams struct {
+	FileName pgtype.Text `json:"file_name"`
+	ID       uuid.UUID   `json:"id"`
+}
+
+func (q *Queries) UpdatePrescriptionFileName(ctx context.Context, arg UpdatePrescriptionFileNameParams) error {
+	_, err := q.db.Exec(ctx, updatePrescriptionFileName, arg.FileName, arg.ID)
+	return err
+}
+
 const updatePrescriptionOCRStatus = `-- name: UpdatePrescriptionOCRStatus :execrows
 UPDATE prescriptions
 SET status = $2,
@@ -541,7 +585,7 @@ UPDATE prescriptions p
 SET status = $2,
     notes = CASE
         WHEN $3 IS NOT NULL THEN $3
-        WHEN $2 = 'approved' THEN TRIM(regexp_replace(COALESCE(notes, ''), E'\s*\[(OCR|Storage)[^\]]+\]', '', 'g'))
+        WHEN $2 = 'approved' THEN TRIM(regexp_replace(COALESCE(notes, ''), E'\\s*\\[(OCR|Storage)[^\\]]+\\]', '', 'g'))
         ELSE notes
     END,
     updated_at = now()

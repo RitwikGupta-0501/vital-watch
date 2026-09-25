@@ -14,10 +14,6 @@ import (
 type Querier interface {
 	CreateAdminProfile(ctx context.Context, arg CreateAdminProfileParams) error
 	CreateAdminUser(ctx context.Context, arg CreateAdminUserParams) (uuid.UUID, error)
-	GetAdminByEmail(ctx context.Context, email string) (GetAdminByEmailRow, error)
-	GetAdminByID(ctx context.Context, id uuid.UUID) (GetAdminByIDRow, error)
-	GetAllUsers(ctx context.Context, arg GetAllUsersParams) ([]GetAllUsersRow, error)
-	UpdateUserActiveStatus(ctx context.Context, arg UpdateUserActiveStatusParams) (int64, error)
 	CreateAppointment(ctx context.Context, arg CreateAppointmentParams) (uuid.UUID, error)
 	CreateAuditLog(ctx context.Context, arg CreateAuditLogParams) (PhiAuditLog, error)
 	CreateDigitalPrescription(ctx context.Context, arg CreateDigitalPrescriptionParams) (uuid.UUID, error)
@@ -31,6 +27,9 @@ type Querier interface {
 	DeleteDoctorScheduleByDay(ctx context.Context, arg DeleteDoctorScheduleByDayParams) error
 	DeletePrescriptionItems(ctx context.Context, prescriptionID uuid.UUID) error
 	GetActivePrescriptionItemsForPatient(ctx context.Context, arg GetActivePrescriptionItemsForPatientParams) ([]PrescriptionItem, error)
+	GetAdminByEmail(ctx context.Context, email string) (GetAdminByEmailRow, error)
+	GetAdminByID(ctx context.Context, id uuid.UUID) (GetAdminByIDRow, error)
+	GetAllUsers(ctx context.Context, arg GetAllUsersParams) ([]GetAllUsersRow, error)
 	GetAppointmentByID(ctx context.Context, id uuid.UUID) (GetAppointmentByIDRow, error)
 	GetAppointmentsByDoctorID(ctx context.Context, arg GetAppointmentsByDoctorIDParams) ([]GetAppointmentsByDoctorIDRow, error)
 	GetAppointmentsByPatientID(ctx context.Context, arg GetAppointmentsByPatientIDParams) ([]GetAppointmentsByPatientIDRow, error)
@@ -60,11 +59,15 @@ type Querier interface {
 	GetRefreshTokenByHash(ctx context.Context, tokenHash string) (RefreshToken, error)
 	HasDoctorPatientRelationship(ctx context.Context, arg HasDoctorPatientRelationshipParams) (pgtype.Bool, error)
 	InsertPrescriptionItem(ctx context.Context, arg InsertPrescriptionItemParams) (PrescriptionItem, error)
+	LockRefreshTokenForRotation(ctx context.Context, arg LockRefreshTokenForRotationParams) (RefreshToken, error)
 	RevokeAllUserRefreshTokens(ctx context.Context, userID uuid.UUID) error
 	RevokeRefreshToken(ctx context.Context, arg RevokeRefreshTokenParams) error
 	UpdateAppointmentAsCompletedForDoctor(ctx context.Context, arg UpdateAppointmentAsCompletedForDoctorParams) (int64, error)
 	UpdateAppointmentMeetingRoom(ctx context.Context, arg UpdateAppointmentMeetingRoomParams) error
+	UpdatePrescriptionExpiry(ctx context.Context, arg UpdatePrescriptionExpiryParams) error
+	UpdatePrescriptionFileName(ctx context.Context, arg UpdatePrescriptionFileNameParams) error
 	UpdatePrescriptionOCRStatus(ctx context.Context, arg UpdatePrescriptionOCRStatusParams) (int64, error)
+	UpdateUserActiveStatus(ctx context.Context, arg UpdateUserActiveStatusParams) (int64, error)
 	UpsertDoctorSchedule(ctx context.Context, arg UpsertDoctorScheduleParams) (DoctorSchedule, error)
 	UpsertMedicationLog(ctx context.Context, arg UpsertMedicationLogParams) (PatientMedicationLog, error)
 	VerifyPrescription(ctx context.Context, arg VerifyPrescriptionParams) (int64, error)

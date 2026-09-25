@@ -9,17 +9,27 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type AdminProfile struct {
+	UserID     uuid.UUID          `json:"user_id"`
+	FirstName  string             `json:"first_name"`
+	LastName   string             `json:"last_name"`
+	Department pgtype.Text        `json:"department"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt  pgtype.Timestamptz `json:"updated_at"`
+}
+
 type Appointment struct {
 	ID              uuid.UUID          `json:"id"`
 	DoctorID        uuid.UUID          `json:"doctor_id"`
 	PatientID       uuid.UUID          `json:"patient_id"`
 	StartTime       pgtype.Timestamptz `json:"start_time"`
 	EndTime         pgtype.Timestamptz `json:"end_time"`
-	Status          pgtype.Text        `json:"status"`
-	AppointmentType pgtype.Text        `json:"appointment_type"`
+	Status          string             `json:"status"`
+	AppointmentType string             `json:"appointment_type"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 	MeetingLink     pgtype.Text        `json:"meeting_link"`
 	MeetingID       pgtype.Text        `json:"meeting_id"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
 }
 
 type DoctorProfile struct {
@@ -138,7 +148,7 @@ type User struct {
 	Email          string             `json:"email"`
 	HashedPassword string             `json:"hashed_password"`
 	Role           string             `json:"role"`
-	IsActive       pgtype.Bool        `json:"is_active"`
+	IsActive       bool               `json:"is_active"`
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
 }

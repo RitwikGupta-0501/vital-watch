@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/RitwikGupta-0501/vital-watch/internal/models"
 	"github.com/RitwikGupta-0501/vital-watch/internal/repository"
@@ -312,4 +314,367 @@ func TestLiveDB_AuditLogImmutabilityTrigger(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected PostgreSQL trigger to block DELETE on phi_audit_logs, but it succeeded")
 	}
+}
+
+func TestLiveDB_GiSTDoubleBookingExclusion(t *testing.T) {
+	pool, repo, teardown := SetupTestDB(t)
+	if pool == nil {
+		return
+	}
+	defer teardown()
+
+	ctx := context.Background()
+	hashedPassword, _ := utils.HashPassword("TestPass123!")
+
+	dID, err := repo.CreateDoctor(ctx, "Gregory", "House", fmt.Sprintf("house-%s@vw.org", uuid.New().String()[:8]), hashedPassword, "Diagnostics", 15)
+	if err != nil {
+		t.Fatalf("failed to create doctor: %v", err)
+	}
+
+	p1ID, err := repo.CreatePatient(ctx, "Patient", "One", fmt.Sprintf("p1-%s@vw.org", uuid.New().String()[:8]), hashedPassword)
+	if err != nil {
+		t.Fatalf("failed to create patient 1: %v", err)
+	}
+
+	p2ID, err := repo.CreatePatient(ctx, "Patient", "Two", fmt.Sprintf("p2-%s@vw.org", uuid.New().String()[:8]), hashedPassword)
+	if err != nil {
+		t.Fatalf("failed to create patient 2: %v", err)
+	}
+
+	baseTime := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
+	slot1Start := baseTime
+	slot1End := baseTime.Add(30 * time.Minute)
+
+	// 1. First appointment for doctor in 09:00 - 09:30 -> succeeds
+	appt1ID, err := repo.CreateAppointment(ctx, uuid.New(), p1ID, dID, slot1Start, slot1End, "in_person", "", "")
+	if err != nil {
+		t.Fatalf("failed to create appointment 1: %v", err)
+	}
+
+	// 2. Overlapping appointment for same doctor in 09:15 - 09:45 -> MUST fail with 23P01 (ExclusionViolation)
+	slotOverlapStart := baseTime.Add(15 * time.Minute)
+	slotOverlapEnd := baseTime.Add(45 * time.Minute)
+	_, err = repo.CreateAppointment(ctx, uuid.New(), p2ID, dID, slotOverlapStart, slotOverlapEnd, "in_person", "", "")
+	if err == nil {
+		t.Fatalf("expected GiST exclusion error for overlapping appointment, but succeeded")
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != pgerrcode.ExclusionViolation {
+		t.Fatalf("expected PostgreSQL exclusion violation error (23P01), got: %v", err)
+	}
+
+	// 3. Contiguous/adjacent appointment in 09:30 - 10:00 -> MUST succeed (boundary touching is not overlapping in tstzrange)
+	slotAdjacentStart := slot1End
+	slotAdjacentEnd := slot1End.Add(30 * time.Minute)
+	_, err = repo.CreateAppointment(ctx, uuid.New(), p2ID, dID, slotAdjacentStart, slotAdjacentEnd, "in_person", "", "")
+	if err != nil {
+		t.Fatalf("expected adjacent appointment to succeed, got: %v", err)
+	}
+
+	// 4. Cancel slot 1: GiST exclusion constraint specifies WHERE (status != 'cancelled')
+	_, err = pool.Exec(ctx, "UPDATE appointments SET status = 'cancelled' WHERE id = $1", appt1ID)
+	if err != nil {
+		t.Fatalf("failed to cancel appointment 1: %v", err)
+	}
+
+	// 5. Booking new appointment in the exact same slot (09:00 - 09:30) for doctor now succeeds!
+	_, err = repo.CreateAppointment(ctx, uuid.New(), p2ID, dID, slot1Start, slot1End, "in_person", "", "")
+	if err != nil {
+		t.Fatalf("expected booking previously cancelled slot to succeed, got: %v", err)
+	}
+}
+
+func TestLiveDB_VitalsConstraintValidation(t *testing.T) {
+	pool, repo, teardown := SetupTestDB(t)
+	if pool == nil {
+		return
+	}
+	defer teardown()
+
+	ctx := context.Background()
+	hashedPassword, _ := utils.HashPassword("TestPass123!")
+
+	dID, err := repo.CreateDoctor(ctx, "Lisa", "Cuddy", fmt.Sprintf("cuddy-%s@vw.org", uuid.New().String()[:8]), hashedPassword, "Endocrinology", 12)
+	if err != nil {
+		t.Fatalf("failed to create doctor: %v", err)
+	}
+
+	pID, err := repo.CreatePatient(ctx, "John", "Doe", fmt.Sprintf("p-vitals-%s@vw.org", uuid.New().String()[:8]), hashedPassword)
+	if err != nil {
+		t.Fatalf("failed to create patient: %v", err)
+	}
+
+	intPtr := func(i int) *int { return &i }
+	floatPtr := func(f float64) *float64 { return &f }
+
+	// 1. Systolic <= Diastolic check constraint violation
+	_, err = repo.CreatePatientVital(ctx, models.PatientVital{
+		PatientID:   pID,
+		RecordedBy:  dID,
+		SystolicBP:  intPtr(80),
+		DiastolicBP: intPtr(120),
+	})
+	if err == nil {
+		t.Fatalf("expected check violation for systolic <= diastolic, got nil")
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != pgerrcode.CheckViolation {
+		t.Fatalf("expected CheckViolation (23514), got: %v", err)
+	}
+
+	// 2. Heart rate out of range (< 30)
+	_, err = repo.CreatePatientVital(ctx, models.PatientVital{
+		PatientID:  pID,
+		RecordedBy: dID,
+		HeartRate:  intPtr(20),
+	})
+	if err == nil || !errors.As(err, &pgErr) || pgErr.Code != pgerrcode.CheckViolation {
+		t.Fatalf("expected CheckViolation for heart_rate < 30, got: %v", err)
+	}
+
+	// 3. SpO2 out of range (> 100.0)
+	_, err = repo.CreatePatientVital(ctx, models.PatientVital{
+		PatientID:        pID,
+		RecordedBy:       dID,
+		OxygenSaturation: floatPtr(105.0),
+	})
+	if err == nil || !errors.As(err, &pgErr) || pgErr.Code != pgerrcode.CheckViolation {
+		t.Fatalf("expected CheckViolation for oxygen_saturation > 100.0, got: %v", err)
+	}
+
+	// 4. Temperature out of range (< 30.0)
+	_, err = repo.CreatePatientVital(ctx, models.PatientVital{
+		PatientID:   pID,
+		RecordedBy:  dID,
+		Temperature: floatPtr(25.0),
+	})
+	if err == nil || !errors.As(err, &pgErr) || pgErr.Code != pgerrcode.CheckViolation {
+		t.Fatalf("expected CheckViolation for temperature < 30.0, got: %v", err)
+	}
+
+	// 5. Valid vitals insertion succeeds
+	vitalID, err := repo.CreatePatientVital(ctx, models.PatientVital{
+		PatientID:        pID,
+		RecordedBy:       dID,
+		SystolicBP:       intPtr(120),
+		DiastolicBP:      intPtr(80),
+		HeartRate:        intPtr(72),
+		OxygenSaturation: floatPtr(98.5),
+		Temperature:      floatPtr(36.6),
+		WeightKg:         floatPtr(70.5),
+		Notes:            "Healthy checkup baseline",
+	})
+	if err != nil {
+		t.Fatalf("expected valid vitals to be recorded successfully, got: %v", err)
+	}
+	if vitalID == uuid.Nil {
+		t.Fatalf("expected non-nil vitalID")
+	}
+}
+
+func TestLiveDB_ClinicalCascadeRestriction(t *testing.T) {
+	pool, repo, teardown := SetupTestDB(t)
+	if pool == nil {
+		return
+	}
+	defer teardown()
+
+	ctx := context.Background()
+	hashedPassword, _ := utils.HashPassword("TestPass123!")
+
+	dID, err := repo.CreateDoctor(ctx, "Robert", "Chase", fmt.Sprintf("chase-%s@vw.org", uuid.New().String()[:8]), hashedPassword, "Surgery", 8)
+	if err != nil {
+		t.Fatalf("failed to create doctor: %v", err)
+	}
+
+	pID, err := repo.CreatePatient(ctx, "Allison", "Cameron", fmt.Sprintf("cameron-%s@vw.org", uuid.New().String()[:8]), hashedPassword)
+	if err != nil {
+		t.Fatalf("failed to create patient: %v", err)
+	}
+
+	// Record clinical vitals
+	intPtr := func(i int) *int { return &i }
+	_, err = repo.CreatePatientVital(ctx, models.PatientVital{
+		PatientID:   pID,
+		RecordedBy:  dID,
+		SystolicBP:  intPtr(115),
+		DiastolicBP: intPtr(75),
+	})
+	if err != nil {
+		t.Fatalf("failed to record vitals: %v", err)
+	}
+
+	// Record clinical appointment
+	start := time.Now().Add(time.Hour)
+	end := start.Add(30 * time.Minute)
+	_, err = repo.CreateAppointment(ctx, uuid.New(), pID, dID, start, end, "in_person", "", "")
+	if err != nil {
+		t.Fatalf("failed to create appointment: %v", err)
+	}
+
+	// Record clinical prescription
+	items := []models.PrescriptionItem{
+		{
+			MedicationName: "Amoxicillin",
+			Dosage:         "500mg",
+			Frequency:      "3x daily",
+			Duration:       "10 days",
+		},
+	}
+	_, err = repo.CreateDigitalPrescription(ctx, pID, dID, "Take after meals", items)
+	if err != nil {
+		t.Fatalf("failed to create prescription: %v", err)
+	}
+
+	// 1. Attempt hard DELETE of Doctor user -> MUST fail with ForeignKeyViolation (23503) due to ON DELETE RESTRICT
+	_, err = pool.Exec(ctx, "DELETE FROM users WHERE id = $1", dID)
+	if err == nil {
+		t.Fatalf("expected hard DELETE of doctor with clinical records to be restricted, but it succeeded")
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != pgerrcode.ForeignKeyViolation {
+		t.Fatalf("expected ForeignKeyViolation (23503) on doctor delete, got: %v", err)
+	}
+
+	// 2. Attempt hard DELETE of Patient user -> MUST fail with ForeignKeyViolation (23503)
+	_, err = pool.Exec(ctx, "DELETE FROM users WHERE id = $1", pID)
+	if err == nil {
+		t.Fatalf("expected hard DELETE of patient with clinical records to be restricted, but it succeeded")
+	}
+	if !errors.As(err, &pgErr) || pgErr.Code != pgerrcode.ForeignKeyViolation {
+		t.Fatalf("expected ForeignKeyViolation (23503) on patient delete, got: %v", err)
+	}
+
+	// 3. Soft deactivation is the compliant method to deactivate users
+	err = repo.UpdateUserActiveStatus(ctx, dID, false)
+	if err != nil {
+		t.Fatalf("expected soft-deactivation to succeed, got: %v", err)
+	}
+
+	var isActive bool
+	err = pool.QueryRow(ctx, "SELECT is_active FROM users WHERE id = $1", dID).Scan(&isActive)
+	if err != nil || isActive {
+		t.Fatalf("expected is_active to be false, got: is_active=%v, err=%v", isActive, err)
+	}
+}
+
+func TestLiveDB_RefreshTokenUserScoping(t *testing.T) {
+	pool, repo, teardown := SetupTestDB(t)
+	if pool == nil {
+		return
+	}
+	defer teardown()
+
+	ctx := context.Background()
+	hashedPassword, _ := utils.HashPassword("TestPass123!")
+
+	user1ID, err := repo.CreatePatient(ctx, "User", "One", fmt.Sprintf("u1-%s@vw.org", uuid.New().String()[:8]), hashedPassword)
+	if err != nil {
+		t.Fatalf("failed to create user 1: %v", err)
+	}
+
+	user2ID, err := repo.CreatePatient(ctx, "User", "Two", fmt.Sprintf("u2-%s@vw.org", uuid.New().String()[:8]), hashedPassword)
+	if err != nil {
+		t.Fatalf("failed to create user 2: %v", err)
+	}
+
+	// Create Refresh Token for User 1
+	token1Hash := "token-hash-1-abcdef"
+	token1, err := repo.CreateRefreshToken(ctx, user1ID, token1Hash, time.Now().Add(24*time.Hour))
+	if err != nil {
+		t.Fatalf("failed to create refresh token: %v", err)
+	}
+
+	// 1. Attempt rotation passing User 2's ID -> MUST be rejected because token belongs to User 1
+	_, err = repo.RotateRefreshToken(ctx, token1.ID, user2ID, "token-hash-hijack-attempt", time.Now().Add(24*time.Hour))
+	if err == nil {
+		t.Fatalf("expected RotateRefreshToken with mismatched user_id to fail, but it succeeded")
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("expected pgx.ErrNoRows, got: %v", err)
+	}
+
+	// Verify Token 1 was NOT revoked or modified by the failed attempt
+	var revokedAt *time.Time
+	var replacedBy *uuid.UUID
+	err = pool.QueryRow(ctx, "SELECT revoked_at, replaced_by_token_id FROM refresh_tokens WHERE id = $1", token1.ID).Scan(&revokedAt, &replacedBy)
+	if err != nil {
+		t.Fatalf("failed to query token status: %v", err)
+	}
+	if revokedAt != nil || replacedBy != nil {
+		t.Fatalf("token was tampered with during unauthorized rotation attempt: rev=%v, rep=%v", revokedAt, replacedBy)
+	}
+
+	// 2. Rotate with correct user_id (User 1) -> succeeds
+	token2Hash := "token-hash-2-legitimate"
+	token2, err := repo.RotateRefreshToken(ctx, token1.ID, user1ID, token2Hash, time.Now().Add(24*time.Hour))
+	if err != nil {
+		t.Fatalf("expected legitimate rotation with correct user_id to succeed, got: %v", err)
+	}
+	if token2.ID == uuid.Nil || token2.TokenHash != token2Hash {
+		t.Fatalf("unexpected rotated token output: %+v", token2)
+	}
+}
+
+func TestLiveDB_TelehealthDecoupledConcurrency(t *testing.T) {
+	pool, repo, teardown := SetupTestDB(t)
+	if pool == nil {
+		return
+	}
+	defer teardown()
+
+	ctx := context.Background()
+	hashedPassword, _ := utils.HashPassword("TestPass123!")
+
+	dID, err := repo.CreateDoctor(ctx, "Eric", "Foreman", fmt.Sprintf("foreman-%s@vw.org", uuid.New().String()[:8]), hashedPassword, "Neurology", 9)
+	if err != nil {
+		t.Fatalf("failed to create doctor: %v", err)
+	}
+
+	pID, err := repo.CreatePatient(ctx, "Patient", "Test", fmt.Sprintf("pt-%s@vw.org", uuid.New().String()[:8]), hashedPassword)
+	if err != nil {
+		t.Fatalf("failed to create patient: %v", err)
+	}
+
+	start := time.Now().Add(3 * time.Hour)
+	end := start.Add(30 * time.Minute)
+	apptID, err := repo.CreateAppointment(ctx, uuid.New(), pID, dID, start, end, "virtual", "", "")
+	if err != nil {
+		t.Fatalf("failed to create appointment: %v", err)
+	}
+
+	// Simulate slow external Daily.co API
+	slowStarted := make(chan struct{})
+	doneGen := make(chan struct{})
+	slowGenerator := func() (string, string, error) {
+		close(slowStarted)
+		time.Sleep(300 * time.Millisecond) // slow external HTTP latency
+		return "https://telehealth.vitalwatch.local/room-slow", "room-slow", nil
+	}
+
+	go func() {
+		defer close(doneGen)
+		_, _ = repo.GetOrGenerateAppointmentMeetingRoom(context.Background(), apptID, slowGenerator)
+	}()
+
+	// Wait until generator is confirmed in-flight
+	<-slowStarted
+
+	// Concurrently query database for this appointment
+	// Because external generator is decoupled from DB transactions, this must complete immediately (< 100ms)
+	queryStart := time.Now()
+	queriedAppt, err := repo.GetAppointmentByID(ctx, apptID)
+	queryDuration := time.Since(queryStart)
+
+	if err != nil {
+		t.Fatalf("concurrent GetAppointmentByID failed: %v", err)
+	}
+	if queriedAppt.ID != apptID {
+		t.Fatalf("expected appointment ID %s, got %s", apptID, queriedAppt.ID)
+	}
+	if queryDuration > 150*time.Millisecond {
+		t.Errorf("GetAppointmentByID took %v while room generator was running; expected < 150ms (proving no lock held)", queryDuration)
+	}
+
+	<-doneGen
 }

@@ -131,7 +131,7 @@ SELECT u.id, u.email, d.first_name, d.last_name, d.specialty, d.experience_years
 FROM users u
 JOIN doctor_profiles d ON u.id = d.user_id
 WHERE u.role = 'doctor' AND u.is_active = true
-ORDER BY d.first_name ASC
+ORDER BY d.first_name ASC, u.id ASC
 LIMIT $1 OFFSET $2
 `
 

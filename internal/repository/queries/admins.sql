@@ -22,7 +22,7 @@ WHERE u.id = $1 AND u.role = 'admin' AND u.is_active = true;
 -- name: GetAllUsers :many
 SELECT u.id, u.email, u.role, u.is_active, u.created_at
 FROM users u
-ORDER BY u.created_at DESC
+ORDER BY u.created_at DESC, u.id DESC
 LIMIT $1 OFFSET $2;
 
 -- name: UpdateUserActiveStatus :execrows

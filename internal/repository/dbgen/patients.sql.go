@@ -110,7 +110,7 @@ FROM users u
 JOIN patient_profiles p ON u.id = p.user_id
 JOIN appointments a ON u.id = a.patient_id
 WHERE a.doctor_id = $1
-ORDER BY u.created_at DESC
+ORDER BY u.created_at DESC, u.id DESC
 LIMIT $2 OFFSET $3
 `
 

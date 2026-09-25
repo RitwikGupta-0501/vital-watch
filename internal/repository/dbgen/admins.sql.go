@@ -18,14 +18,19 @@ VALUES ($1, $2, $3, $4)
 `
 
 type CreateAdminProfileParams struct {
-	UserID     uuid.UUID `json:"user_id"`
-	FirstName  string    `json:"first_name"`
-	LastName   string    `json:"last_name"`
-	Department string    `json:"department"`
+	UserID     uuid.UUID   `json:"user_id"`
+	FirstName  string      `json:"first_name"`
+	LastName   string      `json:"last_name"`
+	Department pgtype.Text `json:"department"`
 }
 
 func (q *Queries) CreateAdminProfile(ctx context.Context, arg CreateAdminProfileParams) error {
-	_, err := q.db.Exec(ctx, createAdminProfile, arg.UserID, arg.FirstName, arg.LastName, arg.Department)
+	_, err := q.db.Exec(ctx, createAdminProfile,
+		arg.UserID,
+		arg.FirstName,
+		arg.LastName,
+		arg.Department,
+	)
 	return err
 }
 
@@ -59,7 +64,7 @@ type GetAdminByEmailRow struct {
 	Email          string             `json:"email"`
 	FirstName      string             `json:"first_name"`
 	LastName       string             `json:"last_name"`
-	Department     string             `json:"department"`
+	Department     pgtype.Text        `json:"department"`
 	HashedPassword string             `json:"hashed_password"`
 	Role           string             `json:"role"`
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
@@ -93,7 +98,7 @@ type GetAdminByIDRow struct {
 	Email      string             `json:"email"`
 	FirstName  string             `json:"first_name"`
 	LastName   string             `json:"last_name"`
-	Department string             `json:"department"`
+	Department pgtype.Text        `json:"department"`
 	Role       string             `json:"role"`
 	CreatedAt  pgtype.Timestamptz `json:"created_at"`
 }
@@ -116,7 +121,7 @@ func (q *Queries) GetAdminByID(ctx context.Context, id uuid.UUID) (GetAdminByIDR
 const getAllUsers = `-- name: GetAllUsers :many
 SELECT u.id, u.email, u.role, u.is_active, u.created_at
 FROM users u
-ORDER BY u.created_at DESC
+ORDER BY u.created_at DESC, u.id DESC
 LIMIT $1 OFFSET $2
 `
 
@@ -129,7 +134,7 @@ type GetAllUsersRow struct {
 	ID        uuid.UUID          `json:"id"`
 	Email     string             `json:"email"`
 	Role      string             `json:"role"`
-	IsActive  pgtype.Bool        `json:"is_active"`
+	IsActive  bool               `json:"is_active"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
@@ -139,7 +144,7 @@ func (q *Queries) GetAllUsers(ctx context.Context, arg GetAllUsersParams) ([]Get
 		return nil, err
 	}
 	defer rows.Close()
-	var items []GetAllUsersRow
+	items := []GetAllUsersRow{}
 	for rows.Next() {
 		var i GetAllUsersRow
 		if err := rows.Scan(
@@ -166,8 +171,8 @@ WHERE id = $1
 `
 
 type UpdateUserActiveStatusParams struct {
-	ID       uuid.UUID   `json:"id"`
-	IsActive pgtype.Bool `json:"is_active"`
+	ID       uuid.UUID `json:"id"`
+	IsActive bool      `json:"is_active"`
 }
 
 func (q *Queries) UpdateUserActiveStatus(ctx context.Context, arg UpdateUserActiveStatusParams) (int64, error) {

@@ -12,6 +12,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/riverqueue/river"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/RitwikGupta-0501/vital-watch/internal/models"
 	"github.com/RitwikGupta-0501/vital-watch/internal/repository/dbgen"
 )
@@ -21,6 +23,7 @@ type DBRepository struct {
 	pool        *pgxpool.Pool
 	queries     *dbgen.Queries
 	riverClient *river.Client[pgx.Tx]
+	roomGroup   singleflight.Group
 }
 
 var _ Repository = (*DBRepository)(nil)
@@ -167,7 +170,7 @@ func (r *DBRepository) CreateAdmin(ctx context.Context, firstName, lastName, ema
 		UserID:     newID,
 		FirstName:  firstName,
 		LastName:   lastName,
-		Department: department,
+		Department: pgtype.Text{String: department, Valid: department != ""},
 	})
 	if err != nil {
 		return uuid.Nil, err
@@ -190,7 +193,7 @@ func (r *DBRepository) GetAdminByEmail(ctx context.Context, email string) (model
 		Email:          row.Email,
 		FirstName:      row.FirstName,
 		LastName:       row.LastName,
-		Department:     row.Department,
+		Department:     row.Department.String,
 		HashedPassword: row.HashedPassword,
 		Role:           row.Role,
 		CreatedAt:      row.CreatedAt.Time,
@@ -207,7 +210,7 @@ func (r *DBRepository) GetAdminByID(ctx context.Context, id uuid.UUID) (models.A
 		Email:      row.Email,
 		FirstName:  row.FirstName,
 		LastName:   row.LastName,
-		Department: row.Department,
+		Department: row.Department.String,
 		Role:       row.Role,
 		CreatedAt:  row.CreatedAt.Time,
 	}, nil
@@ -229,7 +232,7 @@ func (r *DBRepository) GetAllUsers(ctx context.Context, limit, offset int) ([]mo
 			ID:        row.ID,
 			Email:     row.Email,
 			Role:      row.Role,
-			IsActive:  row.IsActive.Bool,
+			IsActive:  row.IsActive,
 			CreatedAt: row.CreatedAt.Time,
 		})
 	}
@@ -239,7 +242,7 @@ func (r *DBRepository) GetAllUsers(ctx context.Context, limit, offset int) ([]mo
 func (r *DBRepository) UpdateUserActiveStatus(ctx context.Context, id uuid.UUID, isActive bool) error {
 	rowsAffected, err := r.queries.UpdateUserActiveStatus(ctx, dbgen.UpdateUserActiveStatusParams{
 		ID:       id,
-		IsActive: pgtype.Bool{Bool: isActive, Valid: true},
+		IsActive: isActive,
 	})
 	if err != nil {
 		return err
@@ -361,7 +364,7 @@ func (r *DBRepository) CreateAppointment(ctx context.Context, id, patientID, doc
 		DoctorID:        doctorID,
 		StartTime:       pgtype.Timestamptz{Time: startTime, Valid: true},
 		EndTime:         pgtype.Timestamptz{Time: endTime, Valid: true},
-		AppointmentType: pgtype.Text{String: apptType, Valid: apptType != ""},
+		AppointmentType: apptType,
 		MeetingLink:     pgtype.Text{String: meetingLink, Valid: meetingLink != ""},
 		MeetingID:       pgtype.Text{String: meetingID, Valid: meetingID != ""},
 	})
@@ -376,74 +379,59 @@ func (r *DBRepository) UpdateAppointmentMeetingRoom(ctx context.Context, apptID 
 }
 
 func (r *DBRepository) GetOrGenerateAppointmentMeetingRoom(ctx context.Context, apptID uuid.UUID, generator func() (meetingLink string, meetingID string, err error)) (models.Appointment, error) {
-	tx, err := r.pool.Begin(ctx)
+	appt, err := r.GetAppointmentByID(ctx, apptID)
 	if err != nil {
 		return models.Appointment{}, err
 	}
-	defer tx.Rollback(ctx)
 
-	const lockQuery = `
-		SELECT a.id, a.patient_id, a.doctor_id, a.start_time, a.end_time, a.status, a.appointment_type,
-		       a.meeting_link, a.meeting_id,
-		       COALESCE(dp.first_name || ' ' || dp.last_name, '') as doctor_name,
-		       COALESCE(dp.specialty, '') as doctor_specialty
-		FROM appointments a
-		LEFT JOIN doctor_profiles dp ON a.doctor_id = dp.user_id
-		WHERE a.id = $1
-		FOR UPDATE OF a`
-
-	var appt models.Appointment
-	var meetingLink, meetingID pgtype.Text
-	err = tx.QueryRow(ctx, lockQuery, apptID).Scan(
-		&appt.ID,
-		&appt.PatientID,
-		&appt.DoctorID,
-		&appt.StartTime,
-		&appt.EndTime,
-		&appt.Status,
-		&appt.Type,
-		&meetingLink,
-		&meetingID,
-		&appt.DoctorName,
-		&appt.DoctorSpecialty,
-	)
-	if err != nil {
-		return models.Appointment{}, err
-	}
-	appt.MeetingLink = meetingLink.String
-	appt.MeetingID = meetingID.String
-
-	// If already populated, return immediately
-	if appt.MeetingLink != "" {
-		_ = tx.Commit(ctx)
+	// If meeting link is already populated, or no generator provided, return immediately
+	if appt.MeetingLink != "" || generator == nil {
 		return appt, nil
 	}
 
-	if generator == nil {
-		_ = tx.Commit(ctx)
-		return appt, nil
+	type roomResult struct {
+		link string
+		id   string
 	}
 
-	newLink, newID, genErr := generator()
+	res, genErr, _ := r.roomGroup.Do(apptID.String(), func() (any, error) {
+		// Re-check DB in case another process/goroutine already created it
+		curAppt, err := r.GetAppointmentByID(ctx, apptID)
+		if err == nil && curAppt.MeetingLink != "" {
+			return roomResult{link: curAppt.MeetingLink, id: curAppt.MeetingID}, nil
+		}
+
+		// Generate external meeting room link OUTSIDE any database transaction or row lock
+		newLink, newID, err := generator()
+		if err != nil {
+			return roomResult{}, err
+		}
+
+		if newLink != "" {
+			// Atomic conditional update: only update if still unpopulated
+			err := r.queries.UpdateAppointmentMeetingRoom(ctx, dbgen.UpdateAppointmentMeetingRoomParams{
+				MeetingLink: pgtype.Text{String: newLink, Valid: true},
+				MeetingID:   pgtype.Text{String: newID, Valid: newID != ""},
+				ID:          apptID,
+			})
+			if err != nil {
+				return roomResult{}, err
+			}
+		}
+
+		return roomResult{link: newLink, id: newID}, nil
+	})
+
 	if genErr != nil {
 		return appt, genErr
 	}
 
-	if newLink != "" {
-		const updateQuery = `
-			UPDATE appointments
-			SET meeting_link = $1, meeting_id = $2
-			WHERE id = $3`
-		if _, err := tx.Exec(ctx, updateQuery, newLink, newID, apptID); err != nil {
-			return appt, err
-		}
-		appt.MeetingLink = newLink
-		appt.MeetingID = newID
+	rRes := res.(roomResult)
+	if rRes.link != "" {
+		appt.MeetingLink = rRes.link
+		appt.MeetingID = rRes.id
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return models.Appointment{}, err
-	}
 	return appt, nil
 }
 
@@ -458,8 +446,8 @@ func (r *DBRepository) GetAppointmentByID(ctx context.Context, id uuid.UUID) (mo
 		DoctorID:        row.DoctorID,
 		StartTime:       row.StartTime.Time,
 		EndTime:         row.EndTime.Time,
-		Status:          row.Status.String,
-		Type:            row.AppointmentType.String,
+		Status:          row.Status,
+		Type:            row.AppointmentType,
 		MeetingLink:     row.MeetingLink.String,
 		MeetingID:       row.MeetingID.String,
 		DoctorName:      row.DoctorFirstName + " " + row.DoctorLastName,
@@ -485,7 +473,7 @@ func (r *DBRepository) GetDoctorAppointmentsInRange(ctx context.Context, doctorI
 			DoctorID:  row.DoctorID,
 			StartTime: row.StartTime.Time,
 			EndTime:   row.EndTime.Time,
-			Status:    row.Status.String,
+			Status:    row.Status,
 		})
 	}
 	return appts, nil
@@ -510,8 +498,8 @@ func (r *DBRepository) GetAppointmentsByDoctorID(ctx context.Context, doctorID u
 			DoctorID:    row.DoctorID,
 			StartTime:   row.StartTime.Time,
 			EndTime:     row.EndTime.Time,
-			Status:      row.Status.String,
-			Type:        row.AppointmentType.String,
+			Status:      row.Status,
+			Type:        row.AppointmentType,
 			MeetingLink: row.MeetingLink.String,
 			MeetingID:   row.MeetingID.String,
 			PatientName: row.FirstName + " " + row.LastName,
@@ -540,8 +528,8 @@ func (r *DBRepository) GetAppointmentsByPatientID(ctx context.Context, patientID
 			DoctorID:        row.DoctorID,
 			StartTime:       row.StartTime.Time,
 			EndTime:         row.EndTime.Time,
-			Status:          row.Status.String,
-			Type:            row.AppointmentType.String,
+			Status:          row.Status,
+			Type:            row.AppointmentType,
 			MeetingLink:     row.MeetingLink.String,
 			MeetingID:       row.MeetingID.String,
 			DoctorName:      row.FirstName + " " + row.LastName,
@@ -572,8 +560,8 @@ func (r *DBRepository) GetAppointmentsForPatient(ctx context.Context, doctorID, 
 			DoctorID:        row.DoctorID,
 			StartTime:       row.StartTime.Time,
 			EndTime:         row.EndTime.Time,
-			Status:          row.Status.String,
-			Type:            row.AppointmentType.String,
+			Status:          row.Status,
+			Type:            row.AppointmentType,
 			MeetingLink:     row.MeetingLink.String,
 			MeetingID:       row.MeetingID.String,
 			DoctorName:      row.FirstName + " " + row.LastName,
@@ -715,12 +703,18 @@ func (r *DBRepository) CreateDigitalPrescription(ctx context.Context, patientID,
 	}
 	defer tx.Rollback(ctx)
 
-	qtx := r.queries.WithTx(tx)
+	var exp pgtype.Timestamptz
+	if len(items) > 0 {
+		expTime := calculatePrescriptionExpiry(items)
+		exp = pgtype.Timestamptz{Time: expTime, Valid: !expTime.IsZero()}
+	}
 
+	qtx := r.queries.WithTx(tx)
 	newID, err := qtx.CreateDigitalPrescription(ctx, dbgen.CreateDigitalPrescriptionParams{
 		PatientID: patientID,
 		DoctorID:  doctorID,
 		Notes:     pgtype.Text{String: notes, Valid: notes != ""},
+		ExpiresAt: exp,
 	})
 	if err != nil {
 		return uuid.Nil, err
@@ -738,13 +732,6 @@ func (r *DBRepository) CreateDigitalPrescription(ctx context.Context, patientID,
 		})
 		if err != nil {
 			return uuid.Nil, err
-		}
-	}
-
-	if len(items) > 0 {
-		exp := calculatePrescriptionExpiry(items)
-		if _, err := tx.Exec(ctx, "UPDATE prescriptions SET expires_at = $1 WHERE id = $2", exp, newID); err != nil {
-			return uuid.Nil, fmt.Errorf("failed to update prescription expiry: %w", err)
 		}
 	}
 
@@ -841,10 +828,32 @@ func (r *DBRepository) VerifyPrescription(ctx context.Context, prescriptionID, d
 				return false, err
 			}
 		}
-		if status == "approved" && len(items) > 0 {
-			exp := calculatePrescriptionExpiry(items)
-			if _, err := tx.Exec(ctx, "UPDATE prescriptions SET expires_at = $1 WHERE id = $2", exp, prescriptionID); err != nil {
-				return false, fmt.Errorf("failed to update prescription expiry: %w", err)
+	}
+
+	if status == "approved" {
+		var itemsForExpiry []models.PrescriptionItem
+		if items != nil {
+			itemsForExpiry = items
+		} else {
+			existingItems, err := qtx.GetPrescriptionItemsByPrescriptionID(ctx, prescriptionID)
+			if err == nil && len(existingItems) > 0 {
+				itemsForExpiry = make([]models.PrescriptionItem, len(existingItems))
+				for i, it := range existingItems {
+					itemsForExpiry[i] = models.PrescriptionItem{
+						Duration: it.Duration.String,
+					}
+				}
+			}
+		}
+		if len(itemsForExpiry) > 0 {
+			exp := calculatePrescriptionExpiry(itemsForExpiry)
+			if !exp.IsZero() {
+				if err := qtx.UpdatePrescriptionExpiry(ctx, dbgen.UpdatePrescriptionExpiryParams{
+					ExpiresAt: pgtype.Timestamptz{Time: exp, Valid: true},
+					ID:        prescriptionID,
+				}); err != nil {
+					return false, fmt.Errorf("failed to update prescription expiry: %w", err)
+				}
 			}
 		}
 	}
@@ -1091,12 +1100,12 @@ func (r *DBRepository) GetPrescriptionByID(ctx context.Context, id uuid.UUID) (m
 }
 
 func (r *DBRepository) UpdatePrescriptionFileName(ctx context.Context, prescriptionID uuid.UUID, fileName string) error {
-	tag, err := r.pool.Exec(ctx, "UPDATE prescriptions SET file_name = $1, updated_at = now() WHERE id = $2", fileName, prescriptionID)
+	err := r.queries.UpdatePrescriptionFileName(ctx, dbgen.UpdatePrescriptionFileNameParams{
+		FileName: pgtype.Text{String: fileName, Valid: fileName != ""},
+		ID:       prescriptionID,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to update prescription file_name: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("prescription %s not found", prescriptionID)
 	}
 	return nil
 }
@@ -1669,67 +1678,39 @@ func (r *DBRepository) RotateRefreshToken(ctx context.Context, oldTokenID, userI
 	defer tx.Rollback(ctx) //nolint:errcheck
 
 	// Lock the old token row to serialise concurrent refresh attempts.
-	const lockQuery = `
-		SELECT id, user_id, token_hash, expires_at, revoked_at, replaced_by_token_id, created_at
-		FROM refresh_tokens WHERE id = $1 FOR UPDATE`
-	row := tx.QueryRow(ctx, lockQuery, oldTokenID)
-	var old struct {
-		id                uuid.UUID
-		userID            uuid.UUID
-		tokenHash         string
-		expiresAt         pgtype.Timestamptz
-		revokedAt         pgtype.Timestamptz
-		replacedByTokenID pgtype.UUID
-		createdAt         pgtype.Timestamptz
-	}
-	if err := row.Scan(&old.id, &old.userID, &old.tokenHash, &old.expiresAt,
-		&old.revokedAt, &old.replacedByTokenID, &old.createdAt); err != nil {
+	qtx := r.queries.WithTx(tx)
+
+	// Lock the old token row to serialise concurrent refresh attempts, scoped strictly to the authenticated user.
+	oldToken, err := qtx.LockRefreshTokenForRotation(ctx, dbgen.LockRefreshTokenForRotationParams{
+		ID:     oldTokenID,
+		UserID: userID,
+	})
+	if err != nil {
 		return models.RefreshToken{}, err
 	}
 
 	// Grace-window retry: old token is already revoked with a known successor.
-	if old.revokedAt.Valid {
-		if time.Since(old.revokedAt.Time) <= 10*time.Second && old.replacedByTokenID.Valid {
-			replacementID := uuid.UUID(old.replacedByTokenID.Bytes)
-			const fetchQuery = `
-				SELECT id, user_id, token_hash, expires_at, revoked_at, replaced_by_token_id, created_at
-				FROM refresh_tokens WHERE id = $1 FOR UPDATE`
-			newRow := tx.QueryRow(ctx, fetchQuery, replacementID)
-			var rep struct {
-				id                uuid.UUID
-				userID            uuid.UUID
-				tokenHash         string
-				expiresAt         pgtype.Timestamptz
-				revokedAt         pgtype.Timestamptz
-				replacedByTokenID pgtype.UUID
-				createdAt         pgtype.Timestamptz
-			}
-			if scanErr := newRow.Scan(&rep.id, &rep.userID, &rep.tokenHash, &rep.expiresAt,
-				&rep.revokedAt, &rep.replacedByTokenID, &rep.createdAt); scanErr == nil {
+	if oldToken.RevokedAt.Valid {
+		if time.Since(oldToken.RevokedAt.Time) <= 10*time.Second && oldToken.ReplacedByTokenID.Valid {
+			replacementID := uuid.UUID(oldToken.ReplacedByTokenID.Bytes)
+			rep, scanErr := qtx.LockRefreshTokenForRotation(ctx, dbgen.LockRefreshTokenForRotationParams{
+				ID:     replacementID,
+				UserID: userID,
+			})
+			if scanErr == nil {
 				// If the replacement token was ALREADY consumed/revoked, this is a replay of an ancestor token
-				if rep.revokedAt.Valid {
+				if rep.RevokedAt.Valid {
 					return models.RefreshToken{}, ErrTokenAlreadyRotated
 				}
 
 				// The replacement was never consumed! Create a new token for this retry and void the unconsumed replacement.
-				const insertRetryQuery = `
-					INSERT INTO refresh_tokens (user_id, token_hash, expires_at)
-					VALUES ($1, $2, $3)
-					RETURNING id, user_id, token_hash, expires_at, revoked_at, replaced_by_token_id, created_at`
-				var created struct {
-					id                uuid.UUID
-					userID            uuid.UUID
-					tokenHash         string
-					expiresAt         pgtype.Timestamptz
-					revokedAt         pgtype.Timestamptz
-					replacedByTokenID pgtype.UUID
-					createdAt         pgtype.Timestamptz
-				}
 				newPgExpiry := pgtype.Timestamptz{Time: expiresAt, Valid: true}
-				if err := tx.QueryRow(ctx, insertRetryQuery, userID, newHash, newPgExpiry).Scan(
-					&created.id, &created.userID, &created.tokenHash, &created.expiresAt,
-					&created.revokedAt, &created.replacedByTokenID, &created.createdAt,
-				); err != nil {
+				created, err := qtx.CreateRefreshToken(ctx, dbgen.CreateRefreshTokenParams{
+					UserID:    userID,
+					TokenHash: newHash,
+					ExpiresAt: newPgExpiry,
+				})
+				if err != nil {
 					return models.RefreshToken{}, err
 				}
 
@@ -1737,8 +1718,8 @@ func (r *DBRepository) RotateRefreshToken(ctx context.Context, oldTokenID, userI
 				const voidRepQuery = `
 					UPDATE refresh_tokens
 					SET revoked_at = now(), replaced_by_token_id = NULL
-					WHERE id = $1 AND revoked_at IS NULL`
-				if _, err := tx.Exec(ctx, voidRepQuery, rep.id); err != nil {
+					WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL`
+				if _, err := tx.Exec(ctx, voidRepQuery, rep.ID, userID); err != nil {
 					return models.RefreshToken{}, err
 				}
 
@@ -1746,16 +1727,16 @@ func (r *DBRepository) RotateRefreshToken(ctx context.Context, oldTokenID, userI
 				const updateOldQuery = `
 					UPDATE refresh_tokens
 					SET replaced_by_token_id = $2
-					WHERE id = $1`
-				if _, err := tx.Exec(ctx, updateOldQuery, oldTokenID, pgtype.UUID{Bytes: created.id, Valid: true}); err != nil {
+					WHERE id = $1 AND user_id = $3`
+				if _, err := tx.Exec(ctx, updateOldQuery, oldTokenID, pgtype.UUID{Bytes: created.ID, Valid: true}, userID); err != nil {
 					return models.RefreshToken{}, err
 				}
 
 				if commitErr := tx.Commit(ctx); commitErr != nil {
 					return models.RefreshToken{}, commitErr
 				}
-				return rawToRefreshToken(created.id, created.userID, created.tokenHash,
-					created.expiresAt, created.revokedAt, created.replacedByTokenID, created.createdAt), nil
+				return rawToRefreshToken(created.ID, created.UserID, created.TokenHash,
+					created.ExpiresAt, created.RevokedAt, created.ReplacedByTokenID, created.CreatedAt), nil
 			}
 			return models.RefreshToken{}, fmt.Errorf("replacement token not found for revoked token %s", oldTokenID)
 		}
@@ -1763,24 +1744,13 @@ func (r *DBRepository) RotateRefreshToken(ctx context.Context, oldTokenID, userI
 	}
 
 	// Create the new token.
-	const insertQuery = `
-		INSERT INTO refresh_tokens (user_id, token_hash, expires_at)
-		VALUES ($1, $2, $3)
-		RETURNING id, user_id, token_hash, expires_at, revoked_at, replaced_by_token_id, created_at`
-	var rep struct {
-		id                uuid.UUID
-		userID            uuid.UUID
-		tokenHash         string
-		expiresAt         pgtype.Timestamptz
-		revokedAt         pgtype.Timestamptz
-		replacedByTokenID pgtype.UUID
-		createdAt         pgtype.Timestamptz
-	}
 	newPgExpiry := pgtype.Timestamptz{Time: expiresAt, Valid: true}
-	if err := tx.QueryRow(ctx, insertQuery, userID, newHash, newPgExpiry).Scan(
-		&rep.id, &rep.userID, &rep.tokenHash, &rep.expiresAt,
-		&rep.revokedAt, &rep.replacedByTokenID, &rep.createdAt,
-	); err != nil {
+	rep, err := qtx.CreateRefreshToken(ctx, dbgen.CreateRefreshTokenParams{
+		UserID:    userID,
+		TokenHash: newHash,
+		ExpiresAt: newPgExpiry,
+	})
+	if err != nil {
 		return models.RefreshToken{}, err
 	}
 
@@ -1788,8 +1758,8 @@ func (r *DBRepository) RotateRefreshToken(ctx context.Context, oldTokenID, userI
 	const revokeQuery = `
 		UPDATE refresh_tokens
 		SET revoked_at = now(), replaced_by_token_id = $2
-		WHERE id = $1 AND revoked_at IS NULL`
-	if _, err := tx.Exec(ctx, revokeQuery, oldTokenID, pgtype.UUID{Bytes: rep.id, Valid: true}); err != nil {
+		WHERE id = $1 AND user_id = $3 AND revoked_at IS NULL`
+	if _, err := tx.Exec(ctx, revokeQuery, oldTokenID, pgtype.UUID{Bytes: rep.ID, Valid: true}, userID); err != nil {
 		return models.RefreshToken{}, err
 	}
 
@@ -1797,8 +1767,8 @@ func (r *DBRepository) RotateRefreshToken(ctx context.Context, oldTokenID, userI
 		return models.RefreshToken{}, err
 	}
 
-	return rawToRefreshToken(rep.id, rep.userID, rep.tokenHash,
-		rep.expiresAt, rep.revokedAt, rep.replacedByTokenID, rep.createdAt), nil
+	return rawToRefreshToken(rep.ID, rep.UserID, rep.TokenHash,
+		rep.ExpiresAt, rep.RevokedAt, rep.ReplacedByTokenID, rep.CreatedAt), nil
 }
 
 // rawToRefreshToken builds a models.RefreshToken from raw pgx scan targets.
