@@ -25,6 +25,7 @@ const (
 	// Clinical Appointments & Scheduling Events (HIPAA § 164.312(b))
 	ActionCreateAppointment   = "CREATE_APPOINTMENT"
 	ActionCompleteAppointment = "COMPLETE_APPOINTMENT"
+	ActionCancelAppointment   = "CANCEL_APPOINTMENT"
 	ActionViewAppointments    = "VIEW_APPOINTMENTS"
 	ActionUpdateSchedule      = "UPDATE_DOCTOR_SCHEDULE"
 	ActionViewPatientProfile       = "VIEW_PATIENT_PROFILE"

@@ -82,6 +82,22 @@ func TestTelehealthVirtualAppointmentFlow(t *testing.T) {
 				Status:      "upcoming",
 			}, nil
 		},
+		GetDoctorByIDFunc: func(ctx context.Context, id uuid.UUID) (models.Doctor, error) {
+			return models.Doctor{ID: id, Available: true}, nil
+		},
+		GetDoctorSchedulesFunc: func(ctx context.Context, dID uuid.UUID) ([]models.DoctorSchedule, error) {
+			return []models.DoctorSchedule{
+				{
+					DoctorID:     doctorID,
+					DayOfWeek:    int(time.Now().Weekday()),
+					StartTime:    "00:00",
+					EndTime:      "23:59",
+					SlotDuration: 15,
+					IsActive:     true,
+					Timezone:     "UTC",
+				},
+			}, nil
+		},
 	}
 
 	h := &Handler{
@@ -93,10 +109,11 @@ func TestTelehealthVirtualAppointmentFlow(t *testing.T) {
 	r := setupPhase4TestRouter(h)
 
 	// 1. Book Virtual Appointment
+	nowSlot := time.Now().Truncate(time.Hour)
 	reqBody := map[string]interface{}{
 		"doctor_id":  doctorID.String(),
-		"start_time": time.Now().Add(2 * time.Hour).Format(time.RFC3339),
-		"end_time":   time.Now().Add(2*time.Hour + 30*time.Minute).Format(time.RFC3339),
+		"start_time": nowSlot.Add(2 * time.Hour).Format(time.RFC3339),
+		"end_time":   nowSlot.Add(2*time.Hour + 30*time.Minute).Format(time.RFC3339),
 		"type":       "virtual",
 	}
 	bodyBytes, _ := json.Marshal(reqBody)
@@ -195,6 +212,9 @@ func TestDoctorScheduleAndAvailableSlots(t *testing.T) {
 					Status:    "upcoming",
 				},
 			}, nil
+		},
+		GetDoctorByIDFunc: func(ctx context.Context, id uuid.UUID) (models.Doctor, error) {
+			return models.Doctor{ID: id, Available: true}, nil
 		},
 	}
 
@@ -563,8 +583,8 @@ func TestTelehealthVirtualAppointmentFlow_LazyRoomGeneration(t *testing.T) {
 				MeetingLink: "", // Initially empty (e.g. earlier provider failure)
 				MeetingID:   "",
 				Status:      "upcoming",
-				StartTime:   time.Now().Add(1 * time.Hour),
-				EndTime:     time.Now().Add(1*time.Hour + 30*time.Minute),
+				StartTime:   time.Now().Add(10 * time.Minute),
+				EndTime:     time.Now().Add(40 * time.Minute),
 			}, nil
 		},
 		UpdateAppointmentMeetingRoomFunc: func(ctx context.Context, id uuid.UUID, link, meetingID string) error {
@@ -628,6 +648,9 @@ func TestCreateAppointment_DoctorScheduleEnforcement(t *testing.T) {
 		},
 		CreateAppointmentFunc: func(ctx context.Context, id, pID, dID uuid.UUID, start, end time.Time, apptType, link, mID string) (uuid.UUID, error) {
 			return id, nil
+		},
+		GetDoctorByIDFunc: func(ctx context.Context, id uuid.UUID) (models.Doctor, error) {
+			return models.Doctor{ID: id, Available: true}, nil
 		},
 	}
 
@@ -810,6 +833,9 @@ func TestCreateAppointment_CrossMidnightTimezone(t *testing.T) {
 		},
 		CreateAppointmentFunc: func(ctx context.Context, id, pID, dID uuid.UUID, start, end time.Time, apptType, link, mID string) (uuid.UUID, error) {
 			return id, nil
+		},
+		GetDoctorByIDFunc: func(ctx context.Context, id uuid.UUID) (models.Doctor, error) {
+			return models.Doctor{ID: id, Available: true}, nil
 		},
 	}
 

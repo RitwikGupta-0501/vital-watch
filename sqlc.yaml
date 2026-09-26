@@ -9,6 +9,7 @@ sql:
       - "migrations/000006_audit_immutability.up.sql"
       - "migrations/000007_admin_entity.up.sql"
       - "migrations/000008_harden_schema_integrity.up.sql"
+      - "migrations/000009_patient_booking_exclusion.up.sql"
     queries: "internal/repository/queries"
     gen:
       go:

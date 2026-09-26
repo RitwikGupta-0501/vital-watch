@@ -66,3 +66,9 @@ UPDATE appointments
 SET meeting_link = $1, meeting_id = $2, updated_at = now()
 WHERE id = $3 AND (meeting_link IS NULL OR meeting_link = '');
 
+-- name: CancelAppointmentByParticipant :execrows
+UPDATE appointments
+SET status = 'cancelled', updated_at = now()
+WHERE id = $1
+  AND (patient_id = $2 OR doctor_id = $2)
+  AND status = 'upcoming';

@@ -389,6 +389,7 @@ func setupRouter(h *api.Handler, storageType string, jwtSecret []byte) *gin.Engi
 
 		// Phase 4: Common Telehealth, Scheduling, Vitals, and Schedules
 		authGroup.GET("/appointments/:id/meeting-room", h.GetAppointmentMeetingRoom)
+		authGroup.PATCH("/appointments/:id/cancel", h.CancelAppointment)
 		authGroup.GET("/doctors/:id/available-slots", h.GetDoctorAvailableSlots)
 		authGroup.POST("/vitals", h.CreatePatientVital)
 		authGroup.GET("/vitals", h.GetPatientVitals)

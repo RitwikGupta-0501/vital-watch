@@ -583,6 +583,17 @@ func (r *DBRepository) UpdateAppointmentAsCompletedForDoctor(ctx context.Context
 	return rowsAffected > 0, nil
 }
 
+func (r *DBRepository) CancelAppointmentByParticipant(ctx context.Context, appointmentID, participantID uuid.UUID) (bool, error) {
+	rowsAffected, err := r.queries.CancelAppointmentByParticipant(ctx, dbgen.CancelAppointmentByParticipantParams{
+		ID:        appointmentID,
+		PatientID: participantID,
+	})
+	if err != nil {
+		return false, err
+	}
+	return rowsAffected > 0, nil
+}
+
 // Prescription Methods: Dual-Mode, Atomic Enqueue, and Review
 
 func (r *DBRepository) CreateUploadedPrescriptionWithJob(ctx context.Context, patientID, doctorID uuid.UUID, fileName, notes string, ocrEnabled bool) (uuid.UUID, string, error) {

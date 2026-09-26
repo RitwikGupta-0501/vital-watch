@@ -44,6 +44,7 @@ type MockRepository struct {
 	GetAppointmentsByPatientIDFunc            func(ctx context.Context, patientID uuid.UUID, limit, offset int) ([]models.Appointment, error)
 	GetAppointmentsForPatientFunc             func(ctx context.Context, doctorID, patientID uuid.UUID, limit, offset int) ([]models.Appointment, error)
 	UpdateAppointmentAsCompletedForDoctorFunc func(ctx context.Context, appointmentID, doctorID uuid.UUID) (bool, error)
+	CancelAppointmentByParticipantFunc        func(ctx context.Context, appointmentID, participantID uuid.UUID) (bool, error)
 
 	CreateUploadedPrescriptionWithJobFunc  func(ctx context.Context, patientID, doctorID uuid.UUID, fileName, notes string, ocrEnabled bool) (uuid.UUID, string, error)
 	CreateDigitalPrescriptionFunc          func(ctx context.Context, patientID, doctorID uuid.UUID, notes string, items []models.PrescriptionItem) (uuid.UUID, error)
@@ -249,6 +250,13 @@ func (m *MockRepository) GetAppointmentsForPatient(ctx context.Context, doctorID
 func (m *MockRepository) UpdateAppointmentAsCompletedForDoctor(ctx context.Context, appointmentID, doctorID uuid.UUID) (bool, error) {
 	if m.UpdateAppointmentAsCompletedForDoctorFunc != nil {
 		return m.UpdateAppointmentAsCompletedForDoctorFunc(ctx, appointmentID, doctorID)
+	}
+	return true, nil
+}
+
+func (m *MockRepository) CancelAppointmentByParticipant(ctx context.Context, appointmentID, participantID uuid.UUID) (bool, error) {
+	if m.CancelAppointmentByParticipantFunc != nil {
+		return m.CancelAppointmentByParticipantFunc(ctx, appointmentID, participantID)
 	}
 	return true, nil
 }

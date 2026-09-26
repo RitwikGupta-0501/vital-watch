@@ -12,6 +12,7 @@ import (
 
 	"github.com/RitwikGupta-0501/vital-watch/internal/audit"
 	"github.com/RitwikGupta-0501/vital-watch/internal/models"
+	"github.com/RitwikGupta-0501/vital-watch/internal/notifications"
 	"github.com/RitwikGupta-0501/vital-watch/internal/telehealth"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -102,6 +103,12 @@ func (h *Handler) CreateAppointment(c *gin.Context) {
 		return
 	}
 
+	// 15-minute lead time enforcement (same rule as slot availability listing)
+	if !req.StartTime.After(now.Add(15 * time.Minute)) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Appointments must be booked at least 15 minutes in advance"})
+		return
+	}
+
 	// Booking horizon: cannot book more than 1 year in advance
 	if req.StartTime.After(now.AddDate(1, 0, 0)) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Appointment cannot be booked more than 1 year in advance"})
@@ -135,59 +142,92 @@ func (h *Handler) CreateAppointment(c *gin.Context) {
 		return
 	}
 
+	// CRITICAL-03: Validate target doctor is active (GetDoctorByID filters is_active=true) and available.
+	doc, dErr := h.Repo.GetDoctorByID(c.Request.Context(), req.DoctorID)
+	if dErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid doctor: doctor not found or inactive"})
+		return
+	}
+	if !doc.Available {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Doctor is not currently available for bookings"})
+		return
+	}
+
 	allScheds, aErr := h.Repo.GetDoctorSchedules(c.Request.Context(), req.DoctorID)
 	if aErr != nil {
 		slog.ErrorContext(c.Request.Context(), "Internal error checking doctor schedules", "error", aErr)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify doctor schedule"})
 		return
 	}
-	if len(allScheds) > 0 {
-		var matchingSched *models.DoctorSchedule
-		for _, s := range allScheds {
-			tz := s.Timezone
-			if tz == "" {
-				tz = "UTC"
-			}
-			loc, lErr := time.LoadLocation(tz)
-			if lErr != nil {
-				loc = time.UTC
-			}
-			if int(req.StartTime.In(loc).Weekday()) == s.DayOfWeek {
-				schedCopy := s
-				matchingSched = &schedCopy
-				break
-			}
-		}
+	// CRITICAL-03: Zero-schedule bypass fix — require at least one schedule entry.
+	if len(allScheds) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Doctor has no schedule configured"})
+		return
+	}
 
-		if matchingSched == nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Doctor has no office hours configured on this day"})
-			return
+	var matchingSched *models.DoctorSchedule
+	for _, s := range allScheds {
+		tz := s.Timezone
+		if tz == "" {
+			tz = "UTC"
 		}
-		if !matchingSched.IsActive {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Doctor is not available on this day"})
-			return
-		}
-
-		docTz := matchingSched.Timezone
-		if docTz == "" {
-			docTz = "UTC"
-		}
-		loc, lErr := time.LoadLocation(docTz)
+		loc, lErr := time.LoadLocation(tz)
 		if lErr != nil {
 			loc = time.UTC
 		}
+		if int(req.StartTime.In(loc).Weekday()) == s.DayOfWeek {
+			schedCopy := s
+			matchingSched = &schedCopy
+			break
+		}
+	}
 
-		localStart := req.StartTime.In(loc)
-		localEnd := req.EndTime.In(loc)
+	if matchingSched == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Doctor has no office hours configured on this day"})
+		return
+	}
+	if !matchingSched.IsActive {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Doctor is not available on this day"})
+		return
+	}
 
-		stParsed, err1 := time.Parse("15:04", matchingSched.StartTime)
-		etParsed, err2 := time.Parse("15:04", matchingSched.EndTime)
-		if err1 == nil && err2 == nil {
-			windowStart := time.Date(localStart.Year(), localStart.Month(), localStart.Day(), stParsed.Hour(), stParsed.Minute(), 0, 0, loc)
-			windowEnd := time.Date(localStart.Year(), localStart.Month(), localStart.Day(), etParsed.Hour(), etParsed.Minute(), 0, 0, loc)
+	docTz := matchingSched.Timezone
+	if docTz == "" {
+		docTz = "UTC"
+	}
+	loc, lErr := time.LoadLocation(docTz)
+	if lErr != nil {
+		loc = time.UTC
+	}
 
-			if localStart.Before(windowStart) || localEnd.After(windowEnd) {
-				c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Appointment is outside doctor's active working hours (%s - %s %s)", matchingSched.StartTime, matchingSched.EndTime, matchingSched.Timezone)})
+	// Truncate seconds/nanoseconds from requested time for slot alignment check.
+	req.StartTime = req.StartTime.Truncate(time.Minute)
+	req.EndTime = req.EndTime.Truncate(time.Minute)
+
+	localStart := req.StartTime.In(loc)
+	localEnd := req.EndTime.In(loc)
+
+	stParsed, err1 := time.Parse("15:04", matchingSched.StartTime)
+	etParsed, err2 := time.Parse("15:04", matchingSched.EndTime)
+	if err1 == nil && err2 == nil {
+		windowStart := time.Date(localStart.Year(), localStart.Month(), localStart.Day(), stParsed.Hour(), stParsed.Minute(), 0, 0, loc)
+		windowEnd := time.Date(localStart.Year(), localStart.Month(), localStart.Day(), etParsed.Hour(), etParsed.Minute(), 0, 0, loc)
+
+		if localStart.Before(windowStart) || localEnd.After(windowEnd) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Appointment is outside doctor's active working hours (%s - %s %s)", matchingSched.StartTime, matchingSched.EndTime, matchingSched.Timezone)})
+			return
+		}
+
+		// HIGH-01: Slot alignment — start and duration must be multiples of slotDuration.
+		slotDur := time.Duration(matchingSched.SlotDuration) * time.Minute
+		if slotDur > 0 {
+			offsetFromWindow := localStart.Sub(windowStart)
+			if offsetFromWindow%slotDur != 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Appointment start time must align to the doctor's %d-minute slot boundaries", matchingSched.SlotDuration)})
+				return
+			}
+			if duration%slotDur != 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Appointment duration must be a multiple of the doctor's %d-minute slot duration", matchingSched.SlotDuration)})
 				return
 			}
 		}
@@ -210,7 +250,11 @@ func (h *Handler) CreateAppointment(c *gin.Context) {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) {
 			if pgErr.Code == "23P01" {
-				c.JSON(http.StatusConflict, gin.H{"error": "Doctor is already booked for this time slot"})
+				msg := "Doctor is already booked for this time slot"
+				if strings.Contains(pgErr.ConstraintName, "patient") || strings.Contains(pgErr.ConstraintName, "uq_patient") {
+					msg = "You already have an appointment during this time slot"
+				}
+				c.JSON(http.StatusConflict, gin.H{"error": msg})
 				return
 			}
 			if pgErr.Code == "23503" {
@@ -220,6 +264,10 @@ func (h *Handler) CreateAppointment(c *gin.Context) {
 		}
 		if strings.Contains(err.Error(), "appointments_doctor_id_tstzrange_excl") || strings.Contains(err.Error(), "conflicting key") {
 			c.JSON(http.StatusConflict, gin.H{"error": "Doctor is already booked for this time slot"})
+			return
+		}
+		if strings.Contains(err.Error(), "uq_patient_no_overlap") {
+			c.JSON(http.StatusConflict, gin.H{"error": "You already have an appointment during this time slot"})
 			return
 		}
 		if strings.Contains(err.Error(), "appointments_doctor_id_fkey") {
@@ -238,6 +286,18 @@ func (h *Handler) CreateAppointment(c *gin.Context) {
 		"end_time":   req.EndTime.Format(time.RFC3339),
 		"type":       req.Type,
 	})
+
+	// SSE: notify both participants of new booking
+	if h.Notifier != nil {
+		event := notifications.NotificationEvent{
+			Type:          notifications.EventAppointmentBooked,
+			AppointmentID: newID,
+			PatientID:     patientID,
+			DoctorID:      req.DoctorID,
+			Message:       "A new appointment has been booked",
+		}
+		h.Notifier.Publish(event)
+	}
 
 	resp := gin.H{"id": newID}
 	if meetingLink != "" {
@@ -301,13 +361,24 @@ func (h *Handler) MarkAppointmentAsCompleted(c *gin.Context) {
 		return
 	}
 
-	// Premature completion guard: cannot complete an appointment that has not started yet
+	// Fetch the appointment and immediately enforce authorization (BOLA prevention).
+	// Auth check MUST precede temporal check: checking time before owner identity
+	// allows Doctor B to probe Doctor A's appointment UUIDs and learn their
+	// scheduling details via the 400 vs 404 response delta.
 	appt, aErr := h.Repo.GetAppointmentByID(c.Request.Context(), appointmentID)
-	if aErr == nil && !appt.StartTime.IsZero() {
-		if time.Now().Before(appt.StartTime) {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Cannot complete an appointment that has not started yet"})
-			return
-		}
+	if aErr != nil || appt.DoctorID != doctorID {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Appointment not found or not assigned to you"})
+		return
+	}
+
+	if appt.Status != "upcoming" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Only upcoming appointments can be completed"})
+		return
+	}
+
+	if time.Now().Before(appt.StartTime) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Cannot complete an appointment that has not started yet"})
+		return
 	}
 
 	updated, err := h.Repo.UpdateAppointmentAsCompletedForDoctor(c.Request.Context(), appointmentID, doctorID)
@@ -323,13 +394,21 @@ func (h *Handler) MarkAppointmentAsCompleted(c *gin.Context) {
 	}
 
 	// Audit appointment completion milestone (HIPAA § 164.312(b))
-	var patID *uuid.UUID
-	if aErr == nil {
-		patID = &appt.PatientID
-	}
-	h.audit(c, audit.ActionCompleteAppointment, "appointment", &appointmentID, patID, http.StatusOK, map[string]interface{}{
+	h.audit(c, audit.ActionCompleteAppointment, "appointment", &appointmentID, &appt.PatientID, http.StatusOK, map[string]interface{}{
 		"doctor_id": doctorID.String(),
 	})
+
+	// SSE: notify both participants of completion
+	if h.Notifier != nil {
+		event := notifications.NotificationEvent{
+			Type:          notifications.EventAppointmentCompleted,
+			AppointmentID: appointmentID,
+			PatientID:     appt.PatientID,
+			DoctorID:      doctorID,
+			Message:       "Appointment has been marked as completed",
+		}
+		h.Notifier.Publish(event)
+	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Appointment marked as completed"})
 }
@@ -383,6 +462,13 @@ func (h *Handler) GetAppointmentMeetingRoom(c *gin.Context) {
 	now := time.Now()
 	if !appt.EndTime.IsZero() && now.After(appt.EndTime.Add(24*time.Hour)) {
 		c.JSON(http.StatusGone, gin.H{"error": "Consultation window has expired"})
+		return
+	}
+
+	// HIGH-04: Prevent meeting token pre-minting weeks in advance.
+	// Access is only allowed within 15 minutes of appointment start.
+	if !appt.StartTime.IsZero() && now.Before(appt.StartTime.Add(-15*time.Minute)) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Meeting room access is only available within 15 minutes of appointment start"})
 		return
 	}
 
@@ -664,6 +750,22 @@ func (h *Handler) GetDoctorAvailableSlots(c *gin.Context) {
 		return
 	}
 
+	// CRITICAL-03: Validate that the doctor is active and available before showing slots.
+	doc, dErr := h.Repo.GetDoctorByID(c.Request.Context(), doctorID)
+	if dErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Doctor not found or inactive"})
+		return
+	}
+	if !doc.Available {
+		c.JSON(http.StatusOK, gin.H{
+			"date":        dateStr,
+			"day_of_week": int(targetDate.Weekday()),
+			"slots":       []models.TimeSlot{},
+			"message":     "Doctor is not currently available for bookings",
+		})
+		return
+	}
+
 	dayOfWeek := int(targetDate.Weekday())
 
 	schedule, err := h.Repo.GetDoctorScheduleByDay(c.Request.Context(), doctorID, dayOfWeek)
@@ -754,4 +856,69 @@ func (h *Handler) GetDoctorAvailableSlots(c *gin.Context) {
 		"timezone":      schedule.Timezone,
 		"slots":         slots,
 	})
+}
+
+// CancelAppointment allows any participant (patient or doctor) to cancel an upcoming appointment.
+func (h *Handler) CancelAppointment(c *gin.Context) {
+	userIDVal, ok := c.Get("userID")
+	if !ok {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "User ID not found in context"})
+		return
+	}
+	callerID, ok := userIDVal.(uuid.UUID)
+	if !ok {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Invalid user ID type in context"})
+		return
+	}
+
+	appointmentID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid appointment ID"})
+		return
+	}
+
+	// Fetch appointment first for audit data and existence verification.
+	appt, aErr := h.Repo.GetAppointmentByID(c.Request.Context(), appointmentID)
+	if aErr != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Appointment not found"})
+		return
+	}
+
+	// Verify caller is a participant.
+	if appt.PatientID != callerID && appt.DoctorID != callerID {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Appointment not found"})
+		return
+	}
+
+	cancelled, err := h.Repo.CancelAppointmentByParticipant(c.Request.Context(), appointmentID, callerID)
+	if err != nil {
+		slog.ErrorContext(c.Request.Context(), "Internal error in CancelAppointment", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to cancel appointment"})
+		return
+	}
+	if !cancelled {
+		// Row was found but status != 'upcoming' — already completed or already cancelled.
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Only upcoming appointments can be cancelled"})
+		return
+	}
+
+	// Audit appointment cancellation (HIPAA § 164.312(b))
+	h.audit(c, audit.ActionCancelAppointment, "appointment", &appointmentID, &appt.PatientID, http.StatusOK, map[string]interface{}{
+		"cancelled_by": callerID.String(),
+		"doctor_id":    appt.DoctorID.String(),
+	})
+
+	// SSE: notify both participants of cancellation
+	if h.Notifier != nil {
+		event := notifications.NotificationEvent{
+			Type:          notifications.EventAppointmentCancelled,
+			AppointmentID: appointmentID,
+			PatientID:     appt.PatientID,
+			DoctorID:      appt.DoctorID,
+			Message:       "Appointment has been cancelled",
+		}
+		h.Notifier.Publish(event)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Appointment cancelled successfully"})
 }

@@ -12,6 +12,27 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const cancelAppointmentByParticipant = `-- name: CancelAppointmentByParticipant :execrows
+UPDATE appointments
+SET status = 'cancelled', updated_at = now()
+WHERE id = $1
+  AND (patient_id = $2 OR doctor_id = $2)
+  AND status = 'upcoming'
+`
+
+type CancelAppointmentByParticipantParams struct {
+	ID        uuid.UUID `json:"id"`
+	PatientID uuid.UUID `json:"patient_id"`
+}
+
+func (q *Queries) CancelAppointmentByParticipant(ctx context.Context, arg CancelAppointmentByParticipantParams) (int64, error) {
+	result, err := q.db.Exec(ctx, cancelAppointmentByParticipant, arg.ID, arg.PatientID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const createAppointment = `-- name: CreateAppointment :one
 INSERT INTO appointments (id, patient_id, doctor_id, start_time, end_time, appointment_type, meeting_link, meeting_id)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)

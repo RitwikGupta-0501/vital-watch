@@ -34,6 +34,7 @@ type Repository interface {
 	UpdateAppointmentAsCompletedForDoctor(ctx context.Context, appointmentID, doctorID uuid.UUID) (bool, error)
 	UpdateAppointmentMeetingRoom(ctx context.Context, apptID uuid.UUID, meetingLink, meetingID string) error
 	GetOrGenerateAppointmentMeetingRoom(ctx context.Context, apptID uuid.UUID, generator func() (meetingLink string, meetingID string, err error)) (models.Appointment, error)
+	CancelAppointmentByParticipant(ctx context.Context, appointmentID, participantID uuid.UUID) (bool, error)
 
 	// Phase 4: Doctor Working Schedules
 	UpsertDoctorSchedule(ctx context.Context, schedule models.DoctorSchedule) (models.DoctorSchedule, error)

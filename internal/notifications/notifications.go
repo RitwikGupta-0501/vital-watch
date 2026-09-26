@@ -18,12 +18,16 @@ const (
 	EventOCRCompleted         EventType = "prescription.ocr_completed"
 	EventPrescriptionApproved EventType = "prescription.approved"
 	EventPrescriptionRejected EventType = "prescription.rejected"
+	EventAppointmentBooked    EventType = "appointment.booked"
+	EventAppointmentCompleted EventType = "appointment.completed"
+	EventAppointmentCancelled EventType = "appointment.cancelled"
 	EventPing                 EventType = "ping"
 )
 
 type NotificationEvent struct {
 	Type           EventType   `json:"type"`
 	PrescriptionID uuid.UUID   `json:"prescription_id,omitempty"`
+	AppointmentID  uuid.UUID   `json:"appointment_id,omitempty"`
 	PatientID      uuid.UUID   `json:"patient_id,omitempty"`
 	DoctorID       uuid.UUID   `json:"doctor_id,omitempty"`
 	Message        string      `json:"message"`
