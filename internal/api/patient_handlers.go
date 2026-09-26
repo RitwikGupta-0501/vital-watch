@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"log/slog"
 	"math"
 	"net/http"
@@ -253,8 +254,94 @@ func (h *Handler) CreatePatientVital(c *gin.Context) {
 		return
 	}
 
-	h.audit(c, audit.ActionRecordVitals, "vital", &newID, &targetPatientID, http.StatusCreated, nil)
-	c.JSON(http.StatusCreated, gin.H{"id": newID})
+	isCritical, criticalAlerts := evaluateVitalAlerts(vital)
+
+	if isCritical && h.Notifier != nil {
+		alertMsg := "Critical vital signs recorded: " + strings.Join(criticalAlerts, "; ")
+		h.Notifier.Publish(notifications.NotificationEvent{
+			Type:      notifications.EventVitalAlert,
+			PatientID: targetPatientID,
+			Message:   alertMsg,
+			Data: map[string]interface{}{
+				"vital_id":        newID,
+				"is_critical":     true,
+				"critical_alerts": criticalAlerts,
+			},
+		})
+	}
+
+	auditMeta := map[string]interface{}{
+		"is_critical": isCritical,
+	}
+	if isCritical {
+		auditMeta["critical_alerts"] = criticalAlerts
+	}
+	h.audit(c, audit.ActionRecordVitals, "vital", &newID, &targetPatientID, http.StatusCreated, auditMeta)
+
+	resp := gin.H{
+		"id":          newID,
+		"is_critical": isCritical,
+	}
+	if isCritical {
+		resp["critical_alerts"] = criticalAlerts
+	}
+	c.JSON(http.StatusCreated, resp)
+}
+
+// evaluateVitalAlerts evaluates biometric readings against emergency physiological crisis thresholds.
+func evaluateVitalAlerts(vital models.PatientVital) (bool, []string) {
+	var alerts []string
+
+	// Blood Pressure: Hypertensive Crisis (>= 180 SBP or >= 120 DBP)
+	if (vital.SystolicBP != nil && *vital.SystolicBP >= 180) || (vital.DiastolicBP != nil && *vital.DiastolicBP >= 120) {
+		alerts = append(alerts, fmt.Sprintf("Hypertensive Crisis: Blood pressure is dangerously elevated (%d/%d mmHg). Seek emergency medical care immediately.",
+			safeIntDeref(vital.SystolicBP), safeIntDeref(vital.DiastolicBP)))
+	} else if vital.SystolicBP != nil && vital.DiastolicBP != nil && *vital.SystolicBP < 80 && *vital.DiastolicBP < 50 {
+		alerts = append(alerts, fmt.Sprintf("Hypotensive Shock Warning: Blood pressure is critically low (%d/%d mmHg). Seek emergency medical care.",
+			*vital.SystolicBP, *vital.DiastolicBP))
+	}
+
+	// Oxygen Saturation: Severe Hypoxemia (< 90%)
+	if vital.OxygenSaturation != nil && *vital.OxygenSaturation < 90.0 {
+		alerts = append(alerts, fmt.Sprintf("Severe Hypoxemia: Blood oxygen saturation is critically low (%.1f%%). Seek emergency medical attention immediately.",
+			*vital.OxygenSaturation))
+	}
+
+	// Heart Rate: Critical Bradycardia (< 40 bpm) or Severe Tachycardia (> 140 bpm)
+	if vital.HeartRate != nil {
+		if *vital.HeartRate < 40 {
+			alerts = append(alerts, fmt.Sprintf("Severe Bradycardia: Heart rate is dangerously low (%d bpm). Seek immediate medical evaluation.", *vital.HeartRate))
+		} else if *vital.HeartRate > 140 {
+			alerts = append(alerts, fmt.Sprintf("Severe Tachycardia: Heart rate is dangerously high (%d bpm). Seek immediate medical evaluation.", *vital.HeartRate))
+		}
+	}
+
+	// Blood Glucose: Severe Hypoglycemia (< 54 mg/dL) or Extreme Hyperglycemia (>= 350 mg/dL)
+	if vital.BloodGlucose != nil {
+		if *vital.BloodGlucose < 54.0 {
+			alerts = append(alerts, fmt.Sprintf("Severe Hypoglycemia: Blood glucose is critically low (%.1f mg/dL). Ingest fast-acting carbohydrates immediately and seek medical attention.", *vital.BloodGlucose))
+		} else if *vital.BloodGlucose >= 350.0 {
+			alerts = append(alerts, fmt.Sprintf("Critical Hyperglycemia: Blood glucose is severely elevated (%.1f mg/dL). High risk of diabetic ketoacidosis. Contact healthcare provider immediately.", *vital.BloodGlucose))
+		}
+	}
+
+	// Temperature: Hyperpyrexia (>= 40.0 C) or Severe Hypothermia (<= 35.0 C)
+	if vital.Temperature != nil {
+		if *vital.Temperature >= 40.0 {
+			alerts = append(alerts, fmt.Sprintf("Hyperpyrexia: Body temperature is dangerously high (%.1f °C). Seek immediate medical care.", *vital.Temperature))
+		} else if *vital.Temperature <= 35.0 {
+			alerts = append(alerts, fmt.Sprintf("Severe Hypothermia: Body temperature is dangerously low (%.1f °C). Seek immediate medical care.", *vital.Temperature))
+		}
+	}
+
+	return len(alerts) > 0, alerts
+}
+
+func safeIntDeref(val *int) int {
+	if val == nil {
+		return 0
+	}
+	return *val
 }
 
 // GetPatientVitals retrieves longitudinal biometric vital signs for a patient.
@@ -491,8 +578,13 @@ func (h *Handler) LogMedicationAdherence(c *gin.Context) {
 		return
 	}
 
-	if schedDate.After(time.Now().Add(24 * time.Hour)) {
+	now := time.Now()
+	if schedDate.After(now.Add(24 * time.Hour)) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "scheduled_date cannot be more than 1 day in the future"})
+		return
+	}
+	if schedDate.Before(now.AddDate(-2, 0, 0)) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "scheduled_date cannot be older than 2 years"})
 		return
 	}
 
@@ -522,13 +614,16 @@ func (h *Handler) LogMedicationAdherence(c *gin.Context) {
 	var takenAt *time.Time
 	if in.Status == "taken" {
 		if in.TakenAt != nil && !in.TakenAt.IsZero() {
-			if in.TakenAt.After(time.Now().Add(5 * time.Minute)) {
+			if in.TakenAt.After(now.Add(5 * time.Minute)) {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "taken_at cannot be in the future"})
+				return
+			}
+			if in.TakenAt.Before(now.AddDate(-2, 0, 0)) {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "taken_at cannot be older than 2 years"})
 				return
 			}
 			takenAt = in.TakenAt
 		} else {
-			now := time.Now()
 			takenAt = &now
 		}
 	}
@@ -550,6 +645,20 @@ func (h *Handler) LogMedicationAdherence(c *gin.Context) {
 		slog.ErrorContext(c.Request.Context(), "Internal error in UpsertMedicationLog", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to log medication adherence"})
 		return
+	}
+
+	if h.Notifier != nil {
+		h.Notifier.Publish(notifications.NotificationEvent{
+			Type:      notifications.EventMedicationLogged,
+			PatientID: patientID,
+			Message:   fmt.Sprintf("Medication adherence logged: %s (%s)", in.Status, in.TimeOfDay),
+			Data: map[string]interface{}{
+				"log_id":               saved.ID,
+				"prescription_item_id": in.PrescriptionItemID,
+				"status":               in.Status,
+				"time_of_day":          in.TimeOfDay,
+			},
+		})
 	}
 
 	h.audit(c, audit.ActionLogMedicationAdherence, "schedule", &saved.ID, &patientID, http.StatusOK, map[string]interface{}{"status": in.Status, "time_of_day": in.TimeOfDay})

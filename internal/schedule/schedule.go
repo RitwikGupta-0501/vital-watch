@@ -2,6 +2,7 @@ package schedule
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -28,52 +29,58 @@ var SlotOrder = map[string]int{
 	SlotAsNeeded:  5,
 }
 
+var (
+	rePRN            = regexp.MustCompile(`(?i)\b(as needed|prn|when required|as directed)\b`)
+	reQ4H            = regexp.MustCompile(`(?i)\b(every 4 hours|every 4\s*h|q4h|6 times daily|6 times a day|6x daily)\b`)
+	reQID            = regexp.MustCompile(`(?i)\b(four times daily|four times a day|4 times daily|4 times a day|4x daily|qid|qds|every 6 hours|every 6\s*h|q6h)\b`)
+	reTID            = regexp.MustCompile(`(?i)\b(three times daily|three times a day|3 times daily|3 times a day|3x daily|tid|tds|every 8 hours|every 8\s*h|q8h)\b`)
+	reBID            = regexp.MustCompile(`(?i)\b(twice daily|twice a day|2 times daily|2 times a day|2x daily|bid|bd|every 12 hours|every 12\s*h|q12h)\b`)
+	reMorningEvening = regexp.MustCompile(`(?i)(\bmorning\b.*\b(night|evening)\b|\b(night|evening)\b.*\bmorning\b)`)
+	reBedtime        = regexp.MustCompile(`(?i)\b(bedtime|at night|before sleep|hs|qhs)\b`)
+	reEvening        = regexp.MustCompile(`(?i)\b(evening|dinner|supper)\b`)
+	reAfternoon      = regexp.MustCompile(`(?i)\b(afternoon|lunch|midday)\b`)
+	reMorning        = regexp.MustCompile(`(?i)\b(morning|breakfast|qam)\b`)
+)
+
 // ParseDailySlots converts clinical frequency and timing text into standardized daily dosage slots
+// using word-boundary regular expressions to eliminate false-positive substring matches on clinical terms.
 func ParseDailySlots(frequency, timing string) []string {
-	freq := strings.ToLower(strings.TrimSpace(frequency))
-	timeStr := strings.ToLower(strings.TrimSpace(timing))
+	freq := strings.TrimSpace(frequency)
+	timeStr := strings.TrimSpace(timing)
 	combined := freq + " " + timeStr
 
-	if strings.Contains(combined, "as needed") || strings.Contains(combined, "prn") || strings.Contains(combined, "when required") {
+	if rePRN.MatchString(combined) {
 		return []string{SlotAsNeeded}
 	}
 
 	// 6 times daily / every 4 hours
-	if strings.Contains(combined, "every 4 hours") || strings.Contains(combined, "every 4h") ||
-		strings.Contains(combined, "q4h") || strings.Contains(combined, "6 times") {
+	if reQ4H.MatchString(combined) {
 		return []string{SlotMorning, SlotAfternoon, SlotEvening, SlotBedtime}
 	}
 
 	// 4 times daily
-	if strings.Contains(combined, "four times") || strings.Contains(combined, "4 times") ||
-		strings.Contains(combined, "qid") || strings.Contains(combined, "qds") ||
-		strings.Contains(combined, "every 6 hours") || strings.Contains(combined, "every 6h") {
+	if reQID.MatchString(combined) {
 		return []string{SlotMorning, SlotAfternoon, SlotEvening, SlotBedtime}
 	}
 
 	// 3 times daily
-	if strings.Contains(combined, "three times") || strings.Contains(combined, "3 times") ||
-		strings.Contains(combined, "tid") || strings.Contains(combined, "tds") ||
-		strings.Contains(combined, "every 8 hours") || strings.Contains(combined, "every 8h") {
+	if reTID.MatchString(combined) {
 		return []string{SlotMorning, SlotAfternoon, SlotEvening}
 	}
 
 	// 2 times daily
-	if strings.Contains(combined, "twice") || strings.Contains(combined, "2 times") ||
-		strings.Contains(combined, "bid") || strings.Contains(combined, "bd") ||
-		strings.Contains(combined, "every 12 hours") || strings.Contains(combined, "every 12h") ||
-		(strings.Contains(combined, "morning") && (strings.Contains(combined, "night") || strings.Contains(combined, "evening"))) {
+	if reBID.MatchString(combined) || reMorningEvening.MatchString(combined) {
 		return []string{SlotMorning, SlotEvening}
 	}
 
 	// Specific single times
-	if strings.Contains(combined, "bedtime") || strings.Contains(combined, "at night") || strings.Contains(combined, "before sleep") {
+	if reBedtime.MatchString(combined) {
 		return []string{SlotBedtime}
 	}
-	if strings.Contains(combined, "evening") || strings.Contains(combined, "dinner") {
+	if reEvening.MatchString(combined) {
 		return []string{SlotEvening}
 	}
-	if strings.Contains(combined, "afternoon") || strings.Contains(combined, "lunch") {
+	if reAfternoon.MatchString(combined) {
 		return []string{SlotAfternoon}
 	}
 
@@ -99,6 +106,11 @@ func BuildDailySchedule(
 		}
 		key := fmt.Sprintf("%s:%s:%d", l.PrescriptionItemID.String(), l.TimeOfDay, dNum)
 		logMap[key] = l
+	}
+
+	itemMap := make(map[uuid.UUID]models.PrescriptionItem)
+	for _, item := range items {
+		itemMap[item.ID] = item
 	}
 
 	var results []models.MedicationLog
@@ -145,8 +157,26 @@ func BuildDailySchedule(
 	}
 
 	// Retain any existing logs that were not matched (e.g. multiple PRN doses, extra doses)
+	// and enrich with prescription item metadata if missing
 	for _, l := range existingLogs {
 		if l.ID != uuid.Nil && !matchedLogIDs[l.ID] {
+			if item, exists := itemMap[l.PrescriptionItemID]; exists {
+				if l.MedicationName == "" {
+					l.MedicationName = item.MedicationName
+				}
+				if l.Dosage == "" {
+					l.Dosage = item.Dosage
+				}
+				if l.Timing == "" {
+					l.Timing = item.Timing
+				}
+				if l.MealTiming == "" {
+					l.MealTiming = item.Timing
+				}
+				if l.Instructions == "" {
+					l.Instructions = item.Instructions
+				}
+			}
 			results = append(results, l)
 		}
 	}

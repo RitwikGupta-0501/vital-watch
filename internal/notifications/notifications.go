@@ -21,6 +21,8 @@ const (
 	EventAppointmentBooked    EventType = "appointment.booked"
 	EventAppointmentCompleted EventType = "appointment.completed"
 	EventAppointmentCancelled EventType = "appointment.cancelled"
+	EventVitalAlert           EventType = "vital.alert"
+	EventMedicationLogged     EventType = "medication.logged"
 	EventPing                 EventType = "ping"
 )
 
@@ -57,7 +59,7 @@ func (b *SSEBroker) Subscribe(userID uuid.UUID) (chan NotificationEvent, func())
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	ch := make(chan NotificationEvent, 16)
+	ch := make(chan NotificationEvent, 64)
 	if b.closed {
 		close(ch)
 		return ch, func() {}

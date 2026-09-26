@@ -83,12 +83,18 @@ func (j *JitsiProvider) CreateRoom(ctx context.Context, appointmentID uuid.UUID,
 // DailyProvider creates ephemeral video rooms using the Daily.co REST API
 type DailyProvider struct {
 	apiKey     string
+	baseURL    string
 	httpClient *http.Client
 }
 
-func NewDailyProvider(apiKey string) *DailyProvider {
+func NewDailyProvider(apiKey string, baseURL ...string) *DailyProvider {
+	base := "https://api.daily.co/v1"
+	if len(baseURL) > 0 && strings.TrimSpace(baseURL[0]) != "" {
+		base = strings.TrimRight(strings.TrimSpace(baseURL[0]), "/")
+	}
 	return &DailyProvider{
-		apiKey: strings.TrimSpace(apiKey),
+		apiKey:  strings.TrimSpace(apiKey),
+		baseURL: base,
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
@@ -124,7 +130,7 @@ func (d *DailyProvider) CreateRoom(ctx context.Context, appointmentID uuid.UUID,
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.daily.co/v1/rooms", bytes.NewReader(bodyBytes))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.baseURL+"/rooms", bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, err
 	}
@@ -176,7 +182,7 @@ func (d *DailyProvider) CreateMeetingToken(ctx context.Context, roomName string,
 	if err != nil {
 		return "", err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.daily.co/v1/meeting-tokens", bytes.NewReader(bodyBytes))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.baseURL+"/meeting-tokens", bytes.NewReader(bodyBytes))
 	if err != nil {
 		return "", err
 	}

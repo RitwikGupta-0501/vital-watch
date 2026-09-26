@@ -17,6 +17,7 @@ import (
 
 	"github.com/RitwikGupta-0501/vital-watch/internal/audit"
 	"github.com/RitwikGupta-0501/vital-watch/internal/models"
+	"github.com/RitwikGupta-0501/vital-watch/internal/notifications"
 	"github.com/RitwikGupta-0501/vital-watch/internal/repository"
 	"github.com/RitwikGupta-0501/vital-watch/internal/storage"
 	"github.com/RitwikGupta-0501/vital-watch/internal/telehealth"
@@ -1316,3 +1317,274 @@ func TestPatientCare_HIPAAAuditLogging(t *testing.T) {
 		t.Errorf("missing ActionViewAppointments audit entry")
 	}
 }
+
+func TestCreatePatientVital_CriticalAlertAndPatientOnlySSE(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	patientID := uuid.New()
+	doctorID := uuid.New()
+	vitalID := uuid.New()
+
+	mockBroker := notifications.NewSSEBroker()
+	defer mockBroker.Shutdown()
+
+	patientCh, unsubPatient := mockBroker.Subscribe(patientID)
+	defer unsubPatient()
+
+	doctorCh, unsubDoctor := mockBroker.Subscribe(doctorID)
+	defer unsubDoctor()
+
+	mockRepo := &repository.MockRepository{
+		CreatePatientVitalFunc: func(ctx context.Context, v models.PatientVital) (uuid.UUID, error) {
+			return vitalID, nil
+		},
+	}
+
+	h := &Handler{
+		Repo:     mockRepo,
+		Notifier: mockBroker,
+	}
+
+	r := gin.New()
+	r.POST("/api/vitals", func(c *gin.Context) {
+		c.Set("userID", patientID)
+		c.Set("role", "patient")
+		h.CreatePatientVital(c)
+	})
+
+	sbp := 195
+	dbp := 125
+	spo2 := 87.5
+	hr := 115
+	body, _ := json.Marshal(VitalInput{
+		SystolicBP:       &sbp,
+		DiastolicBP:      &dbp,
+		OxygenSaturation: &spo2,
+		HeartRate:        &hr,
+	})
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/vitals", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if resp["is_critical"] != true {
+		t.Fatalf("expected is_critical to be true for 195/125 mmHg and 87.5%% SpO2, got: %v", resp["is_critical"])
+	}
+
+	alerts, ok := resp["critical_alerts"].([]interface{})
+	if !ok || len(alerts) < 2 {
+		t.Fatalf("expected at least 2 critical alerts (HTN Crisis and Hypoxemia), got: %v", resp["critical_alerts"])
+	}
+
+	// Verify Patient received EventVitalAlert via SSE
+	select {
+	case event := <-patientCh:
+		if event.Type != notifications.EventVitalAlert {
+			t.Errorf("expected EventVitalAlert event, got %s", event.Type)
+		}
+		if event.PatientID != patientID {
+			t.Errorf("expected patient ID %s, got %s", patientID, event.PatientID)
+		}
+		if !strings.Contains(event.Message, "Hypertensive Crisis") {
+			t.Errorf("expected message to mention Hypertensive Crisis, got: %s", event.Message)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatalf("timed out waiting for patient EventVitalAlert")
+	}
+
+	// Verify Doctor did NOT receive the vital alert (patient-centric privacy)
+	select {
+	case event := <-doctorCh:
+		t.Fatalf("doctor should NOT receive unsolicited vital alert push, but got: %+v", event)
+	default:
+		// OK - no message received by doctor
+	}
+}
+
+func TestCreatePatientVital_NormalVitalsNoCriticalAlert(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	patientID := uuid.New()
+	vitalID := uuid.New()
+
+	mockBroker := notifications.NewSSEBroker()
+	defer mockBroker.Shutdown()
+
+	patientCh, unsubPatient := mockBroker.Subscribe(patientID)
+	defer unsubPatient()
+
+	mockRepo := &repository.MockRepository{
+		CreatePatientVitalFunc: func(ctx context.Context, v models.PatientVital) (uuid.UUID, error) {
+			return vitalID, nil
+		},
+	}
+
+	h := &Handler{
+		Repo:     mockRepo,
+		Notifier: mockBroker,
+	}
+
+	r := gin.New()
+	r.POST("/api/vitals", func(c *gin.Context) {
+		c.Set("userID", patientID)
+		c.Set("role", "patient")
+		h.CreatePatientVital(c)
+	})
+
+	sbp := 120
+	dbp := 80
+	spo2 := 99.0
+	hr := 72
+	body, _ := json.Marshal(VitalInput{
+		SystolicBP:       &sbp,
+		DiastolicBP:      &dbp,
+		OxygenSaturation: &spo2,
+		HeartRate:        &hr,
+	})
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/vitals", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+
+	if resp["is_critical"] != false {
+		t.Errorf("expected is_critical == false for normal vitals, got: %v", resp["is_critical"])
+	}
+	if resp["critical_alerts"] != nil {
+		t.Errorf("expected nil critical_alerts, got: %v", resp["critical_alerts"])
+	}
+
+	// Verify no EventVitalAlert was sent to patient
+	select {
+	case event := <-patientCh:
+		t.Fatalf("expected no vital alert for normal vitals, got: %+v", event)
+	default:
+		// OK
+	}
+}
+
+func TestLogMedicationAdherence_TemporalBoundsAndNotification(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	patientID := uuid.New()
+	itemID := uuid.New()
+	logID := uuid.New()
+
+	mockBroker := notifications.NewSSEBroker()
+	defer mockBroker.Shutdown()
+
+	patientCh, unsubPatient := mockBroker.Subscribe(patientID)
+	defer unsubPatient()
+
+	mockRepo := &repository.MockRepository{
+		VerifyPrescriptionItemOwnershipFunc: func(ctx context.Context, pItemID, pID uuid.UUID) (bool, error) {
+			return true, nil
+		},
+		UpsertMedicationLogFunc: func(ctx context.Context, log models.MedicationLog) (models.MedicationLog, error) {
+			log.ID = logID
+			return log, nil
+		},
+	}
+
+	h := &Handler{
+		Repo:     mockRepo,
+		Notifier: mockBroker,
+	}
+
+	r := gin.New()
+	r.POST("/api/adherence", func(c *gin.Context) {
+		c.Set("userID", patientID)
+		c.Set("role", "patient")
+		h.LogMedicationAdherence(c)
+	})
+
+	t.Run("Rejects ScheduledDate Older Than 2 Years", func(t *testing.T) {
+		pastDate := time.Now().AddDate(-3, 0, 0).Format("2006-01-02")
+		body, _ := json.Marshal(MedicationLogInput{
+			PrescriptionItemID: itemID,
+			ScheduledDate:      pastDate,
+			TimeOfDay:          "morning",
+			Status:             "taken",
+		})
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodPost, "/api/adherence", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 Bad Request, got %d: %s", w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "older than 2 years") {
+			t.Errorf("expected error message to mention 'older than 2 years', got: %s", w.Body.String())
+		}
+	})
+
+	t.Run("Rejects TakenAt Older Than 2 Years", func(t *testing.T) {
+		oldTaken := time.Now().AddDate(-3, 0, 0)
+		body, _ := json.Marshal(MedicationLogInput{
+			PrescriptionItemID: itemID,
+			ScheduledDate:      time.Now().Format("2006-01-02"),
+			TimeOfDay:          "morning",
+			Status:             "taken",
+			TakenAt:            &oldTaken,
+		})
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodPost, "/api/adherence", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 Bad Request, got %d: %s", w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "older than 2 years") {
+			t.Errorf("expected error message to mention 'older than 2 years', got: %s", w.Body.String())
+		}
+	})
+
+	t.Run("Publishes EventMedicationLogged on Success", func(t *testing.T) {
+		body, _ := json.Marshal(MedicationLogInput{
+			PrescriptionItemID: itemID,
+			ScheduledDate:      time.Now().Format("2006-01-02"),
+			TimeOfDay:          "evening",
+			Status:             "taken",
+		})
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodPost, "/api/adherence", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d: %s", w.Code, w.Body.String())
+		}
+
+		select {
+		case event := <-patientCh:
+			if event.Type != notifications.EventMedicationLogged {
+				t.Errorf("expected EventMedicationLogged, got %s", event.Type)
+			}
+			if event.PatientID != patientID {
+				t.Errorf("expected patient ID %s, got %s", patientID, event.PatientID)
+			}
+		case <-time.After(1 * time.Second):
+			t.Fatalf("timed out waiting for EventMedicationLogged notification")
+		}
+	})
+}
+

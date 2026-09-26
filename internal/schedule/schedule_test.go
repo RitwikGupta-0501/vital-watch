@@ -64,6 +64,60 @@ func TestParseDailySlots(t *testing.T) {
 			timing:    "with water",
 			expected:  []string{"morning", "afternoon", "evening", "bedtime"},
 		},
+		{
+			name:      "Abdominal pain does not trigger BD",
+			frequency: "Once daily",
+			timing:    "Take for severe abdominal cramps",
+			expected:  []string{"morning"},
+		},
+		{
+			name:      "Liquid suspension does not trigger QID",
+			frequency: "Once daily",
+			timing:    "Liquid suspension 10ml",
+			expected:  []string{"morning"},
+		},
+		{
+			name:      "Antidiabetic does not trigger TID",
+			frequency: "Once daily",
+			timing:    "Antidiabetic agent with breakfast",
+			expected:  []string{"morning"},
+		},
+		{
+			name:      "Sprained ankle does not trigger PRN",
+			frequency: "Once daily",
+			timing:    "Apply ointment for sprained ankle",
+			expected:  []string{"morning"},
+		},
+		{
+			name:      "Morbid obesity does not trigger BID",
+			frequency: "Once daily",
+			timing:    "Therapy for morbid obesity",
+			expected:  []string{"morning"},
+		},
+		{
+			name:      "Legitimate standalone BID with meal notes",
+			frequency: "1 tab bid",
+			timing:    "after meals",
+			expected:  []string{"morning", "evening"},
+		},
+		{
+			name:      "Legitimate standalone TID",
+			frequency: "take 1 capsule tid",
+			timing:    "with water",
+			expected:  []string{"morning", "afternoon", "evening"},
+		},
+		{
+			name:      "Legitimate standalone QID",
+			frequency: "2 puffs qid",
+			timing:    "",
+			expected:  []string{"morning", "afternoon", "evening", "bedtime"},
+		},
+		{
+			name:      "Legitimate standalone PRN",
+			frequency: "take 1 tab prn for pain",
+			timing:    "",
+			expected:  []string{"as_needed"},
+		},
 	}
 
 	for _, tt := range tests {
