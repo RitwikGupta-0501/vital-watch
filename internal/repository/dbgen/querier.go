@@ -13,6 +13,7 @@ import (
 
 type Querier interface {
 	CancelAppointmentByParticipant(ctx context.Context, arg CancelAppointmentByParticipantParams) (int64, error)
+	CheckPrescriptionFileNameExists(ctx context.Context, fileName pgtype.Text) (bool, error)
 	CreateAdminProfile(ctx context.Context, arg CreateAdminProfileParams) error
 	CreateAdminUser(ctx context.Context, arg CreateAdminUserParams) (uuid.UUID, error)
 	CreateAppointment(ctx context.Context, arg CreateAppointmentParams) (uuid.UUID, error)

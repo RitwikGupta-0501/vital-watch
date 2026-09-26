@@ -1447,9 +1447,11 @@ func TestUnifiedDownloadPrescription_DoctorAccess(t *testing.T) {
 type mockSafetyChecker struct {
 	hasAlert   bool
 	isDegraded bool
+	called     bool
 }
 
 func (m *mockSafetyChecker) CheckPrescriptionSafety(ctx context.Context, newMeds, activeMeds, allergies []string) (*safety.SafetyReport, error) {
+	m.called = true
 	if m.isDegraded {
 		return &safety.SafetyReport{
 			ServiceDegraded:       true,
@@ -2155,7 +2157,7 @@ func TestGetPrescriptionByID_PublicQRVerification(t *testing.T) {
 					Items: []models.PrescriptionItem{
 						{MedicationName: "Amoxicillin", Dosage: "500mg"},
 					},
-					Notes: "Take after meals",
+					Notes: "Take after meals. [Safety Override: Patient aware of mild allergy risk]",
 				}, nil
 			},
 		}
@@ -2182,6 +2184,13 @@ func TestGetPrescriptionByID_PublicQRVerification(t *testing.T) {
 		}
 		if resp["status"] != "approved" {
 			t.Errorf("expected status == approved, got %v", resp["status"])
+		}
+		if resp["notes"] != "Take after meals." {
+			t.Errorf("expected sanitized notes 'Take after meals.', got %q", resp["notes"])
+		}
+		maskedPID, ok := resp["patient_id"].(string)
+		if !ok || maskedPID == patientID.String() || !strings.HasPrefix(maskedPID, "********-****-****-****-") {
+			t.Errorf("expected masked patient_id with prefix '********-****-****-****-', got %q", maskedPID)
 		}
 	})
 
@@ -2320,3 +2329,112 @@ func TestDownloadPrescription_PathTraversalSanitization(t *testing.T) {
 		}
 	}
 }
+
+func TestVerifyPrescription_UnauthorizedDoctorBlockedBeforeSafetyCheck(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	doctorA := uuid.New()
+	unauthorizedDoctor := uuid.New()
+	patientID := uuid.New()
+	prescID := uuid.New()
+
+	mockSafety := &mockSafetyChecker{
+		hasAlert: true,
+	}
+
+	mockRepo := &repository.MockRepository{
+		GetPrescriptionByIDFunc: func(ctx context.Context, id uuid.UUID) (models.Prescription, error) {
+			return models.Prescription{
+				ID:        prescID,
+				DoctorID:  doctorA,
+				PatientID: patientID,
+				Status:    "needs_review",
+			}, nil
+		},
+		HasDoctorPatientRelationshipFunc: func(ctx context.Context, dID, pID uuid.UUID) (bool, error) {
+			return false, nil
+		},
+	}
+
+	h := &Handler{
+		Repo:          mockRepo,
+		SafetyChecker: mockSafety,
+	}
+
+	r := gin.New()
+	r.POST("/prescriptions/:id/verify", func(c *gin.Context) {
+		c.Set("userID", unauthorizedDoctor)
+		c.Set("role", "doctor")
+		h.VerifyPrescription(c)
+	})
+
+	body, _ := json.Marshal(VerifyPrescriptionRequest{
+		Status: "approved",
+		Items: []PrescriptionItemInput{
+			{MedicationName: "Warfarin", Dosage: "5mg"},
+		},
+	})
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/prescriptions/"+prescID.String()+"/verify", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for unauthorized doctor, got %d: %s", w.Code, w.Body.String())
+	}
+	if mockSafety.called {
+		t.Fatalf("expected safety check to NOT be called when doctor is unauthorized")
+	}
+}
+
+func TestCreatePrescription_DuplicateFileName409Conflict(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	doctorID := uuid.New()
+	patientID := uuid.New()
+	existingFileName := "prescription-" + patientID.String() + "-" + uuid.New().String() + ".pdf"
+
+	mockStorage := storage.NewMockProvider()
+	mockStorage.Files[existingFileName] = []byte("%PDF-1.4 test")
+
+	mockRepo := &repository.MockRepository{
+		GetPatientByIDFunc: func(ctx context.Context, id uuid.UUID) (models.Patient, error) {
+			return models.Patient{ID: id}, nil
+		},
+		GetAppointmentsForPatientFunc: func(ctx context.Context, dID, pID uuid.UUID, limit, offset int) ([]models.Appointment, error) {
+			return []models.Appointment{{ID: uuid.New()}}, nil
+		},
+		CheckPrescriptionFileNameExistsFunc: func(ctx context.Context, fileName string) (bool, error) {
+			return true, nil
+		},
+	}
+
+	h := &Handler{
+		Repo:    mockRepo,
+		Storage: mockStorage,
+	}
+
+	r := gin.New()
+	r.POST("/prescriptions", func(c *gin.Context) {
+		c.Set("userID", doctorID)
+		c.Set("role", "doctor")
+		h.CreatePrescription(c)
+	})
+
+	body, _ := json.Marshal(map[string]interface{}{
+		"patient_id": patientID.String(),
+		"file_name":  existingFileName,
+	})
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/prescriptions", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict for duplicate filename, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "already exists") {
+		t.Errorf("expected error message to mention 'already exists', got: %s", w.Body.String())
+	}
+}
+

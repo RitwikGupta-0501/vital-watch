@@ -20,6 +20,10 @@ func TestCleanDrugName(t *testing.T) {
 	}{
 		{"Amoxicillin 500mg", "amoxicillin"},
 		{"Metformin 1000 mg", "metformin"},
+		{"Metformin HCl 500mg", "metformin"},
+		{"Amlodipine Besylate 5mg", "amlodipine"},
+		{"Ciprofloxacin Hydrochloride", "ciprofloxacin"},
+		{"Levothyroxine Sodium 50mcg", "levothyroxine"},
 		{"Aspirin (oral)", "aspirin"},
 		{"Atorvastatin 20mg tablet", "atorvastatin"},
 		{"Vitamin D3 1000iu", "vitamin d3"},
@@ -250,6 +254,64 @@ func TestReciprocalDrugDrugInteraction(t *testing.T) {
 	}
 	if len(report.InteractionAlerts) != 1 {
 		t.Fatalf("expected exactly 1 interaction alert, got %d", len(report.InteractionAlerts))
+	}
+}
+
+func TestReciprocalDrugDrugInteraction_UpgradesModerateToContraindication(t *testing.T) {
+	// Drug A (DrugOne) returns a mild/moderate drug interaction
+	// Drug B (DrugTwo) returns a CONTRAINDICATION mentioning DrugOne
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query().Get("search")
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(query, "drugtwo") {
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"results": []map[string]interface{}{
+					{
+						"contraindications": []string{
+							"DrugTwo is strictly contraindicated when co-prescribed with drugone.",
+						},
+					},
+				},
+			})
+		} else {
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"results": []map[string]interface{}{
+					{
+						"drug_interactions": []string{
+							"DrugOne may moderately reduce absorption of drugtwo.",
+						},
+					},
+				},
+			})
+		}
+	}))
+	defer server.Close()
+
+	checker := NewOpenFDAChecker()
+	checker.SetBaseURL(server.URL)
+
+	report, err := checker.CheckPrescriptionSafety(
+		context.Background(),
+		[]string{"DrugOne 10mg", "DrugTwo 20mg"},
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !report.HasHighSeverityAlerts {
+		t.Fatalf("expected HasHighSeverityAlerts to be true because DrugTwo has a contraindication with DrugOne")
+	}
+
+	hasHighAlert := false
+	for _, alert := range report.InteractionAlerts {
+		if alert.Severity == SeverityHigh {
+			hasHighAlert = true
+		}
+	}
+	if !hasHighAlert {
+		t.Fatalf("expected at least one HIGH severity alert from reciprocal contraindication")
 	}
 }
 

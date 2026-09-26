@@ -134,12 +134,14 @@ func (c *OpenFDAChecker) putCache(key string, label cachedLabel) {
 var dosageRegex = regexp.MustCompile(`(?i)\b\d+(\.\d+)?\s*(mg|mcg|g|ml|tablets?|capsules?|pills?|drops?|iu|meq|%)\b`)
 var parenRegex = regexp.MustCompile(`\([^)]*\)`)
 var formRegex = regexp.MustCompile(`(?i)\b(tablets?|capsules?|pills?|drops?|solution|syrup|suspension|injection|cream|ointment)\b`)
+var saltRegex = regexp.MustCompile(`(?i)\b(hcl|hydrochloride|sodium|potassium|calcium|succinate|tartrate|maleate|fumarate|besylate|mesylate|phosphate|sulfate|nitrate|citrate|hydrate|monohydrate|dihydrate|trihydrate)\b`)
 
-// CleanDrugName strips dosages and extra annotations to isolate generic/brand chemical name
+// CleanDrugName strips dosages, pharmaceutical salts, and extra annotations to isolate generic/brand chemical name
 func CleanDrugName(name string) string {
 	cleaned := parenRegex.ReplaceAllString(name, " ")
 	cleaned = dosageRegex.ReplaceAllString(cleaned, " ")
 	cleaned = formRegex.ReplaceAllString(cleaned, " ")
+	cleaned = saltRegex.ReplaceAllString(cleaned, " ")
 	cleaned = strings.ReplaceAll(cleaned, `"`, " ")
 	cleaned = strings.ReplaceAll(cleaned, `\`, " ")
 	cleaned = strings.Join(strings.Fields(cleaned), " ")
@@ -331,15 +333,17 @@ func (c *OpenFDAChecker) CheckPrescriptionSafety(ctx context.Context, newMedicat
 			if errPrimary != nil {
 				recordDegraded(cleanPrimary)
 			}
-			alertFound := c.scanLabelForInteraction(report, labelPrimary, primaryDrug, secondaryDrug, cleanSecondary)
+			foundPrimary, isHighPrimary := c.scanLabelForInteraction(report, labelPrimary, primaryDrug, secondaryDrug, cleanSecondary)
 
-			// If no interaction found in primary drug label, check reciprocal (secondary drug label)
-			if !alertFound {
+			// HIGH-1: If primary drug did not yield a High severity contraindication, check reciprocal (secondary drug label)
+			// to ensure a high-severity contraindication in the secondary drug's FDA label is never masked
+			// by a moderate interaction in the primary drug's label.
+			if !isHighPrimary {
 				labelSecondary, errSecondary := c.getDrugLabel(ctx, cleanSecondary)
 				if errSecondary != nil {
-				recordDegraded(cleanSecondary)
+					recordDegraded(cleanSecondary)
 				}
-				c.scanLabelForInteraction(report, labelSecondary, secondaryDrug, primaryDrug, cleanPrimary)
+				c.scanLabelForReciprocalInteraction(report, labelSecondary, secondaryDrug, primaryDrug, cleanPrimary, foundPrimary)
 			}
 		}
 	}
@@ -363,19 +367,19 @@ func (c *OpenFDAChecker) CheckPrescriptionSafety(ctx context.Context, newMedicat
 	return report, nil
 }
 
-func (c *OpenFDAChecker) scanLabelForInteraction(report *SafetyReport, label *cachedLabel, drugA, drugB, cleanTarget string) bool {
+func (c *OpenFDAChecker) scanLabelForInteraction(report *SafetyReport, label *cachedLabel, drugA, drugB, cleanTarget string) (found bool, isHigh bool) {
 	if label == nil {
-		return false
+		return false, false
 	}
 	target := strings.TrimSpace(cleanTarget)
 	if target == "" {
-		return false
+		return false, false
 	}
 
 	pattern := `(?i)\b` + regexp.QuoteMeta(target) + `\b`
 	re, err := regexp.Compile(pattern)
 	if err != nil {
-		return false
+		return false, false
 	}
 
 	// 1. Check Contraindications (High severity)
@@ -389,7 +393,7 @@ func (c *OpenFDAChecker) scanLabelForInteraction(report *SafetyReport, label *ca
 				Source:      "OpenFDA Label: Contraindications",
 			})
 			report.HasHighSeverityAlerts = true
-			return true
+			return true, true
 		}
 	}
 
@@ -403,11 +407,60 @@ func (c *OpenFDAChecker) scanLabelForInteraction(report *SafetyReport, label *ca
 				Description: matchSnippet,
 				Source:      "OpenFDA Label: Drug Interactions",
 			})
-			return true
+			return true, false
 		}
 	}
 
-	return false
+	return false, false
+}
+
+func (c *OpenFDAChecker) scanLabelForReciprocalInteraction(report *SafetyReport, label *cachedLabel, drugA, drugB, cleanTarget string, alreadyFoundModerate bool) (found bool, isHigh bool) {
+	if label == nil {
+		return false, false
+	}
+	target := strings.TrimSpace(cleanTarget)
+	if target == "" {
+		return false, false
+	}
+
+	pattern := `(?i)\b` + regexp.QuoteMeta(target) + `\b`
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return false, false
+	}
+
+	// 1. Always check Contraindications (High severity) across the reciprocal label
+	for _, contra := range label.contraindications {
+		if matchSnippet := findInteractionSnippetWithRegex(contra, re); matchSnippet != "" {
+			report.InteractionAlerts = append(report.InteractionAlerts, InteractionAlert{
+				DrugA:       drugA,
+				DrugB:       drugB,
+				Severity:    SeverityHigh,
+				Description: matchSnippet,
+				Source:      "OpenFDA Label: Contraindications",
+			})
+			report.HasHighSeverityAlerts = true
+			return true, true
+		}
+	}
+
+	// 2. Check Drug Interactions (Moderate severity) only if not already discovered on the primary label
+	if !alreadyFoundModerate {
+		for _, inter := range label.interactions {
+			if matchSnippet := findInteractionSnippetWithRegex(inter, re); matchSnippet != "" {
+				report.InteractionAlerts = append(report.InteractionAlerts, InteractionAlert{
+					DrugA:       drugA,
+					DrugB:       drugB,
+					Severity:    SeverityModerate,
+					Description: matchSnippet,
+					Source:      "OpenFDA Label: Drug Interactions",
+				})
+				return true, false
+			}
+		}
+	}
+
+	return false, false
 }
 
 // findInteractionSnippet searches text for mention of target drug using word boundaries and extracts a relevant sentence

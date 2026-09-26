@@ -619,3 +619,17 @@ func (q *Queries) VerifyPrescription(ctx context.Context, arg VerifyPrescription
 	}
 	return result.RowsAffected(), nil
 }
+
+const checkPrescriptionFileNameExists = `-- name: CheckPrescriptionFileNameExists :one
+SELECT EXISTS(
+    SELECT 1 FROM prescriptions WHERE file_name = $1
+)
+`
+
+func (q *Queries) CheckPrescriptionFileNameExists(ctx context.Context, fileName pgtype.Text) (bool, error) {
+	row := q.db.QueryRow(ctx, checkPrescriptionFileNameExists, fileName)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -429,6 +430,13 @@ func (h *Handler) CreatePrescription(c *gin.Context) {
 		return
 	}
 
+	// HIGH-3: Check if file_name is already associated with an existing prescription
+	fileAlreadyUsed, chkErr := h.Repo.CheckPrescriptionFileNameExists(ctx, req.FileName)
+	if chkErr == nil && fileAlreadyUsed {
+		c.JSON(http.StatusConflict, gin.H{"error": "A prescription with this file name already exists"})
+		return
+	}
+
 	notes := strings.TrimSpace(req.Notes)
 	if req.Medication = strings.TrimSpace(req.Medication); req.Medication != "" {
 		if notes == "" {
@@ -444,6 +452,11 @@ func (h *Handler) CreatePrescription(c *gin.Context) {
 		go func() {
 			rbCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
+			// Guard: only delete file if no database record references it
+			inUse, cErr := h.Repo.CheckPrescriptionFileNameExists(rbCtx, req.FileName)
+			if cErr == nil && inUse {
+				return
+			}
 			if delErr := h.Storage.DeleteFile(rbCtx, req.FileName); delErr != nil {
 				slog.ErrorContext(rbCtx, "CRITICAL: Failed to rollback storage file", "error", delErr, "filename", req.FileName)
 			}
@@ -473,14 +486,20 @@ func (h *Handler) checkSafety(ctx context.Context, patientID uuid.UUID, items []
 		newMedNames = append(newMedNames, it.MedicationName)
 	}
 	activeMedNames := make([]string, 0)
-	activeRxs, err := h.Repo.GetPrescriptionsByPatientID(ctx, patientID, 50, 0)
-	if err == nil {
-		for _, rx := range activeRxs {
-			if rx.Status != "approved" {
-				continue
-			}
-			for _, it := range rx.Items {
-				activeMedNames = append(activeMedNames, it.MedicationName)
+	activeItems, err := h.Repo.GetActivePrescriptionItemsForPatient(ctx, patientID, time.Now())
+	if err == nil && len(activeItems) > 0 {
+		for _, it := range activeItems {
+			activeMedNames = append(activeMedNames, it.MedicationName)
+		}
+	} else {
+		// Fallback for repositories / mocks where only GetPrescriptionsByPatientID is implemented
+		if prescriptions, pErr := h.Repo.GetPrescriptionsByPatientID(ctx, patientID, 50, 0); pErr == nil {
+			for _, p := range prescriptions {
+				if p.Status == "approved" {
+					for _, it := range p.Items {
+						activeMedNames = append(activeMedNames, it.MedicationName)
+					}
+				}
 			}
 		}
 	}
@@ -695,17 +714,36 @@ func (h *Handler) VerifyPrescription(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
-	var existing models.Prescription
-	var getErr error
+	existing, getErr := h.Repo.GetPrescriptionByID(ctx, prescriptionID)
+	if getErr != nil || existing.ID == uuid.Nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Prescription not found"})
+		return
+	}
+
+	// CRITICAL-1: Enforce authorization immediately before any safety calculation or processing.
+	// Prevents unauthorized doctors from probing prescription UUIDs to extract patient medication/allergy history.
+	isAuthorized := existing.DoctorID == doctorID
+	if !isAuthorized {
+		hasRel, relErr := h.Repo.HasDoctorPatientRelationship(ctx, doctorID, existing.PatientID)
+		isAuthorized = relErr == nil && hasRel
+	}
+	if !isAuthorized {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied: you are not authorized to verify prescriptions for this patient"})
+		return
+	}
+
+	if existing.Status == "pending_ocr" {
+		c.JSON(http.StatusConflict, gin.H{"error": "Prescription OCR processing is in progress. Verification is only available once OCR completes."})
+		return
+	}
+	if existing.Status == "approved" || existing.Status == "rejected" {
+		c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("Prescription has already been verified (status: %s)", existing.Status)})
+		return
+	}
+
 	var items []models.PrescriptionItem
 
 	if req.Status == "approved" {
-		existing, getErr = h.Repo.GetPrescriptionByID(ctx, prescriptionID)
-		if getErr != nil || existing.ID == uuid.Nil {
-			c.JSON(http.StatusNotFound, gin.H{"error": "Prescription not found"})
-			return
-		}
-
 		var itemsToCheck []models.PrescriptionItem
 
 		if req.Items != nil {
@@ -766,101 +804,29 @@ func (h *Handler) VerifyPrescription(c *gin.Context) {
 	}
 
 	if !updated {
-		if getErr != nil || existing.ID == uuid.Nil {
-			existing, getErr = h.Repo.GetPrescriptionByID(ctx, prescriptionID)
-		}
-		if getErr == nil {
-			isAuthorized := existing.DoctorID == doctorID
-			if !isAuthorized {
-				hasRel, relErr := h.Repo.HasDoctorPatientRelationship(ctx, doctorID, existing.PatientID)
-				isAuthorized = relErr == nil && hasRel
-			}
-			if isAuthorized {
-				if existing.Status == "pending_ocr" {
-					c.JSON(http.StatusConflict, gin.H{"error": "Prescription OCR processing is in progress. Verification is only available once OCR completes."})
-					return
-				}
-				if existing.Status == "approved" || existing.Status == "rejected" {
-					c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("Prescription has already been verified (status: %s)", existing.Status)})
-					return
-				}
-			}
-		}
-		c.JSON(http.StatusNotFound, gin.H{"error": "Prescription not found or access denied"})
+		c.JSON(http.StatusConflict, gin.H{"error": "Prescription could not be updated or was modified concurrently"})
 		return
 	}
 
-	if existing.ID == uuid.Nil {
-		existing, getErr = h.Repo.GetPrescriptionByID(ctx, prescriptionID)
-	} else if req.Items != nil {
-		existing.Items = items
-	}
-
-	if getErr == nil {
-		if req.Status == "approved" {
-			if existing.FileName == "" {
-				pdfFileName := fmt.Sprintf("prescription-%s-%s.pdf", existing.PatientID.String(), prescriptionID.String())
-				if h.PDFGenerator != nil && h.Storage != nil {
-					doc, docErr := h.Repo.GetDoctorByID(ctx, doctorID)
-					if docErr != nil {
-						slog.WarnContext(c.Request.Context(), "Failed to fetch doctor details for PDF", "error", docErr)
-					}
-					pat, patErr := h.Repo.GetPatientByID(ctx, existing.PatientID)
-					if patErr != nil {
-						slog.WarnContext(c.Request.Context(), "Failed to fetch patient details for PDF", "error", patErr)
-					}
-
-					baseURL := os.Getenv("APP_BASE_URL")
-					if baseURL == "" {
-						baseURL = "https://vitalwatch.internal"
-					}
-					baseURL = strings.TrimRight(baseURL, "/")
-
-					pdfBytes, genErr := h.PDFGenerator.GeneratePrescriptionPDF(pdf.PrescriptionData{
-						PrescriptionID:  prescriptionID,
-						Date:            time.Now().UTC(),
-						DoctorName:      strings.TrimSpace(doc.FirstName + " " + doc.LastName),
-						DoctorSpecialty: doc.Specialty,
-						DoctorEmail:     doc.Email,
-						PatientName:     strings.TrimSpace(pat.FirstName + " " + pat.LastName),
-						PatientEmail:    pat.Email,
-						Notes:           notes,
-						Items:           existing.Items,
-						VerificationURL: fmt.Sprintf("%s/verify/rx/%s", baseURL, prescriptionID),
-					})
-					if genErr == nil {
-						if saveErr := h.Storage.SaveFile(ctx, pdfFileName, pdfBytes, "application/pdf"); saveErr != nil {
-							slog.ErrorContext(c.Request.Context(), "Failed to persist verified prescription PDF to storage", "error", saveErr)
-						} else {
-							if updateErr := h.Repo.UpdatePrescriptionFileName(ctx, prescriptionID, pdfFileName); updateErr != nil {
-								slog.ErrorContext(c.Request.Context(), "Failed to link verified prescription PDF filename in DB", "error", updateErr)
-							}
-						}
-					} else {
-						slog.WarnContext(c.Request.Context(), "Failed to generate verified prescription PDF", "error", genErr)
-					}
-				}
-			}
-
-			if h.Notifier != nil {
-				h.Notifier.Publish(notifications.NotificationEvent{
-					Type:           notifications.EventPrescriptionApproved,
-					PrescriptionID: prescriptionID,
-					PatientID:      existing.PatientID,
-					DoctorID:       doctorID,
-					Message:        "Prescription verified and approved by clinician",
-				})
-			}
-		} else if req.Status == "rejected" {
-			if h.Notifier != nil {
-				h.Notifier.Publish(notifications.NotificationEvent{
-					Type:           notifications.EventPrescriptionRejected,
-					PrescriptionID: prescriptionID,
-					PatientID:      existing.PatientID,
-					DoctorID:       doctorID,
-					Message:        "Prescription was rejected by clinician",
-				})
-			}
+	if req.Status == "approved" {
+		if h.Notifier != nil {
+			h.Notifier.Publish(notifications.NotificationEvent{
+				Type:           notifications.EventPrescriptionApproved,
+				PrescriptionID: prescriptionID,
+				PatientID:      existing.PatientID,
+				DoctorID:       doctorID,
+				Message:        "Prescription verified and approved by clinician",
+			})
+		}
+	} else if req.Status == "rejected" {
+		if h.Notifier != nil {
+			h.Notifier.Publish(notifications.NotificationEvent{
+				Type:           notifications.EventPrescriptionRejected,
+				PrescriptionID: prescriptionID,
+				PatientID:      existing.PatientID,
+				DoctorID:       doctorID,
+				Message:        "Prescription was rejected by clinician",
+			})
 		}
 	}
 
@@ -873,6 +839,12 @@ func (h *Handler) VerifyPrescription(c *gin.Context) {
 		"message": "Prescription verified successfully",
 		"status":  req.Status,
 	})
+}
+
+var safetyOverrideRegex = regexp.MustCompile(`(?i)\s*\[Safety Override:.*?\]`)
+
+func sanitizePublicNotes(notes string) string {
+	return strings.TrimSpace(safetyOverrideRegex.ReplaceAllString(notes, ""))
 }
 
 // GetPrescriptionByID retrieves a single prescription by ID with ownership access control,
@@ -905,15 +877,18 @@ func (h *Handler) GetPrescriptionByID(c *gin.Context) {
 		h.audit(c, audit.ActionReadPrescriptions, "prescription", &prescription.ID, nil, http.StatusOK, map[string]interface{}{
 			"mode": "public_qr_verification",
 		})
+		patientIDStr := prescription.PatientID.String()
+		maskedPatientID := "********-****-****-****-" + patientIDStr[len(patientIDStr)-12:]
 		c.JSON(http.StatusOK, gin.H{
-			"id":         prescription.ID,
-			"status":     prescription.Status,
-			"created_at": prescription.CreatedAt,
-			"doctor_id":  prescription.DoctorID,
-			"patient_id": prescription.PatientID,
-			"verified":   true,
-			"items":      prescription.Items,
-			"notes":      prescription.Notes,
+			"id":                prescription.ID,
+			"status":            prescription.Status,
+			"created_at":        prescription.CreatedAt,
+			"doctor_id":         prescription.DoctorID,
+			"patient_id":        maskedPatientID,
+			"masked_patient_id": maskedPatientID,
+			"verified":          true,
+			"items":             prescription.Items,
+			"notes":             sanitizePublicNotes(prescription.Notes),
 		})
 		return
 	}

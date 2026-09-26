@@ -67,7 +67,9 @@ func (w *PrescriptionOCRWorker) Work(ctx context.Context, job *river.Job[Prescri
 	// 1. If OCR is disabled, cleanly transition to needs_review for manual clinician entry
 	if w.ocrManager == nil || !w.ocrManager.IsEnabled() {
 		slog.InfoContext(ctx, "OCR disabled; transitioning prescription to needs_review", "prescription_id", job.Args.PrescriptionID)
-		return w.repo.UpdatePrescriptionOCRResults(ctx, job.Args.PrescriptionID, "needs_review", "[OCR disabled: manual entry required]", "", nil)
+		err := w.repo.UpdatePrescriptionOCRResults(ctx, job.Args.PrescriptionID, "needs_review", "[OCR disabled: manual entry required]", "", nil)
+		w.notifyDoctor(ctx, job.Args.PrescriptionID, "OCR disabled: manual clinical review required", 0, "")
+		return err
 	}
 
 	// 2. Fetch file bytes from storage provider
@@ -84,6 +86,7 @@ func (w *PrescriptionOCRWorker) Work(ctx context.Context, job *river.Job[Prescri
 			if updateErr := w.repo.UpdatePrescriptionOCRResults(ctx, job.Args.PrescriptionID, "needs_review", fmt.Sprintf("[Storage error: %v]", err), "", nil); updateErr != nil {
 				return fmt.Errorf("failed to update prescription status after permanent storage failure: %w", updateErr)
 			}
+			w.notifyDoctor(ctx, job.Args.PrescriptionID, "Prescription file could not be retrieved from storage; manual review required", 0, "")
 			return nil
 		}
 
@@ -92,6 +95,7 @@ func (w *PrescriptionOCRWorker) Work(ctx context.Context, job *river.Job[Prescri
 			if updateErr := w.repo.UpdatePrescriptionOCRResults(ctx, job.Args.PrescriptionID, "needs_review", fmt.Sprintf("[Storage failed after %d attempts: %v]", attempt, err), "", nil); updateErr != nil {
 				return fmt.Errorf("failed to update prescription status after max storage attempts: %w", updateErr)
 			}
+			w.notifyDoctor(ctx, job.Args.PrescriptionID, "Storage retrieval retry budget exhausted; manual review required", 0, "")
 			return nil
 		}
 

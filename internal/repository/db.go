@@ -856,16 +856,18 @@ func (r *DBRepository) VerifyPrescription(ctx context.Context, prescriptionID, d
 				}
 			}
 		}
+		var exp time.Time
 		if len(itemsForExpiry) > 0 {
-			exp := calculatePrescriptionExpiry(itemsForExpiry)
-			if !exp.IsZero() {
-				if err := qtx.UpdatePrescriptionExpiry(ctx, dbgen.UpdatePrescriptionExpiryParams{
-					ExpiresAt: pgtype.Timestamptz{Time: exp, Valid: true},
-					ID:        prescriptionID,
-				}); err != nil {
-					return false, fmt.Errorf("failed to update prescription expiry: %w", err)
-				}
-			}
+			exp = calculatePrescriptionExpiry(itemsForExpiry)
+		}
+		if exp.IsZero() {
+			exp = time.Now().Add(30 * 24 * time.Hour)
+		}
+		if err := qtx.UpdatePrescriptionExpiry(ctx, dbgen.UpdatePrescriptionExpiryParams{
+			ExpiresAt: pgtype.Timestamptz{Time: exp, Valid: true},
+			ID:        prescriptionID,
+		}); err != nil {
+			return false, fmt.Errorf("failed to update prescription expiry: %w", err)
 		}
 	}
 
@@ -1119,6 +1121,10 @@ func (r *DBRepository) UpdatePrescriptionFileName(ctx context.Context, prescript
 		return fmt.Errorf("failed to update prescription file_name: %w", err)
 	}
 	return nil
+}
+
+func (r *DBRepository) CheckPrescriptionFileNameExists(ctx context.Context, fileName string) (bool, error) {
+	return r.queries.CheckPrescriptionFileNameExists(ctx, pgtype.Text{String: fileName, Valid: fileName != ""})
 }
 
 // Helpers for Phase 4 conversions

@@ -45,13 +45,13 @@ func (h *Handler) HandleLocalStorageUpload(c *gin.Context) {
 		return
 	}
 
-	// Bound the read to 10MB
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 10<<20)
+	// Bound the read to storage.MaxOCRFileSize (15MB)
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, storage.MaxOCRFileSize)
 	data, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
-			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "File size exceeds maximum limit of 10MB"})
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "File size exceeds maximum limit of 15MB"})
 			return
 		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to read body"})

@@ -67,6 +67,7 @@ type Repository interface {
 	GetPrescriptionByFilenameForDoctor(ctx context.Context, doctorID uuid.UUID, filename string) (models.Prescription, error)
 	GetPrescriptionByID(ctx context.Context, id uuid.UUID) (models.Prescription, error)
 	UpdatePrescriptionFileName(ctx context.Context, prescriptionID uuid.UUID, fileName string) error
+	CheckPrescriptionFileNameExists(ctx context.Context, fileName string) (bool, error)
 
 	// Phase 5: Refresh Tokens & Session Management
 	CreateRefreshToken(ctx context.Context, userID uuid.UUID, tokenHash string, expiresAt time.Time) (models.RefreshToken, error)

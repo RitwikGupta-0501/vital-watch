@@ -142,3 +142,8 @@ UPDATE prescriptions
 SET file_name = $1, updated_at = now()
 WHERE id = $2;
 
+-- name: CheckPrescriptionFileNameExists :one
+SELECT EXISTS(
+    SELECT 1 FROM prescriptions WHERE file_name = $1
+);
+

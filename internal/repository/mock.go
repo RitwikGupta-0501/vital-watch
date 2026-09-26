@@ -57,6 +57,7 @@ type MockRepository struct {
 	GetPrescriptionByFilenameForDoctorFunc func(ctx context.Context, doctorID uuid.UUID, filename string) (models.Prescription, error)
 	GetPrescriptionByIDFunc                func(ctx context.Context, id uuid.UUID) (models.Prescription, error)
 	UpdatePrescriptionFileNameFunc         func(ctx context.Context, prescriptionID uuid.UUID, fileName string) error
+	CheckPrescriptionFileNameExistsFunc    func(ctx context.Context, fileName string) (bool, error)
 
 	CreateRefreshTokenFunc          func(ctx context.Context, userID uuid.UUID, tokenHash string, expiresAt time.Time) (models.RefreshToken, error)
 	GetRefreshTokenByHashFunc       func(ctx context.Context, tokenHash string) (models.RefreshToken, error)
@@ -340,6 +341,13 @@ func (m *MockRepository) UpdatePrescriptionFileName(ctx context.Context, prescri
 		return m.UpdatePrescriptionFileNameFunc(ctx, prescriptionID, fileName)
 	}
 	return nil
+}
+
+func (m *MockRepository) CheckPrescriptionFileNameExists(ctx context.Context, fileName string) (bool, error) {
+	if m.CheckPrescriptionFileNameExistsFunc != nil {
+		return m.CheckPrescriptionFileNameExistsFunc(ctx, fileName)
+	}
+	return false, nil
 }
 
 func (m *MockRepository) VerifyPrescriptionItemOwnership(ctx context.Context, itemID, patientID uuid.UUID) (bool, error) {

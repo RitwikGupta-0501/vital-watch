@@ -439,7 +439,7 @@ func setupRouter(h *api.Handler, storageType string, jwtSecret []byte) *gin.Engi
 	}
 
 	// Public Clinical Prescription Verification (scanned via QR code on prescription PDFs)
-	r.GET("/verify/rx/:id", h.GetPrescriptionByID)
+	r.GET("/verify/rx/:id", authLimiter.Middleware(), h.GetPrescriptionByID)
 
 	// Local development file routes with cryptographic HMAC pre-signing
 	if storageType == "local" {
