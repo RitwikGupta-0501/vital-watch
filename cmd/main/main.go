@@ -27,7 +27,7 @@ import (
 
 	"github.com/RitwikGupta-0501/vital-watch/internal/api"
 	"github.com/RitwikGupta-0501/vital-watch/internal/audit"
-	_ "github.com/RitwikGupta-0501/vital-watch/internal/logger"
+	"github.com/RitwikGupta-0501/vital-watch/internal/logger"
 	"github.com/RitwikGupta-0501/vital-watch/internal/middleware"
 	"github.com/RitwikGupta-0501/vital-watch/internal/notifications"
 	"github.com/RitwikGupta-0501/vital-watch/internal/ocr"
@@ -65,11 +65,24 @@ func init_db(ctx context.Context) *pgxpool.Pool {
 		log.Fatal("Failed to parse database pool configuration:", err)
 	}
 
-	// Tune database connection pool settings (DB-03)
-	poolConfig.MaxConns = 25
-	poolConfig.MinConns = 5
-	poolConfig.MaxConnLifetime = 5 * time.Minute
-	poolConfig.MaxConnIdleTime = 2 * time.Minute
+	// Tune database connection pool settings (DB-03, OPS-01)
+	maxConns := 50
+	if val := os.Getenv("DB_MAX_CONNS"); val != "" {
+		if n, err := strconv.Atoi(val); err == nil && n > 0 {
+			maxConns = n
+		}
+	}
+	minConns := 10
+	if val := os.Getenv("DB_MIN_CONNS"); val != "" {
+		if n, err := strconv.Atoi(val); err == nil && n > 0 {
+			minConns = n
+		}
+	}
+
+	poolConfig.MaxConns = int32(maxConns)
+	poolConfig.MinConns = int32(minConns)
+	poolConfig.MaxConnLifetime = 1 * time.Hour
+	poolConfig.MaxConnIdleTime = 30 * time.Minute
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
@@ -132,6 +145,10 @@ func main() {
 	if err != nil {
 		slog.Info("No .env file found, relying on system environment variables")
 	}
+
+	// Re-initialize logger to apply LOG_LEVEL and LOG_FORMAT loaded from .env
+	logger.DefaultLogger = logger.InitLogger()
+	slog.SetDefault(logger.DefaultLogger)
 
 	// Validate critical environment variables
 	jwtSecretStr := os.Getenv("JWT_SECRET")
@@ -359,14 +376,16 @@ func setupRouter(h *api.Handler, storageType string, jwtSecret []byte) *gin.Engi
 	r.Use(cors.New(cors.Config{
 		AllowOrigins:     allowedOrigins,
 		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
-		ExposeHeaders:    []string{"Content-Length"},
+		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization", "X-Request-ID"},
+		ExposeHeaders:    []string{"Content-Length", "X-Request-ID"},
 		AllowCredentials: true,
 	}))
 
 	// -----------------------
 	// -       Routes        -
 	// -----------------------
+	r.GET("/healthz", h.HealthCheck)
+	r.GET("/api/healthz", h.HealthCheck)
 	r.GET("/api/ping", h.Ping)
 	r.POST("/api/register", authLimiter.Middleware(), h.Register)
 	r.POST("/api/login", authLimiter.Middleware(), h.Login)

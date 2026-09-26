@@ -42,6 +42,14 @@ func (r *DBRepository) SetRiverClient(riverClient *river.Client[pgx.Tx]) {
 	r.riverClient = riverClient
 }
 
+// Ping checks if the underlying PostgreSQL connection pool is alive and reachable.
+func (r *DBRepository) Ping(ctx context.Context) error {
+	if r.pool == nil {
+		return fmt.Errorf("database pool is not initialized")
+	}
+	return r.pool.Ping(ctx)
+}
+
 func clampPagination(limit, offset int) (int, int) {
 	if limit <= 0 {
 		limit = 20

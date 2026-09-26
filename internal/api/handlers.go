@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -90,6 +91,36 @@ func (h *Handler) IsUserActive(ctx context.Context, userID uuid.UUID, role strin
 
 func (h *Handler) Ping(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "pong from the api layer!"})
+}
+
+// HealthCheck verifies backend liveness and database connectivity for container probes.
+func (h *Handler) HealthCheck(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+	defer cancel()
+
+	if h.Repo == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"status":   "degraded",
+			"database": "down",
+			"error":    "repository not initialized",
+		})
+		return
+	}
+
+	if err := h.Repo.Ping(ctx); err != nil {
+		slog.Error("HealthCheck: database ping failed", "error", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"status":   "degraded",
+			"database": "down",
+			"error":    err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":   "healthy",
+		"database": "up",
+	})
 }
 
 func AuthMiddleware(jwtSecret []byte) gin.HandlerFunc {

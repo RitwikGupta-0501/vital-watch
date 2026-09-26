@@ -196,3 +196,26 @@ func TestAsyncAuditor_RepoErrorResilience(t *testing.T) {
 		t.Fatalf("auditor failed to shutdown cleanly after repo error: %v", err)
 	}
 }
+
+func TestAsyncAuditor_FallbackRepoErrorResilience(t *testing.T) {
+	mockRepo := &repository.MockRepository{
+		CreateAuditLogFunc: func(ctx context.Context, log models.PhiAuditLog) (uuid.UUID, error) {
+			return uuid.Nil, errors.New("simulated synchronous fallback database failure")
+		},
+	}
+
+	// Buffer size 1 to quickly force synchronous fallback
+	auditor := NewAsyncAuditor(mockRepo, 1)
+
+	// Send entries to saturate channel and trigger synchronous fallback with error
+	for i := 0; i < 5; i++ {
+		auditor.Log(models.PhiAuditLog{Action: ActionLogMedicationAdherence})
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := auditor.Shutdown(shutdownCtx); err != nil {
+		t.Fatalf("auditor failed to shutdown cleanly after fallback error: %v", err)
+	}
+}
+

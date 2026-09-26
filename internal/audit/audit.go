@@ -111,7 +111,9 @@ func (a *AsyncAuditor) Log(entry models.PhiAuditLog) {
 		slog.Warn("HIPAA Audit queue full; logging synchronously to prevent audit loss", "action", entry.Action)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_, _ = a.repo.CreateAuditLog(ctx, entry)
+		if _, err := a.repo.CreateAuditLog(ctx, entry); err != nil {
+			slog.Error("Critical: Failed to persist synchronous HIPAA audit log fallback", "error", err, "action", entry.Action)
+		}
 	}
 }
 

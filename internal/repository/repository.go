@@ -15,6 +15,8 @@ var ErrTokenAlreadyRotated = errors.New("token rotation replay detected: replace
 
 // Repository defines all database operations needed by the application handlers
 type Repository interface {
+	Ping(ctx context.Context) error
+
 	CreatePatient(ctx context.Context, firstName, lastName, email, hashedPassword string) (uuid.UUID, error)
 	GetPatientByEmail(ctx context.Context, email string) (models.Patient, error)
 	GetPatientByID(ctx context.Context, id uuid.UUID) (models.Patient, error)

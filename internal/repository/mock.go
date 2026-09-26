@@ -14,6 +14,7 @@ var _ Repository = (*MockRepository)(nil)
 
 // MockRepository provides a thread-safe, customizable mock for unit testing
 type MockRepository struct {
+	PingFunc                                  func(ctx context.Context) error
 	CreatePatientFunc                         func(ctx context.Context, firstName, lastName, email, hashedPassword string) (uuid.UUID, error)
 	GetPatientByEmailFunc                     func(ctx context.Context, email string) (models.Patient, error)
 	GetPatientByIDFunc                        func(ctx context.Context, id uuid.UUID) (models.Patient, error)
@@ -525,4 +526,12 @@ func (m *MockRepository) UpdateUserActiveStatus(ctx context.Context, id uuid.UUI
 	}
 	return nil
 }
+
+func (m *MockRepository) Ping(ctx context.Context) error {
+	if m.PingFunc != nil {
+		return m.PingFunc(ctx)
+	}
+	return nil
+}
+
 
