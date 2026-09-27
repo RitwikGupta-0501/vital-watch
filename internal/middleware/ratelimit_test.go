@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -162,7 +163,7 @@ func TestRateLimiter_ConcurrencySafety(t *testing.T) {
 		c.String(http.StatusOK, "ok")
 	})
 
-	const numGoroutines = 20
+	const numGoroutines = 1000
 	var wg sync.WaitGroup
 	var successCount int32
 	var rateLimitedCount int32
@@ -173,7 +174,7 @@ func TestRateLimiter_ConcurrencySafety(t *testing.T) {
 			defer wg.Done()
 			w := httptest.NewRecorder()
 			req, _ := http.NewRequest(http.MethodGet, "/concurrent", nil)
-			req.RemoteAddr = "10.0.0.1:10000"
+			req.RemoteAddr = fmt.Sprintf("10.0.%d.%d:10000", idx%256, (idx/256)%256)
 			r.ServeHTTP(w, req)
 			if w.Code == http.StatusOK {
 				atomic.AddInt32(&successCount, 1)

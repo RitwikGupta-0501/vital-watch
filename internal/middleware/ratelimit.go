@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+	"encoding/json"
 	"time"
 
 	"github.com/RitwikGupta-0501/vital-watch/internal/audit"
@@ -18,17 +19,32 @@ type tokenBucket struct {
 	lastUpdate time.Time
 }
 
+type shard struct {
+	mu      sync.Mutex
+	clients map[string]*tokenBucket
+}
+
+const numShards uint32 = 64
+
 // RateLimiter provides memory-safe token-bucket rate limiting per client IP
 // with automatic background pruning to prevent memory exhaustion (DoS).
 type RateLimiter struct {
-	mu       sync.Mutex
-	clients  map[string]*tokenBucket
+	shards   []*shard
 	rate     float64       // token replenishment rate (tokens/sec)
 	capacity float64       // burst limit
 	window   time.Duration
 	limit    int
 	auditor  audit.Auditor
 	stopChan chan struct{}
+}
+
+func getShardIndex(ip string) uint32 {
+	var hash uint32 = 2166136261
+	for i := 0; i < len(ip); i++ {
+		hash ^= uint32(ip[i])
+		hash *= 16777619
+	}
+	return hash % numShards
 }
 
 // NewRateLimiter creates a new RateLimiter allowing `limit` requests per `window` duration per IP.
@@ -41,8 +57,16 @@ func NewRateLimiter(limit int, window time.Duration, auditor audit.Auditor) *Rat
 	}
 
 	rate := float64(limit) / window.Seconds()
+
+	shards := make([]*shard, numShards)
+	for i := uint32(0); i < numShards; i++ {
+		shards[i] = &shard{
+			clients: make(map[string]*tokenBucket),
+		}
+	}
+
 	rl := &RateLimiter{
-		clients:  make(map[string]*tokenBucket),
+		shards:   shards,
 		rate:     rate,
 		capacity: float64(limit),
 		window:   window,
@@ -80,13 +104,15 @@ func (rl *RateLimiter) cleanupRoutine(interval time.Duration) {
 		case <-rl.stopChan:
 			return
 		case now := <-ticker.C:
-			rl.mu.Lock()
-			for ip, bucket := range rl.clients {
-				if now.Sub(bucket.lastUpdate) > interval {
-					delete(rl.clients, ip)
+			for _, s := range rl.shards {
+				s.mu.Lock()
+				for ip, bucket := range s.clients {
+					if now.Sub(bucket.lastUpdate) > interval {
+						delete(s.clients, ip)
+					}
 				}
+				s.mu.Unlock()
 			}
-			rl.mu.Unlock()
 		}
 	}
 }
@@ -99,15 +125,18 @@ func (rl *RateLimiter) Middleware() gin.HandlerFunc {
 			ip = "unknown"
 		}
 
-		rl.mu.Lock()
+		shardIdx := getShardIndex(ip)
+		s := rl.shards[shardIdx]
+
+		s.mu.Lock()
 		now := time.Now()
-		bucket, exists := rl.clients[ip]
+		bucket, exists := s.clients[ip]
 		if !exists {
 			bucket = &tokenBucket{
 				tokens:     rl.capacity,
 				lastUpdate: now,
 			}
-			rl.clients[ip] = bucket
+			s.clients[ip] = bucket
 		}
 
 		// Replenish tokens based on elapsed duration
@@ -121,7 +150,7 @@ func (rl *RateLimiter) Middleware() gin.HandlerFunc {
 			if retryAfter < 1 {
 				retryAfter = 1
 			}
-			rl.mu.Unlock()
+			s.mu.Unlock()
 
 			c.Header("Retry-After", strconv.Itoa(retryAfter))
 			c.Header("X-RateLimit-Limit", strconv.Itoa(rl.limit))
@@ -134,7 +163,7 @@ func (rl *RateLimiter) Middleware() gin.HandlerFunc {
 					IPAddress:  ip,
 					UserAgent:  c.Request.UserAgent(),
 					StatusCode: http.StatusTooManyRequests,
-					Metadata:   fmt.Sprintf(`{"path":%q,"method":%q,"retry_after":%d}`, c.Request.URL.Path, c.Request.Method, retryAfter),
+					Metadata:   json.RawMessage(fmt.Sprintf(`{"path":%q,"method":%q,"retry_after":%d}`, c.Request.URL.Path, c.Request.Method, retryAfter)),
 				})
 			}
 
@@ -147,7 +176,7 @@ func (rl *RateLimiter) Middleware() gin.HandlerFunc {
 		// Consume 1 token
 		bucket.tokens -= 1.0
 		remaining := int(math.Floor(bucket.tokens))
-		rl.mu.Unlock()
+		s.mu.Unlock()
 
 		c.Header("X-RateLimit-Limit", strconv.Itoa(rl.limit))
 		c.Header("X-RateLimit-Remaining", strconv.Itoa(remaining))
