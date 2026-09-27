@@ -250,7 +250,12 @@ func main() {
 	safetyChecker := safety.NewOpenFDAChecker()
 	notifier := notifications.NewSSEBroker()
 	telehealthProv := telehealth.NewTelehealthManager(jwtSecret)
-	auditor := audit.NewAsyncAuditor(repo, 1000)
+	dlqFilePath := os.Getenv("AUDIT_DLQ_PATH")
+	if dlqFilePath == "" {
+		dlqFilePath = "audit_dlq.jsonl"
+	}
+	dlq := audit.NewFileDLQ(dlqFilePath)
+	auditor := audit.NewAsyncAuditor(repo, dlq, 1000)
 
 	// Initialize River Task Queue & Worker
 	ocrWorker := queue.NewPrescriptionOCRWorker(repo, storageProvider, ocrManager)

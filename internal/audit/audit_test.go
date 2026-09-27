@@ -13,6 +13,18 @@ import (
 	"github.com/RitwikGupta-0501/vital-watch/internal/repository"
 )
 
+type MockDLQ struct {
+	mu      sync.Mutex
+	entries []models.PhiAuditLog
+}
+
+func (m *MockDLQ) Enqueue(ctx context.Context, entry models.PhiAuditLog) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.entries = append(m.entries, entry)
+	return nil
+}
+
 func TestAsyncAuditor_WorkerAndDrain(t *testing.T) {
 	var loggedEntries []models.PhiAuditLog
 	mockRepo := &repository.MockRepository{
@@ -22,7 +34,8 @@ func TestAsyncAuditor_WorkerAndDrain(t *testing.T) {
 		},
 	}
 
-	auditor := NewAsyncAuditor(mockRepo, 10)
+	dlq := &MockDLQ{}
+	auditor := NewAsyncAuditor(mockRepo, dlq, 10)
 
 	patientID := uuid.New()
 	userID := uuid.New()
@@ -40,7 +53,6 @@ func TestAsyncAuditor_WorkerAndDrain(t *testing.T) {
 
 	auditor.Log(entry)
 
-	// Shutdown should drain pending logs
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := auditor.Shutdown(shutdownCtx); err != nil {
@@ -50,7 +62,6 @@ func TestAsyncAuditor_WorkerAndDrain(t *testing.T) {
 	if len(loggedEntries) != 1 {
 		t.Fatalf("expected 1 logged audit entry, got %d", len(loggedEntries))
 	}
-
 	if loggedEntries[0].Action != ActionReadPrescriptions {
 		t.Errorf("expected action %s, got %s", ActionReadPrescriptions, loggedEntries[0].Action)
 	}
@@ -73,7 +84,8 @@ func TestAsyncAuditor_ConcurrentLogAndShutdown(t *testing.T) {
 		},
 	}
 
-	auditor := NewAsyncAuditor(mockRepo, 100)
+	dlq := &MockDLQ{}
+	auditor := NewAsyncAuditor(mockRepo, dlq, 100)
 
 	done := make(chan struct{})
 	go func() {
@@ -89,47 +101,10 @@ func TestAsyncAuditor_ConcurrentLogAndShutdown(t *testing.T) {
 	defer cancel()
 	_ = auditor.Shutdown(shutdownCtx)
 
-	// Additional Log calls after shutdown should be safely ignored and not panic
 	for i := 0; i < 50; i++ {
 		auditor.Log(models.PhiAuditLog{Action: ActionReadPrescriptions})
 	}
 	<-done
-}
-
-func TestAsyncAuditor_QueueFullFallback(t *testing.T) {
-	var count int64
-	var mu sync.Mutex
-	mockRepo := &repository.MockRepository{
-		CreateAuditLogFunc: func(ctx context.Context, log models.PhiAuditLog) (uuid.UUID, error) {
-			mu.Lock()
-			count++
-			mu.Unlock()
-			return uuid.New(), nil
-		},
-	}
-
-	// Tiny buffer of 2
-	auditor := NewAsyncAuditor(mockRepo, 2)
-
-	// Send 15 items rapidly, which will fill buffer of 2 and trigger synchronous fallback
-	totalEntries := 15
-	for i := 0; i < totalEntries; i++ {
-		auditor.Log(models.PhiAuditLog{Action: ActionViewVitals})
-	}
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	if err := auditor.Shutdown(shutdownCtx); err != nil {
-		t.Fatalf("shutdown error: %v", err)
-	}
-
-	mu.Lock()
-	finalCount := count
-	mu.Unlock()
-
-	if int(finalCount) != totalEntries {
-		t.Errorf("expected all %d entries to be logged via async queue or fallback, got %d", totalEntries, finalCount)
-	}
 }
 
 func TestAsyncAuditor_HighConcurrencyStress(t *testing.T) {
@@ -144,7 +119,8 @@ func TestAsyncAuditor_HighConcurrencyStress(t *testing.T) {
 		},
 	}
 
-	auditor := NewAsyncAuditor(mockRepo, 50)
+	dlq := &MockDLQ{}
+	auditor := NewAsyncAuditor(mockRepo, dlq, 50)
 	concurrency := 20
 	iterations := 25
 	var wg sync.WaitGroup
@@ -171,51 +147,101 @@ func TestAsyncAuditor_HighConcurrencyStress(t *testing.T) {
 	finalCount := count
 	mu.Unlock()
 
+	dlq.mu.Lock()
+	dlqCount := len(dlq.entries)
+	dlq.mu.Unlock()
+
 	expectedTotal := concurrency * iterations
-	if int(finalCount) != expectedTotal {
-		t.Errorf("expected %d entries, got %d", expectedTotal, finalCount)
+	if int(finalCount)+dlqCount != expectedTotal {
+		t.Errorf("expected %d entries, got %d (DB) + %d (DLQ)", expectedTotal, finalCount, dlqCount)
 	}
 }
 
-func TestAsyncAuditor_RepoErrorResilience(t *testing.T) {
+func TestAsyncAuditor_WorkerRetriesAndDLQ(t *testing.T) {
+	var attempts int
+	var mu sync.Mutex
 	mockRepo := &repository.MockRepository{
 		CreateAuditLogFunc: func(ctx context.Context, log models.PhiAuditLog) (uuid.UUID, error) {
-			return uuid.Nil, errors.New("simulated database failure")
+			mu.Lock()
+			attempts++
+			mu.Unlock()
+			return uuid.Nil, errors.New("simulated persistent database failure")
 		},
 	}
 
-	auditor := NewAsyncAuditor(mockRepo, 10)
+	dlq := &MockDLQ{}
+	auditor := NewAsyncAuditor(mockRepo, dlq, 10)
 
-	for i := 0; i < 5; i++ {
-		auditor.Log(models.PhiAuditLog{Action: ActionLogMedicationAdherence})
-	}
+	auditor.Log(models.PhiAuditLog{Action: ActionLogMedicationAdherence})
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := auditor.Shutdown(shutdownCtx); err != nil {
-		t.Fatalf("auditor failed to shutdown cleanly after repo error: %v", err)
+		t.Fatalf("auditor failed to shutdown: %v", err)
+	}
+
+	mu.Lock()
+	finalAttempts := attempts
+	mu.Unlock()
+
+	// Initial attempt + 3 retries = 4 attempts total
+	if finalAttempts != 4 {
+		t.Errorf("expected 4 repo creation attempts, got %d", finalAttempts)
+	}
+
+	dlq.mu.Lock()
+	defer dlq.mu.Unlock()
+	if len(dlq.entries) != 1 {
+		t.Fatalf("expected 1 entry in DLQ, got %d", len(dlq.entries))
+	}
+	if dlq.entries[0].Action != ActionLogMedicationAdherence {
+		t.Errorf("expected DLQ action %s, got %s", ActionLogMedicationAdherence, dlq.entries[0].Action)
 	}
 }
 
-func TestAsyncAuditor_FallbackRepoErrorResilience(t *testing.T) {
+func TestAsyncAuditor_QueueFullRoutesToDLQ(t *testing.T) {
+	var count int64
+	var mu sync.Mutex
 	mockRepo := &repository.MockRepository{
 		CreateAuditLogFunc: func(ctx context.Context, log models.PhiAuditLog) (uuid.UUID, error) {
-			return uuid.Nil, errors.New("simulated synchronous fallback database failure")
+			// Simulate a slow database to force queue to fill
+			time.Sleep(100 * time.Millisecond)
+			mu.Lock()
+			count++
+			mu.Unlock()
+			return uuid.New(), nil
 		},
 	}
 
-	// Buffer size 1 to quickly force synchronous fallback
-	auditor := NewAsyncAuditor(mockRepo, 1)
+	dlq := &MockDLQ{}
+	// Tiny buffer of 1 to quickly force DLQ fallback
+	auditor := NewAsyncAuditor(mockRepo, dlq, 1)
 
-	// Send entries to saturate channel and trigger synchronous fallback with error
-	for i := 0; i < 5; i++ {
-		auditor.Log(models.PhiAuditLog{Action: ActionLogMedicationAdherence})
+	// Send 10 entries rapidly. The queue (size 1) and workers (5) will consume up to 6 immediately.
+	// The rest should instantly fall back to the DLQ.
+	totalEntries := 10
+	for i := 0; i < totalEntries; i++ {
+		auditor.Log(models.PhiAuditLog{Action: ActionViewVitals})
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := auditor.Shutdown(shutdownCtx); err != nil {
-		t.Fatalf("auditor failed to shutdown cleanly after fallback error: %v", err)
+	_ = auditor.Shutdown(shutdownCtx)
+
+	dlq.mu.Lock()
+	defer dlq.mu.Unlock()
+	
+	// We expect some entries to have been routed to the DLQ since the DB was slow.
+	if len(dlq.entries) == 0 {
+		t.Errorf("expected some entries to route to DLQ due to full queue, got 0")
+	}
+
+	// The total processed by DB + DLQ should equal the total entries sent
+	mu.Lock()
+	finalCount := count
+	mu.Unlock()
+	
+	if int(finalCount)+len(dlq.entries) != totalEntries {
+		t.Errorf("expected total entries %d, got %d (DB) + %d (DLQ)", totalEntries, finalCount, len(dlq.entries))
 	}
 }
-

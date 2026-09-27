@@ -52,10 +52,15 @@ type Auditor interface {
 	Shutdown(ctx context.Context) error
 }
 
+type DLQ interface {
+	Enqueue(ctx context.Context, entry models.PhiAuditLog) error
+}
+
 // AsyncAuditor records audit logs in a non-blocking background queue using a
 // worker pool to prevent single-goroutine throughput bottlenecks.
 type AsyncAuditor struct {
 	repo        repository.Repository
+	dlq         DLQ
 	logChan     chan models.PhiAuditLog
 	wg          sync.WaitGroup
 	workerCount int
@@ -63,12 +68,13 @@ type AsyncAuditor struct {
 	closed      bool
 }
 
-func NewAsyncAuditor(repo repository.Repository, bufferSize int) *AsyncAuditor {
+func NewAsyncAuditor(repo repository.Repository, dlq DLQ, bufferSize int) *AsyncAuditor {
 	if bufferSize <= 0 {
 		bufferSize = 1000
 	}
 	a := &AsyncAuditor{
 		repo:        repo,
+		dlq:         dlq,
 		logChan:     make(chan models.PhiAuditLog, bufferSize),
 		workerCount: DefaultWorkerCount,
 	}
@@ -83,11 +89,34 @@ func NewAsyncAuditor(repo repository.Repository, bufferSize int) *AsyncAuditor {
 func (a *AsyncAuditor) worker() {
 	defer a.wg.Done()
 	for entry := range a.logChan {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if _, err := a.repo.CreateAuditLog(ctx, entry); err != nil {
-			slog.Error("Failed to persist HIPAA ePHI audit log", "error", err, "action", entry.Action)
+		var err error
+		backoff := 100 * time.Millisecond
+		maxRetries := 3
+
+		for i := 0; i <= maxRetries; i++ {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_, err = a.repo.CreateAuditLog(ctx, entry)
+			cancel()
+
+			if err == nil {
+				break
+			}
+			if i < maxRetries {
+				time.Sleep(backoff)
+				backoff *= 2
+			}
 		}
-		cancel()
+
+		if err != nil {
+			slog.Error("Failed to persist HIPAA ePHI audit log after retries. Routing to DLQ.", "error", err, "action", entry.Action)
+			if a.dlq != nil {
+				dlqCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				if dlqErr := a.dlq.Enqueue(dlqCtx, entry); dlqErr != nil {
+					slog.Error("CRITICAL: Failed to enqueue audit log to DLQ. Data lost.", "error", dlqErr, "action", entry.Action)
+				}
+				cancel()
+			}
+		}
 	}
 }
 
@@ -108,11 +137,14 @@ func (a *AsyncAuditor) Log(entry models.PhiAuditLog) {
 		return
 	default:
 		a.mu.RUnlock()
-		slog.Warn("HIPAA Audit queue full; logging synchronously to prevent audit loss", "action", entry.Action)
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if _, err := a.repo.CreateAuditLog(ctx, entry); err != nil {
-			slog.Error("Critical: Failed to persist synchronous HIPAA audit log fallback", "error", err, "action", entry.Action)
+		slog.Warn("HIPAA Audit queue full; routing directly to DLQ to prevent blocking", "action", entry.Action)
+		
+		if a.dlq != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if err := a.dlq.Enqueue(ctx, entry); err != nil {
+				slog.Error("Critical: Failed to persist audit log to DLQ on queue full fallback", "error", err, "action", entry.Action)
+			}
 		}
 	}
 }
