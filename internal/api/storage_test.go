@@ -33,6 +33,7 @@ func TestGetPrescriptionUploadURL(t *testing.T) {
 		"patient_id":   patientID.String(),
 		"filename":     "prescription_scan.pdf",
 		"content_type": "application/pdf",
+		"file_size":    1024,
 	})
 	w1 := httptest.NewRecorder()
 	req1, _ := http.NewRequest(http.MethodPost, "/upload-url", bytes.NewReader(validBody))
@@ -56,6 +57,7 @@ func TestGetPrescriptionUploadURL(t *testing.T) {
 		"patient_id":   patientID.String(),
 		"filename":     "script.exe",
 		"content_type": "application/pdf",
+		"file_size":    1024,
 	})
 	w2 := httptest.NewRecorder()
 	req2, _ := http.NewRequest(http.MethodPost, "/upload-url", bytes.NewReader(malwareBody))
@@ -71,6 +73,7 @@ func TestGetPrescriptionUploadURL(t *testing.T) {
 		"patient_id":   patientID.String(),
 		"filename":     "attack.html",
 		"content_type": "text/html",
+		"file_size":    1024,
 	})
 	w3 := httptest.NewRecorder()
 	req3, _ := http.NewRequest(http.MethodPost, "/upload-url", bytes.NewReader(xssBody))
@@ -86,6 +89,7 @@ func TestGetPrescriptionUploadURL(t *testing.T) {
 		"patient_id":   uuid.Nil.String(),
 		"filename":     "prescription.png",
 		"content_type": "image/png",
+		"file_size":    1024,
 	})
 	w4 := httptest.NewRecorder()
 	req4, _ := http.NewRequest(http.MethodPost, "/upload-url", bytes.NewReader(emptyPatientBody))

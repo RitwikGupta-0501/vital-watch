@@ -33,11 +33,12 @@ func NewS3Provider(client *s3.Client, bucket string) *S3Provider {
 	}
 }
 
-func (s *S3Provider) GenerateUploadURL(ctx context.Context, key string, contentType string, expiry time.Duration) (string, error) {
+func (s *S3Provider) GenerateUploadURL(ctx context.Context, key string, contentType string, size int64, expiry time.Duration) (string, error) {
 	req, err := s.presignClient.PresignPutObject(ctx, &s3.PutObjectInput{
-		Bucket:      aws.String(s.bucket),
-		Key:         aws.String(key),
-		ContentType: aws.String(contentType),
+		Bucket:        aws.String(s.bucket),
+		Key:           aws.String(key),
+		ContentType:   aws.String(contentType),
+		ContentLength: aws.Int64(size),
 	}, s3.WithPresignExpires(expiry))
 	if err != nil {
 		return "", fmt.Errorf("failed to generate S3 pre-signed upload URL: %w", err)

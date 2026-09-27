@@ -27,7 +27,7 @@ func NewMockProvider() *MockProvider {
 	}
 }
 
-func (m *MockProvider) GenerateUploadURL(ctx context.Context, key string, contentType string, expiry time.Duration) (string, error) {
+func (m *MockProvider) GenerateUploadURL(ctx context.Context, key string, contentType string, size int64, expiry time.Duration) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	url := fmt.Sprintf("https://mock-storage.local/upload/%s?expires=%d", key, time.Now().Add(expiry).Unix())

@@ -130,7 +130,7 @@ func TestLocalProvider_Security(t *testing.T) {
 	key := "prescription-" + patientID.String() + "-" + fileID.String() + ".pdf"
 
 	// 1. URL generation and query parsing
-	uploadURL, err := provider.GenerateUploadURL(ctx, key, "application/pdf", 5*time.Minute)
+	uploadURL, err := provider.GenerateUploadURL(ctx, key, "application/pdf", 1024, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("failed to generate upload URL: %v", err)
 	}
@@ -218,7 +218,7 @@ func TestMockProvider(t *testing.T) {
 	ctx := context.Background()
 	key := "prescriptions/test-key.pdf"
 
-	uploadURL, err := mock.GenerateUploadURL(ctx, key, "application/pdf", 5*time.Minute)
+	uploadURL, err := mock.GenerateUploadURL(ctx, key, "application/pdf", 1024, 5*time.Minute)
 	if err != nil || uploadURL == "" {
 		t.Fatalf("expected valid upload URL from mock, got %s, err: %v", uploadURL, err)
 	}

@@ -88,7 +88,7 @@ func (l *LocalProvider) VerifySignature(action, key string, expiresUnix int64, p
 	return nil
 }
 
-func (l *LocalProvider) GenerateUploadURL(ctx context.Context, key string, contentType string, expiry time.Duration) (string, error) {
+func (l *LocalProvider) GenerateUploadURL(ctx context.Context, key string, contentType string, size int64, expiry time.Duration) (string, error) {
 	expires := time.Now().Add(expiry).Unix()
 	sig := l.GenerateSignature("PUT", key, expires)
 	return fmt.Sprintf("%s/storage/upload?key=%s&expires=%d&sig=%s", l.baseURL, url.QueryEscape(key), expires, sig), nil

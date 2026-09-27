@@ -1002,6 +1002,7 @@ func TestGetPrescriptionUploadURL_Authorization(t *testing.T) {
 			"patient_id":   patientID.String(),
 			"filename":     "prescription.pdf",
 			"content_type": "application/pdf",
+			"file_size":    1024,
 		})
 		w := httptest.NewRecorder()
 		req, _ := http.NewRequest(http.MethodPost, "/prescriptions/upload-url", bytes.NewReader(body))
@@ -1030,6 +1031,7 @@ func TestGetPrescriptionUploadURL_Authorization(t *testing.T) {
 			"patient_id":   patientID.String(),
 			"filename":     "prescription.pdf",
 			"content_type": "application/pdf",
+			"file_size":    1024,
 		})
 		w := httptest.NewRecorder()
 		req, _ := http.NewRequest(http.MethodPost, "/prescriptions/upload-url", bytes.NewReader(body))
@@ -1061,6 +1063,7 @@ func TestGetPrescriptionUploadURL_Authorization(t *testing.T) {
 			"patient_id":   patientID.String(),
 			"filename":     "prescription.pdf",
 			"content_type": "application/pdf",
+			"file_size":    1024,
 		})
 		w := httptest.NewRecorder()
 		req, _ := http.NewRequest(http.MethodPost, "/prescriptions/upload-url", bytes.NewReader(body))

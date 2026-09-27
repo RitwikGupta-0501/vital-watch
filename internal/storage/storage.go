@@ -93,7 +93,7 @@ func ValidateMagicBytes(data []byte) (string, error) {
 // Provider defines the storage interface for file operations
 type Provider interface {
 	// GenerateUploadURL creates a pre-signed URL allowing a client to upload a file directly
-	GenerateUploadURL(ctx context.Context, key string, contentType string, expiry time.Duration) (string, error)
+	GenerateUploadURL(ctx context.Context, key string, contentType string, size int64, expiry time.Duration) (string, error)
 
 	// GenerateDownloadURL creates a short-lived pre-signed URL allowing a client to download a file
 	GenerateDownloadURL(ctx context.Context, key string, expiry time.Duration) (string, error)

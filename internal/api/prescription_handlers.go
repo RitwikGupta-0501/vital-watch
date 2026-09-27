@@ -301,6 +301,7 @@ func (h *Handler) GetPrescriptionUploadURL(c *gin.Context) {
 		PatientID   uuid.UUID `json:"patient_id"`
 		Filename    string    `json:"filename"`
 		ContentType string    `json:"content_type"`
+		FileSize    int64     `json:"file_size"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -310,6 +311,11 @@ func (h *Handler) GetPrescriptionUploadURL(c *gin.Context) {
 
 	if req.PatientID == uuid.Nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "A valid patient_id is required"})
+		return
+	}
+
+	if req.FileSize <= 0 || req.FileSize > storage.MaxOCRFileSize {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("File size must be between 1 byte and %d bytes", storage.MaxOCRFileSize)})
 		return
 	}
 
@@ -348,7 +354,7 @@ func (h *Handler) GetPrescriptionUploadURL(c *gin.Context) {
 	uniqueFilename := fmt.Sprintf("prescription-%s-%s%s", req.PatientID.String(), uuid.New().String(), ext)
 
 	ctx := c.Request.Context()
-	uploadURL, err := h.Storage.GenerateUploadURL(ctx, uniqueFilename, req.ContentType, 5*time.Minute)
+	uploadURL, err := h.Storage.GenerateUploadURL(ctx, uniqueFilename, req.ContentType, req.FileSize, 5*time.Minute)
 	if err != nil {
 		slog.ErrorContext(c.Request.Context(), "Failed to generate upload URL", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate upload URL"})
