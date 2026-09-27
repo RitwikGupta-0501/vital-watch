@@ -632,10 +632,10 @@ func (h *Handler) LogMedicationAdherence(c *gin.Context) {
 		PatientID:          patientID,
 		PrescriptionItemID: in.PrescriptionItemID,
 		ScheduledDate:      schedDate,
-		TimeOfDay:          in.TimeOfDay,
+		TimeOfDay: models.MedicationTimeOfDay(in.TimeOfDay),
 		DoseNumber:         doseNum,
 		MealTiming:         strings.TrimSpace(in.MealTiming),
-		Status:             in.Status,
+		Status: models.MedicationLogStatus(in.Status),
 		TakenAt:            takenAt,
 		Notes:              strings.TrimSpace(in.Notes),
 	}

@@ -65,7 +65,7 @@ type Querier interface {
 	RevokeAllUserRefreshTokens(ctx context.Context, userID uuid.UUID) error
 	RevokeRefreshToken(ctx context.Context, arg RevokeRefreshTokenParams) error
 	UpdateAppointmentAsCompletedForDoctor(ctx context.Context, arg UpdateAppointmentAsCompletedForDoctorParams) (int64, error)
-	UpdateAppointmentMeetingRoom(ctx context.Context, arg UpdateAppointmentMeetingRoomParams) error
+	UpdateAppointmentMeetingRoom(ctx context.Context, arg UpdateAppointmentMeetingRoomParams) (int64, error)
 	UpdatePrescriptionExpiry(ctx context.Context, arg UpdatePrescriptionExpiryParams) error
 	UpdatePrescriptionFileName(ctx context.Context, arg UpdatePrescriptionFileNameParams) error
 	UpdatePrescriptionOCRStatus(ctx context.Context, arg UpdatePrescriptionOCRStatusParams) (int64, error)

@@ -8,9 +8,23 @@ package dbgen
 import (
 	"context"
 
+	"github.com/RitwikGupta-0501/vital-watch/internal/models"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
+
+const checkPrescriptionFileNameExists = `-- name: CheckPrescriptionFileNameExists :one
+SELECT EXISTS(
+    SELECT 1 FROM prescriptions WHERE file_name = $1
+)
+`
+
+func (q *Queries) CheckPrescriptionFileNameExists(ctx context.Context, fileName pgtype.Text) (bool, error) {
+	row := q.db.QueryRow(ctx, checkPrescriptionFileNameExists, fileName)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
 
 const createDigitalPrescription = `-- name: CreateDigitalPrescription :one
 INSERT INTO prescriptions (patient_id, doctor_id, source, status, notes, expires_at)
@@ -44,11 +58,11 @@ RETURNING id
 `
 
 type CreatePrescriptionParams struct {
-	PatientID uuid.UUID   `json:"patient_id"`
-	DoctorID  uuid.UUID   `json:"doctor_id"`
-	Status    string      `json:"status"`
-	FileName  pgtype.Text `json:"file_name"`
-	Notes     pgtype.Text `json:"notes"`
+	PatientID uuid.UUID                 `json:"patient_id"`
+	DoctorID  uuid.UUID                 `json:"doctor_id"`
+	Status    models.PrescriptionStatus `json:"status"`
+	FileName  pgtype.Text               `json:"file_name"`
+	Notes     pgtype.Text               `json:"notes"`
 }
 
 func (q *Queries) CreatePrescription(ctx context.Context, arg CreatePrescriptionParams) (uuid.UUID, error) {
@@ -84,8 +98,8 @@ type GetPrescriptionByFilenameParams struct {
 }
 
 type GetPrescriptionByFilenameRow struct {
-	ID     uuid.UUID `json:"id"`
-	Status string    `json:"status"`
+	ID     uuid.UUID                 `json:"id"`
+	Status models.PrescriptionStatus `json:"status"`
 }
 
 func (q *Queries) GetPrescriptionByFilename(ctx context.Context, arg GetPrescriptionByFilenameParams) (GetPrescriptionByFilenameRow, error) {
@@ -115,9 +129,9 @@ type GetPrescriptionByFilenameForDoctorParams struct {
 }
 
 type GetPrescriptionByFilenameForDoctorRow struct {
-	ID        uuid.UUID `json:"id"`
-	Status    string    `json:"status"`
-	PatientID uuid.UUID `json:"patient_id"`
+	ID        uuid.UUID                 `json:"id"`
+	Status    models.PrescriptionStatus `json:"status"`
+	PatientID uuid.UUID                 `json:"patient_id"`
 }
 
 func (q *Queries) GetPrescriptionByFilenameForDoctor(ctx context.Context, arg GetPrescriptionByFilenameForDoctorParams) (GetPrescriptionByFilenameForDoctorRow, error) {
@@ -139,20 +153,20 @@ WHERE p.id = $1
 `
 
 type GetPrescriptionByIDRow struct {
-	ID               uuid.UUID          `json:"id"`
-	PatientID        uuid.UUID          `json:"patient_id"`
-	DoctorID         uuid.UUID          `json:"doctor_id"`
-	Source           string             `json:"source"`
-	Status           string             `json:"status"`
-	FileName         pgtype.Text        `json:"file_name"`
-	Notes            pgtype.Text        `json:"notes"`
-	OcrProvider      pgtype.Text        `json:"ocr_provider"`
-	CreatedAt        pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
-	DoctorFirstName  string             `json:"doctor_first_name"`
-	DoctorLastName   string             `json:"doctor_last_name"`
-	PatientFirstName string             `json:"patient_first_name"`
-	PatientLastName  string             `json:"patient_last_name"`
+	ID               uuid.UUID                 `json:"id"`
+	PatientID        uuid.UUID                 `json:"patient_id"`
+	DoctorID         uuid.UUID                 `json:"doctor_id"`
+	Source           models.PrescriptionSource `json:"source"`
+	Status           models.PrescriptionStatus `json:"status"`
+	FileName         pgtype.Text               `json:"file_name"`
+	Notes            pgtype.Text               `json:"notes"`
+	OcrProvider      pgtype.Text               `json:"ocr_provider"`
+	CreatedAt        pgtype.Timestamptz        `json:"created_at"`
+	UpdatedAt        pgtype.Timestamptz        `json:"updated_at"`
+	DoctorFirstName  string                    `json:"doctor_first_name"`
+	DoctorLastName   string                    `json:"doctor_last_name"`
+	PatientFirstName string                    `json:"patient_first_name"`
+	PatientLastName  string                    `json:"patient_last_name"`
 }
 
 func (q *Queries) GetPrescriptionByID(ctx context.Context, id uuid.UUID) (GetPrescriptionByIDRow, error) {
@@ -268,18 +282,18 @@ type GetPrescriptionsByPatientIDParams struct {
 }
 
 type GetPrescriptionsByPatientIDRow struct {
-	ID          uuid.UUID          `json:"id"`
-	PatientID   uuid.UUID          `json:"patient_id"`
-	DoctorID    uuid.UUID          `json:"doctor_id"`
-	Source      string             `json:"source"`
-	Status      string             `json:"status"`
-	FileName    pgtype.Text        `json:"file_name"`
-	Notes       pgtype.Text        `json:"notes"`
-	OcrProvider pgtype.Text        `json:"ocr_provider"`
-	CreatedAt   pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
-	FirstName   string             `json:"first_name"`
-	LastName    string             `json:"last_name"`
+	ID          uuid.UUID                 `json:"id"`
+	PatientID   uuid.UUID                 `json:"patient_id"`
+	DoctorID    uuid.UUID                 `json:"doctor_id"`
+	Source      models.PrescriptionSource `json:"source"`
+	Status      models.PrescriptionStatus `json:"status"`
+	FileName    pgtype.Text               `json:"file_name"`
+	Notes       pgtype.Text               `json:"notes"`
+	OcrProvider pgtype.Text               `json:"ocr_provider"`
+	CreatedAt   pgtype.Timestamptz        `json:"created_at"`
+	UpdatedAt   pgtype.Timestamptz        `json:"updated_at"`
+	FirstName   string                    `json:"first_name"`
+	LastName    string                    `json:"last_name"`
 }
 
 func (q *Queries) GetPrescriptionsByPatientID(ctx context.Context, arg GetPrescriptionsByPatientIDParams) ([]GetPrescriptionsByPatientIDRow, error) {
@@ -342,18 +356,18 @@ type GetPrescriptionsForPatientParams struct {
 }
 
 type GetPrescriptionsForPatientRow struct {
-	ID          uuid.UUID          `json:"id"`
-	PatientID   uuid.UUID          `json:"patient_id"`
-	DoctorID    uuid.UUID          `json:"doctor_id"`
-	Source      string             `json:"source"`
-	Status      string             `json:"status"`
-	FileName    pgtype.Text        `json:"file_name"`
-	Notes       pgtype.Text        `json:"notes"`
-	OcrProvider pgtype.Text        `json:"ocr_provider"`
-	CreatedAt   pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
-	FirstName   string             `json:"first_name"`
-	LastName    string             `json:"last_name"`
+	ID          uuid.UUID                 `json:"id"`
+	PatientID   uuid.UUID                 `json:"patient_id"`
+	DoctorID    uuid.UUID                 `json:"doctor_id"`
+	Source      models.PrescriptionSource `json:"source"`
+	Status      models.PrescriptionStatus `json:"status"`
+	FileName    pgtype.Text               `json:"file_name"`
+	Notes       pgtype.Text               `json:"notes"`
+	OcrProvider pgtype.Text               `json:"ocr_provider"`
+	CreatedAt   pgtype.Timestamptz        `json:"created_at"`
+	UpdatedAt   pgtype.Timestamptz        `json:"updated_at"`
+	FirstName   string                    `json:"first_name"`
+	LastName    string                    `json:"last_name"`
 }
 
 func (q *Queries) GetPrescriptionsForPatient(ctx context.Context, arg GetPrescriptionsForPatientParams) ([]GetPrescriptionsForPatientRow, error) {
@@ -422,20 +436,20 @@ type GetPrescriptionsPendingReviewParams struct {
 }
 
 type GetPrescriptionsPendingReviewRow struct {
-	ID               uuid.UUID          `json:"id"`
-	PatientID        uuid.UUID          `json:"patient_id"`
-	DoctorID         uuid.UUID          `json:"doctor_id"`
-	Source           string             `json:"source"`
-	Status           string             `json:"status"`
-	FileName         pgtype.Text        `json:"file_name"`
-	Notes            pgtype.Text        `json:"notes"`
-	OcrProvider      pgtype.Text        `json:"ocr_provider"`
-	CreatedAt        pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
-	DoctorFirstName  string             `json:"doctor_first_name"`
-	DoctorLastName   string             `json:"doctor_last_name"`
-	PatientFirstName string             `json:"patient_first_name"`
-	PatientLastName  string             `json:"patient_last_name"`
+	ID               uuid.UUID                 `json:"id"`
+	PatientID        uuid.UUID                 `json:"patient_id"`
+	DoctorID         uuid.UUID                 `json:"doctor_id"`
+	Source           models.PrescriptionSource `json:"source"`
+	Status           models.PrescriptionStatus `json:"status"`
+	FileName         pgtype.Text               `json:"file_name"`
+	Notes            pgtype.Text               `json:"notes"`
+	OcrProvider      pgtype.Text               `json:"ocr_provider"`
+	CreatedAt        pgtype.Timestamptz        `json:"created_at"`
+	UpdatedAt        pgtype.Timestamptz        `json:"updated_at"`
+	DoctorFirstName  string                    `json:"doctor_first_name"`
+	DoctorLastName   string                    `json:"doctor_last_name"`
+	PatientFirstName string                    `json:"patient_first_name"`
+	PatientLastName  string                    `json:"patient_last_name"`
 }
 
 func (q *Queries) GetPrescriptionsPendingReview(ctx context.Context, arg GetPrescriptionsPendingReviewParams) ([]GetPrescriptionsPendingReviewRow, error) {
@@ -556,15 +570,14 @@ SET status = $2,
     END,
     ocr_provider = $4,
     updated_at = now()
-WHERE id = $1
-  AND status = 'pending_ocr'
+WHERE id = $1 AND status = 'pending_ocr'
 `
 
 type UpdatePrescriptionOCRStatusParams struct {
-	ID          uuid.UUID   `json:"id"`
-	Status      string      `json:"status"`
-	Notes       pgtype.Text `json:"notes"`
-	OcrProvider pgtype.Text `json:"ocr_provider"`
+	ID          uuid.UUID                 `json:"id"`
+	Status      models.PrescriptionStatus `json:"status"`
+	Notes       pgtype.Text               `json:"notes"`
+	OcrProvider pgtype.Text               `json:"ocr_provider"`
 }
 
 func (q *Queries) UpdatePrescriptionOCRStatus(ctx context.Context, arg UpdatePrescriptionOCRStatusParams) (int64, error) {
@@ -601,10 +614,10 @@ WHERE p.id = $1
 `
 
 type VerifyPrescriptionParams struct {
-	ID       uuid.UUID   `json:"id"`
-	Status   string      `json:"status"`
-	Notes    pgtype.Text `json:"notes"`
-	DoctorID uuid.UUID   `json:"doctor_id"`
+	ID       uuid.UUID                 `json:"id"`
+	Status   models.PrescriptionStatus `json:"status"`
+	Notes    pgtype.Text               `json:"notes"`
+	DoctorID uuid.UUID                 `json:"doctor_id"`
 }
 
 func (q *Queries) VerifyPrescription(ctx context.Context, arg VerifyPrescriptionParams) (int64, error) {
@@ -619,17 +632,3 @@ func (q *Queries) VerifyPrescription(ctx context.Context, arg VerifyPrescription
 	}
 	return result.RowsAffected(), nil
 }
-
-const checkPrescriptionFileNameExists = `-- name: CheckPrescriptionFileNameExists :one
-SELECT EXISTS(
-    SELECT 1 FROM prescriptions WHERE file_name = $1
-)
-`
-
-func (q *Queries) CheckPrescriptionFileNameExists(ctx context.Context, fileName pgtype.Text) (bool, error) {
-	row := q.db.QueryRow(ctx, checkPrescriptionFileNameExists, fileName)
-	var exists bool
-	err := row.Scan(&exists)
-	return exists, err
-}
-

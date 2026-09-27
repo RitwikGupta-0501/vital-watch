@@ -8,6 +8,7 @@ package dbgen
 import (
 	"context"
 
+	"github.com/RitwikGupta-0501/vital-watch/internal/models"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
@@ -75,21 +76,21 @@ type GetMedicationLogsByDateParams struct {
 }
 
 type GetMedicationLogsByDateRow struct {
-	ID                 uuid.UUID          `json:"id"`
-	PatientID          uuid.UUID          `json:"patient_id"`
-	PrescriptionItemID uuid.UUID          `json:"prescription_item_id"`
-	ScheduledDate      pgtype.Date        `json:"scheduled_date"`
-	TimeOfDay          string             `json:"time_of_day"`
-	DoseNumber         int32              `json:"dose_number"`
-	MealTiming         pgtype.Text        `json:"meal_timing"`
-	Status             string             `json:"status"`
-	TakenAt            pgtype.Timestamptz `json:"taken_at"`
-	Notes              pgtype.Text        `json:"notes"`
-	CreatedAt          pgtype.Timestamptz `json:"created_at"`
-	MedicationName     string             `json:"medication_name"`
-	Dosage             pgtype.Text        `json:"dosage"`
-	Timing             pgtype.Text        `json:"timing"`
-	Instructions       pgtype.Text        `json:"instructions"`
+	ID                 uuid.UUID                  `json:"id"`
+	PatientID          uuid.UUID                  `json:"patient_id"`
+	PrescriptionItemID uuid.UUID                  `json:"prescription_item_id"`
+	ScheduledDate      pgtype.Date                `json:"scheduled_date"`
+	TimeOfDay          models.MedicationTimeOfDay `json:"time_of_day"`
+	DoseNumber         int32                      `json:"dose_number"`
+	MealTiming         pgtype.Text                `json:"meal_timing"`
+	Status             models.MedicationLogStatus `json:"status"`
+	TakenAt            pgtype.Timestamptz         `json:"taken_at"`
+	Notes              pgtype.Text                `json:"notes"`
+	CreatedAt          pgtype.Timestamptz         `json:"created_at"`
+	MedicationName     string                     `json:"medication_name"`
+	Dosage             pgtype.Text                `json:"dosage"`
+	Timing             pgtype.Text                `json:"timing"`
+	Instructions       pgtype.Text                `json:"instructions"`
 }
 
 func (q *Queries) GetMedicationLogsByDate(ctx context.Context, arg GetMedicationLogsByDateParams) ([]GetMedicationLogsByDateRow, error) {
@@ -143,15 +144,15 @@ RETURNING id, patient_id, prescription_item_id, scheduled_date, time_of_day, dos
 `
 
 type UpsertMedicationLogParams struct {
-	PatientID          uuid.UUID          `json:"patient_id"`
-	PrescriptionItemID uuid.UUID          `json:"prescription_item_id"`
-	ScheduledDate      pgtype.Date        `json:"scheduled_date"`
-	TimeOfDay          string             `json:"time_of_day"`
-	DoseNumber         int32              `json:"dose_number"`
-	MealTiming         pgtype.Text        `json:"meal_timing"`
-	Status             string             `json:"status"`
-	TakenAt            pgtype.Timestamptz `json:"taken_at"`
-	Notes              pgtype.Text        `json:"notes"`
+	PatientID          uuid.UUID                  `json:"patient_id"`
+	PrescriptionItemID uuid.UUID                  `json:"prescription_item_id"`
+	ScheduledDate      pgtype.Date                `json:"scheduled_date"`
+	TimeOfDay          models.MedicationTimeOfDay `json:"time_of_day"`
+	DoseNumber         int32                      `json:"dose_number"`
+	MealTiming         pgtype.Text                `json:"meal_timing"`
+	Status             models.MedicationLogStatus `json:"status"`
+	TakenAt            pgtype.Timestamptz         `json:"taken_at"`
+	Notes              pgtype.Text                `json:"notes"`
 }
 
 func (q *Queries) UpsertMedicationLog(ctx context.Context, arg UpsertMedicationLogParams) (PatientMedicationLog, error) {

@@ -8,6 +8,7 @@ package dbgen
 import (
 	"context"
 
+	"github.com/RitwikGupta-0501/vital-watch/internal/models"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
@@ -40,14 +41,14 @@ RETURNING id
 `
 
 type CreateAppointmentParams struct {
-	ID              uuid.UUID          `json:"id"`
-	PatientID       uuid.UUID          `json:"patient_id"`
-	DoctorID        uuid.UUID          `json:"doctor_id"`
-	StartTime       pgtype.Timestamptz `json:"start_time"`
-	EndTime         pgtype.Timestamptz `json:"end_time"`
-	AppointmentType string             `json:"appointment_type"`
-	MeetingLink     pgtype.Text        `json:"meeting_link"`
-	MeetingID       pgtype.Text        `json:"meeting_id"`
+	ID              uuid.UUID              `json:"id"`
+	PatientID       uuid.UUID              `json:"patient_id"`
+	DoctorID        uuid.UUID              `json:"doctor_id"`
+	StartTime       pgtype.Timestamptz     `json:"start_time"`
+	EndTime         pgtype.Timestamptz     `json:"end_time"`
+	AppointmentType models.AppointmentType `json:"appointment_type"`
+	MeetingLink     pgtype.Text            `json:"meeting_link"`
+	MeetingID       pgtype.Text            `json:"meeting_id"`
 }
 
 func (q *Queries) CreateAppointment(ctx context.Context, arg CreateAppointmentParams) (uuid.UUID, error) {
@@ -79,21 +80,21 @@ WHERE a.id = $1
 `
 
 type GetAppointmentByIDRow struct {
-	ID               uuid.UUID          `json:"id"`
-	PatientID        uuid.UUID          `json:"patient_id"`
-	DoctorID         uuid.UUID          `json:"doctor_id"`
-	StartTime        pgtype.Timestamptz `json:"start_time"`
-	EndTime          pgtype.Timestamptz `json:"end_time"`
-	Status           string             `json:"status"`
-	AppointmentType  string             `json:"appointment_type"`
-	MeetingLink      pgtype.Text        `json:"meeting_link"`
-	MeetingID        pgtype.Text        `json:"meeting_id"`
-	CreatedAt        pgtype.Timestamptz `json:"created_at"`
-	DoctorFirstName  string             `json:"doctor_first_name"`
-	DoctorLastName   string             `json:"doctor_last_name"`
-	DoctorSpecialty  pgtype.Text        `json:"doctor_specialty"`
-	PatientFirstName string             `json:"patient_first_name"`
-	PatientLastName  string             `json:"patient_last_name"`
+	ID               uuid.UUID                `json:"id"`
+	PatientID        uuid.UUID                `json:"patient_id"`
+	DoctorID         uuid.UUID                `json:"doctor_id"`
+	StartTime        pgtype.Timestamptz       `json:"start_time"`
+	EndTime          pgtype.Timestamptz       `json:"end_time"`
+	Status           models.AppointmentStatus `json:"status"`
+	AppointmentType  models.AppointmentType   `json:"appointment_type"`
+	MeetingLink      pgtype.Text              `json:"meeting_link"`
+	MeetingID        pgtype.Text              `json:"meeting_id"`
+	CreatedAt        pgtype.Timestamptz       `json:"created_at"`
+	DoctorFirstName  string                   `json:"doctor_first_name"`
+	DoctorLastName   string                   `json:"doctor_last_name"`
+	DoctorSpecialty  pgtype.Text              `json:"doctor_specialty"`
+	PatientFirstName string                   `json:"patient_first_name"`
+	PatientLastName  string                   `json:"patient_last_name"`
 }
 
 func (q *Queries) GetAppointmentByID(ctx context.Context, id uuid.UUID) (GetAppointmentByIDRow, error) {
@@ -138,18 +139,18 @@ type GetAppointmentsByDoctorIDParams struct {
 }
 
 type GetAppointmentsByDoctorIDRow struct {
-	ID              uuid.UUID          `json:"id"`
-	PatientID       uuid.UUID          `json:"patient_id"`
-	DoctorID        uuid.UUID          `json:"doctor_id"`
-	StartTime       pgtype.Timestamptz `json:"start_time"`
-	EndTime         pgtype.Timestamptz `json:"end_time"`
-	Status          string             `json:"status"`
-	AppointmentType string             `json:"appointment_type"`
-	MeetingLink     pgtype.Text        `json:"meeting_link"`
-	MeetingID       pgtype.Text        `json:"meeting_id"`
-	CreatedAt       pgtype.Timestamptz `json:"created_at"`
-	FirstName       string             `json:"first_name"`
-	LastName        string             `json:"last_name"`
+	ID              uuid.UUID                `json:"id"`
+	PatientID       uuid.UUID                `json:"patient_id"`
+	DoctorID        uuid.UUID                `json:"doctor_id"`
+	StartTime       pgtype.Timestamptz       `json:"start_time"`
+	EndTime         pgtype.Timestamptz       `json:"end_time"`
+	Status          models.AppointmentStatus `json:"status"`
+	AppointmentType models.AppointmentType   `json:"appointment_type"`
+	MeetingLink     pgtype.Text              `json:"meeting_link"`
+	MeetingID       pgtype.Text              `json:"meeting_id"`
+	CreatedAt       pgtype.Timestamptz       `json:"created_at"`
+	FirstName       string                   `json:"first_name"`
+	LastName        string                   `json:"last_name"`
 }
 
 func (q *Queries) GetAppointmentsByDoctorID(ctx context.Context, arg GetAppointmentsByDoctorIDParams) ([]GetAppointmentsByDoctorIDRow, error) {
@@ -204,19 +205,19 @@ type GetAppointmentsByPatientIDParams struct {
 }
 
 type GetAppointmentsByPatientIDRow struct {
-	ID              uuid.UUID          `json:"id"`
-	PatientID       uuid.UUID          `json:"patient_id"`
-	DoctorID        uuid.UUID          `json:"doctor_id"`
-	StartTime       pgtype.Timestamptz `json:"start_time"`
-	EndTime         pgtype.Timestamptz `json:"end_time"`
-	Status          string             `json:"status"`
-	AppointmentType string             `json:"appointment_type"`
-	MeetingLink     pgtype.Text        `json:"meeting_link"`
-	MeetingID       pgtype.Text        `json:"meeting_id"`
-	CreatedAt       pgtype.Timestamptz `json:"created_at"`
-	FirstName       string             `json:"first_name"`
-	LastName        string             `json:"last_name"`
-	Specialty       pgtype.Text        `json:"specialty"`
+	ID              uuid.UUID                `json:"id"`
+	PatientID       uuid.UUID                `json:"patient_id"`
+	DoctorID        uuid.UUID                `json:"doctor_id"`
+	StartTime       pgtype.Timestamptz       `json:"start_time"`
+	EndTime         pgtype.Timestamptz       `json:"end_time"`
+	Status          models.AppointmentStatus `json:"status"`
+	AppointmentType models.AppointmentType   `json:"appointment_type"`
+	MeetingLink     pgtype.Text              `json:"meeting_link"`
+	MeetingID       pgtype.Text              `json:"meeting_id"`
+	CreatedAt       pgtype.Timestamptz       `json:"created_at"`
+	FirstName       string                   `json:"first_name"`
+	LastName        string                   `json:"last_name"`
+	Specialty       pgtype.Text              `json:"specialty"`
 }
 
 func (q *Queries) GetAppointmentsByPatientID(ctx context.Context, arg GetAppointmentsByPatientIDParams) ([]GetAppointmentsByPatientIDRow, error) {
@@ -273,19 +274,19 @@ type GetAppointmentsForPatientParams struct {
 }
 
 type GetAppointmentsForPatientRow struct {
-	ID              uuid.UUID          `json:"id"`
-	PatientID       uuid.UUID          `json:"patient_id"`
-	DoctorID        uuid.UUID          `json:"doctor_id"`
-	StartTime       pgtype.Timestamptz `json:"start_time"`
-	EndTime         pgtype.Timestamptz `json:"end_time"`
-	Status          string             `json:"status"`
-	AppointmentType string             `json:"appointment_type"`
-	MeetingLink     pgtype.Text        `json:"meeting_link"`
-	MeetingID       pgtype.Text        `json:"meeting_id"`
-	CreatedAt       pgtype.Timestamptz `json:"created_at"`
-	FirstName       string             `json:"first_name"`
-	LastName        string             `json:"last_name"`
-	Specialty       pgtype.Text        `json:"specialty"`
+	ID              uuid.UUID                `json:"id"`
+	PatientID       uuid.UUID                `json:"patient_id"`
+	DoctorID        uuid.UUID                `json:"doctor_id"`
+	StartTime       pgtype.Timestamptz       `json:"start_time"`
+	EndTime         pgtype.Timestamptz       `json:"end_time"`
+	Status          models.AppointmentStatus `json:"status"`
+	AppointmentType models.AppointmentType   `json:"appointment_type"`
+	MeetingLink     pgtype.Text              `json:"meeting_link"`
+	MeetingID       pgtype.Text              `json:"meeting_id"`
+	CreatedAt       pgtype.Timestamptz       `json:"created_at"`
+	FirstName       string                   `json:"first_name"`
+	LastName        string                   `json:"last_name"`
+	Specialty       pgtype.Text              `json:"specialty"`
 }
 
 func (q *Queries) GetAppointmentsForPatient(ctx context.Context, arg GetAppointmentsForPatientParams) ([]GetAppointmentsForPatientRow, error) {
@@ -344,11 +345,11 @@ type GetDoctorAppointmentsInRangeParams struct {
 }
 
 type GetDoctorAppointmentsInRangeRow struct {
-	ID        uuid.UUID          `json:"id"`
-	DoctorID  uuid.UUID          `json:"doctor_id"`
-	StartTime pgtype.Timestamptz `json:"start_time"`
-	EndTime   pgtype.Timestamptz `json:"end_time"`
-	Status    string             `json:"status"`
+	ID        uuid.UUID                `json:"id"`
+	DoctorID  uuid.UUID                `json:"doctor_id"`
+	StartTime pgtype.Timestamptz       `json:"start_time"`
+	EndTime   pgtype.Timestamptz       `json:"end_time"`
+	Status    models.AppointmentStatus `json:"status"`
 }
 
 func (q *Queries) GetDoctorAppointmentsInRange(ctx context.Context, arg GetDoctorAppointmentsInRangeParams) ([]GetDoctorAppointmentsInRangeRow, error) {
@@ -396,7 +397,7 @@ func (q *Queries) UpdateAppointmentAsCompletedForDoctor(ctx context.Context, arg
 	return result.RowsAffected(), nil
 }
 
-const updateAppointmentMeetingRoom = `-- name: UpdateAppointmentMeetingRoom :exec
+const updateAppointmentMeetingRoom = `-- name: UpdateAppointmentMeetingRoom :execrows
 UPDATE appointments 
 SET meeting_link = $1, meeting_id = $2, updated_at = now()
 WHERE id = $3 AND (meeting_link IS NULL OR meeting_link = '')
@@ -408,7 +409,10 @@ type UpdateAppointmentMeetingRoomParams struct {
 	ID          uuid.UUID   `json:"id"`
 }
 
-func (q *Queries) UpdateAppointmentMeetingRoom(ctx context.Context, arg UpdateAppointmentMeetingRoomParams) error {
-	_, err := q.db.Exec(ctx, updateAppointmentMeetingRoom, arg.MeetingLink, arg.MeetingID, arg.ID)
-	return err
+func (q *Queries) UpdateAppointmentMeetingRoom(ctx context.Context, arg UpdateAppointmentMeetingRoomParams) (int64, error) {
+	result, err := q.db.Exec(ctx, updateAppointmentMeetingRoom, arg.MeetingLink, arg.MeetingID, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

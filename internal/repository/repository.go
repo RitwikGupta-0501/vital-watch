@@ -13,6 +13,12 @@ import (
 // ErrTokenAlreadyRotated is returned when a revoked token is replayed and its replacement has already been consumed.
 var ErrTokenAlreadyRotated = errors.New("token rotation replay detected: replacement token already consumed")
 
+// ErrDoubleBooking is returned when a scheduling conflict occurs.
+var ErrDoubleBooking = errors.New("a scheduling conflict exists for this time slot")
+
+// ErrUniqueConstraint is returned when a unique constraint violation occurs (e.g. duplicate schedule).
+var ErrUniqueConstraint = errors.New("a unique constraint violation occurred")
+
 // Repository defines all database operations needed by the application handlers
 type Repository interface {
 	Ping(ctx context.Context) error

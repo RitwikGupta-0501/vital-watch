@@ -135,9 +135,9 @@ func (h *Handler) CreateAppointment(c *gin.Context) {
 	// API-04: appointment type validation
 	req.Type = strings.ToLower(strings.TrimSpace(req.Type))
 	if req.Type == "" {
-		req.Type = "in_person"
+		req.Type = string(models.AppointmentTypeInPerson)
 	}
-	if req.Type != "in_person" && req.Type != "virtual" {
+	if req.Type != string(models.AppointmentTypeInPerson) && req.Type != string(models.AppointmentTypeVirtual) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid appointment type: must be in_person or virtual"})
 		return
 	}

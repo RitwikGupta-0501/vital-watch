@@ -39,8 +39,7 @@ SET status = $2,
     END,
     ocr_provider = $4,
     updated_at = now()
-WHERE id = $1
-  AND status = 'pending_ocr';
+WHERE id = $1 AND status = 'pending_ocr';
 
 -- name: VerifyPrescription :execrows
 UPDATE prescriptions p

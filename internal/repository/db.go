@@ -7,7 +7,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"errors"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/riverqueue/river"
@@ -366,24 +368,33 @@ func (r *DBRepository) CreateAppointment(ctx context.Context, id, patientID, doc
 	if id == uuid.Nil {
 		id = uuid.New()
 	}
-	return r.queries.CreateAppointment(ctx, dbgen.CreateAppointmentParams{
+	resID, err := r.queries.CreateAppointment(ctx, dbgen.CreateAppointmentParams{
 		ID:              id,
 		PatientID:       patientID,
 		DoctorID:        doctorID,
 		StartTime:       pgtype.Timestamptz{Time: startTime, Valid: true},
 		EndTime:         pgtype.Timestamptz{Time: endTime, Valid: true},
-		AppointmentType: apptType,
+		AppointmentType: models.AppointmentType(apptType),
 		MeetingLink:     pgtype.Text{String: meetingLink, Valid: meetingLink != ""},
 		MeetingID:       pgtype.Text{String: meetingID, Valid: meetingID != ""},
 	})
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return uuid.Nil, ErrDoubleBooking
+		}
+		return uuid.Nil, err
+	}
+	return resID, nil
 }
 
 func (r *DBRepository) UpdateAppointmentMeetingRoom(ctx context.Context, apptID uuid.UUID, meetingLink, meetingID string) error {
-	return r.queries.UpdateAppointmentMeetingRoom(ctx, dbgen.UpdateAppointmentMeetingRoomParams{
+	_, err := r.queries.UpdateAppointmentMeetingRoom(ctx, dbgen.UpdateAppointmentMeetingRoomParams{
 		MeetingLink: pgtype.Text{String: meetingLink, Valid: meetingLink != ""},
 		MeetingID:   pgtype.Text{String: meetingID, Valid: meetingID != ""},
 		ID:          apptID,
 	})
+	return err
 }
 
 func (r *DBRepository) GetOrGenerateAppointmentMeetingRoom(ctx context.Context, apptID uuid.UUID, generator func() (meetingLink string, meetingID string, err error)) (models.Appointment, error) {
@@ -417,13 +428,19 @@ func (r *DBRepository) GetOrGenerateAppointmentMeetingRoom(ctx context.Context, 
 
 		if newLink != "" {
 			// Atomic conditional update: only update if still unpopulated
-			err := r.queries.UpdateAppointmentMeetingRoom(ctx, dbgen.UpdateAppointmentMeetingRoomParams{
+			rowsAffected, err := r.queries.UpdateAppointmentMeetingRoom(ctx, dbgen.UpdateAppointmentMeetingRoomParams{
 				MeetingLink: pgtype.Text{String: newLink, Valid: true},
 				MeetingID:   pgtype.Text{String: newID, Valid: newID != ""},
 				ID:          apptID,
 			})
 			if err != nil {
 				return roomResult{}, err
+			}
+			if rowsAffected == 0 {
+				curAppt, err := r.GetAppointmentByID(ctx, apptID)
+				if err == nil && curAppt.MeetingLink != "" {
+					return roomResult{link: curAppt.MeetingLink, id: curAppt.MeetingID}, nil
+				}
 			}
 		}
 
@@ -626,7 +643,7 @@ func (r *DBRepository) CreateUploadedPrescriptionWithJob(ctx context.Context, pa
 	newID, err := qtx.CreatePrescription(ctx, dbgen.CreatePrescriptionParams{
 		PatientID: patientID,
 		DoctorID:  doctorID,
-		Status:    status,
+		Status:    models.PrescriptionStatus(status),
 		FileName:  pgtype.Text{String: fileName, Valid: fileName != ""},
 		Notes:     pgtype.Text{String: notes, Valid: notes != ""},
 	})
@@ -772,7 +789,7 @@ func (r *DBRepository) UpdatePrescriptionOCRResults(ctx context.Context, prescri
 
 	rowsAffected, err := qtx.UpdatePrescriptionOCRStatus(ctx, dbgen.UpdatePrescriptionOCRStatusParams{
 		ID:          prescriptionID,
-		Status:      status,
+		Status:      models.PrescriptionStatus(status),
 		Notes:       pgtype.Text{String: notes, Valid: notes != ""},
 		OcrProvider: pgtype.Text{String: ocrProvider, Valid: ocrProvider != ""},
 	})
@@ -818,7 +835,7 @@ func (r *DBRepository) VerifyPrescription(ctx context.Context, prescriptionID, d
 
 	rowsAffected, err := qtx.VerifyPrescription(ctx, dbgen.VerifyPrescriptionParams{
 		ID:       prescriptionID,
-		Status:   status,
+		Status:   models.PrescriptionStatus(status),
 		Notes:    pgtype.Text{String: notes, Valid: notes != ""},
 		DoctorID: doctorID,
 	})
@@ -1905,7 +1922,7 @@ func (r *DBRepository) GetAuditLogsByPatientID(ctx context.Context, patientID uu
 			UserAgent:    row.UserAgent.String,
 			RequestID:    reqID,
 			StatusCode:   int(row.StatusCode.Int32),
-			Metadata:     string(row.Metadata),
+			Metadata:     row.Metadata,
 			CreatedAt:    row.CreatedAt.Time,
 		})
 	}
@@ -1952,7 +1969,7 @@ func (r *DBRepository) GetAuditLogs(ctx context.Context, limit, offset int) ([]m
 			UserAgent:    row.UserAgent.String,
 			RequestID:    reqID,
 			StatusCode:   int(row.StatusCode.Int32),
-			Metadata:     string(row.Metadata),
+			Metadata:     row.Metadata,
 			CreatedAt:    row.CreatedAt.Time,
 		})
 	}

@@ -306,7 +306,7 @@ func (h *Handler) audit(c *gin.Context, action, resourceType string, resourceID,
 		UserAgent:    c.Request.UserAgent(),
 		RequestID:    reqID,
 		StatusCode:   statusCode,
-		Metadata:     metaStr,
+		Metadata:     json.RawMessage(metaStr),
 	})
 }
 

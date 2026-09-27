@@ -10,6 +10,7 @@ sql:
       - "migrations/000007_admin_entity.up.sql"
       - "migrations/000008_harden_schema_integrity.up.sql"
       - "migrations/000009_patient_booking_exclusion.up.sql"
+      - "migrations/000010_harden_relational_integrity.up.sql"
     queries: "internal/repository/queries"
     gen:
       go:
@@ -24,3 +25,15 @@ sql:
         overrides:
           - db_type: "uuid"
             go_type: "github.com/google/uuid.UUID"
+          - column: "appointments.status"
+            go_type: "github.com/RitwikGupta-0501/vital-watch/internal/models.AppointmentStatus"
+          - column: "appointments.appointment_type"
+            go_type: "github.com/RitwikGupta-0501/vital-watch/internal/models.AppointmentType"
+          - column: "prescriptions.status"
+            go_type: "github.com/RitwikGupta-0501/vital-watch/internal/models.PrescriptionStatus"
+          - column: "prescriptions.source"
+            go_type: "github.com/RitwikGupta-0501/vital-watch/internal/models.PrescriptionSource"
+          - column: "patient_medication_logs.status"
+            go_type: "github.com/RitwikGupta-0501/vital-watch/internal/models.MedicationLogStatus"
+          - column: "patient_medication_logs.time_of_day"
+            go_type: "github.com/RitwikGupta-0501/vital-watch/internal/models.MedicationTimeOfDay"

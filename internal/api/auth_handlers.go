@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"errors"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -183,7 +184,7 @@ func (h *Handler) Register(c *gin.Context) {
 			IPAddress:  c.ClientIP(),
 			UserAgent:  c.Request.UserAgent(),
 			StatusCode: http.StatusCreated,
-			Metadata:   fmt.Sprintf(`{"role":%q,"email":%q}`, req.Role, req.Email),
+			Metadata:   json.RawMessage(fmt.Sprintf(`{"role":%q,"email":%q}`, req.Role, req.Email)),
 		})
 	}
 
@@ -239,7 +240,7 @@ func (h *Handler) Login(c *gin.Context) {
 				IPAddress:  c.ClientIP(),
 				UserAgent:  c.Request.UserAgent(),
 				StatusCode: http.StatusUnauthorized,
-				Metadata:   fmt.Sprintf(`{"email":%q,"role":%q,"reason":"user_not_found"}`, req.Email, req.Role),
+				Metadata:   json.RawMessage(fmt.Sprintf(`{"email":%q,"role":%q,"reason":"user_not_found"}`, req.Email, req.Role)),
 			})
 		}
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
@@ -256,7 +257,7 @@ func (h *Handler) Login(c *gin.Context) {
 				IPAddress:  c.ClientIP(),
 				UserAgent:  c.Request.UserAgent(),
 				StatusCode: http.StatusUnauthorized,
-				Metadata:   fmt.Sprintf(`{"email":%q,"role":%q,"reason":"bad_credentials"}`, req.Email, req.Role),
+				Metadata:   json.RawMessage(fmt.Sprintf(`{"email":%q,"role":%q,"reason":"bad_credentials"}`, req.Email, req.Role)),
 			})
 		}
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
@@ -305,7 +306,7 @@ func (h *Handler) Login(c *gin.Context) {
 			IPAddress:  c.ClientIP(),
 			UserAgent:  c.Request.UserAgent(),
 			StatusCode: http.StatusOK,
-			Metadata:   fmt.Sprintf(`{"role":%q}`, req.Role),
+			Metadata:   json.RawMessage(fmt.Sprintf(`{"role":%q}`, req.Role)),
 		})
 	}
 
@@ -353,7 +354,7 @@ func (h *Handler) RefreshToken(c *gin.Context) {
 					IPAddress:  c.ClientIP(),
 					UserAgent:  c.Request.UserAgent(),
 					StatusCode: http.StatusUnauthorized,
-					Metadata:   fmt.Sprintf(`{"token_id":%q}`, existingToken.ID.String()),
+					Metadata:   json.RawMessage(fmt.Sprintf(`{"token_id":%q}`, existingToken.ID.String())),
 				})
 			}
 			_ = h.Repo.RevokeAllUserRefreshTokens(c.Request.Context(), existingToken.UserID)
@@ -403,7 +404,7 @@ func (h *Handler) RefreshToken(c *gin.Context) {
 					IPAddress:  c.ClientIP(),
 					UserAgent:  c.Request.UserAgent(),
 					StatusCode: http.StatusUnauthorized,
-					Metadata:   fmt.Sprintf(`{"token_id":%q}`, existingToken.ID.String()),
+					Metadata:   json.RawMessage(fmt.Sprintf(`{"token_id":%q}`, existingToken.ID.String())),
 				})
 			}
 			_ = h.Repo.RevokeAllUserRefreshTokens(c.Request.Context(), existingToken.UserID)

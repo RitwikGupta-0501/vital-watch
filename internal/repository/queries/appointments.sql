@@ -61,7 +61,7 @@ UPDATE appointments
 SET status = 'completed', updated_at = now()
 WHERE id = $1 AND doctor_id = $2 AND status = 'upcoming';
 
--- name: UpdateAppointmentMeetingRoom :exec
+-- name: UpdateAppointmentMeetingRoom :execrows
 UPDATE appointments 
 SET meeting_link = $1, meeting_id = $2, updated_at = now()
 WHERE id = $3 AND (meeting_link IS NULL OR meeting_link = '');

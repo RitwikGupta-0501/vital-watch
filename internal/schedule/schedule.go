@@ -143,10 +143,10 @@ func BuildDailySchedule(
 					PatientID:          patientID,
 					PrescriptionItemID: item.ID,
 					ScheduledDate:      date,
-					TimeOfDay:          slot,
+					TimeOfDay:          models.MedicationTimeOfDay(slot),
 					DoseNumber:         1,
 					MealTiming:         item.Timing,
-					Status:             "pending",
+					Status:             models.MedicationLogStatusPending,
 					MedicationName:     item.MedicationName,
 					Dosage:             item.Dosage,
 					Timing:             item.Timing,
@@ -183,11 +183,11 @@ func BuildDailySchedule(
 
 	// Sort chronologically by slot order, dose number, and medication name
 	sort.SliceStable(results, func(i, j int) bool {
-		orderI := SlotOrder[results[i].TimeOfDay]
+		orderI := SlotOrder[string(results[i].TimeOfDay)]
 		if orderI == 0 {
 			orderI = 99
 		}
-		orderJ := SlotOrder[results[j].TimeOfDay]
+		orderJ := SlotOrder[string(results[j].TimeOfDay)]
 		if orderJ == 0 {
 			orderJ = 99
 		}

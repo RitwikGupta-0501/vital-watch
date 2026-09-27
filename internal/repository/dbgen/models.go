@@ -5,6 +5,7 @@
 package dbgen
 
 import (
+	"github.com/RitwikGupta-0501/vital-watch/internal/models"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
@@ -19,26 +20,28 @@ type AdminProfile struct {
 }
 
 type Appointment struct {
-	ID              uuid.UUID          `json:"id"`
-	DoctorID        uuid.UUID          `json:"doctor_id"`
-	PatientID       uuid.UUID          `json:"patient_id"`
-	StartTime       pgtype.Timestamptz `json:"start_time"`
-	EndTime         pgtype.Timestamptz `json:"end_time"`
-	Status          string             `json:"status"`
-	AppointmentType string             `json:"appointment_type"`
-	CreatedAt       pgtype.Timestamptz `json:"created_at"`
-	MeetingLink     pgtype.Text        `json:"meeting_link"`
-	MeetingID       pgtype.Text        `json:"meeting_id"`
-	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+	ID              uuid.UUID                `json:"id"`
+	DoctorID        uuid.UUID                `json:"doctor_id"`
+	PatientID       uuid.UUID                `json:"patient_id"`
+	StartTime       pgtype.Timestamptz       `json:"start_time"`
+	EndTime         pgtype.Timestamptz       `json:"end_time"`
+	Status          models.AppointmentStatus `json:"status"`
+	AppointmentType models.AppointmentType   `json:"appointment_type"`
+	CreatedAt       pgtype.Timestamptz       `json:"created_at"`
+	MeetingLink     pgtype.Text              `json:"meeting_link"`
+	MeetingID       pgtype.Text              `json:"meeting_id"`
+	UpdatedAt       pgtype.Timestamptz       `json:"updated_at"`
 }
 
 type DoctorProfile struct {
-	UserID          uuid.UUID   `json:"user_id"`
-	FirstName       string      `json:"first_name"`
-	LastName        string      `json:"last_name"`
-	Specialty       pgtype.Text `json:"specialty"`
-	ExperienceYears pgtype.Int4 `json:"experience_years"`
-	Available       pgtype.Bool `json:"available"`
+	UserID          uuid.UUID          `json:"user_id"`
+	FirstName       string             `json:"first_name"`
+	LastName        string             `json:"last_name"`
+	Specialty       pgtype.Text        `json:"specialty"`
+	ExperienceYears pgtype.Int4        `json:"experience_years"`
+	Available       pgtype.Bool        `json:"available"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
 }
 
 type DoctorSchedule struct {
@@ -55,23 +58,25 @@ type DoctorSchedule struct {
 }
 
 type PatientMedicationLog struct {
-	ID                 uuid.UUID          `json:"id"`
-	PatientID          uuid.UUID          `json:"patient_id"`
-	PrescriptionItemID uuid.UUID          `json:"prescription_item_id"`
-	ScheduledDate      pgtype.Date        `json:"scheduled_date"`
-	TimeOfDay          string             `json:"time_of_day"`
-	DoseNumber         int32              `json:"dose_number"`
-	MealTiming         pgtype.Text        `json:"meal_timing"`
-	Status             string             `json:"status"`
-	TakenAt            pgtype.Timestamptz `json:"taken_at"`
-	Notes              pgtype.Text        `json:"notes"`
-	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	ID                 uuid.UUID                  `json:"id"`
+	PatientID          uuid.UUID                  `json:"patient_id"`
+	PrescriptionItemID uuid.UUID                  `json:"prescription_item_id"`
+	ScheduledDate      pgtype.Date                `json:"scheduled_date"`
+	TimeOfDay          models.MedicationTimeOfDay `json:"time_of_day"`
+	DoseNumber         int32                      `json:"dose_number"`
+	MealTiming         pgtype.Text                `json:"meal_timing"`
+	Status             models.MedicationLogStatus `json:"status"`
+	TakenAt            pgtype.Timestamptz         `json:"taken_at"`
+	Notes              pgtype.Text                `json:"notes"`
+	CreatedAt          pgtype.Timestamptz         `json:"created_at"`
 }
 
 type PatientProfile struct {
-	UserID    uuid.UUID `json:"user_id"`
-	FirstName string    `json:"first_name"`
-	LastName  string    `json:"last_name"`
+	UserID    uuid.UUID          `json:"user_id"`
+	FirstName string             `json:"first_name"`
+	LastName  string             `json:"last_name"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
 }
 
 type PatientVital struct {
@@ -107,18 +112,18 @@ type PhiAuditLog struct {
 }
 
 type Prescription struct {
-	ID          uuid.UUID          `json:"id"`
-	PatientID   uuid.UUID          `json:"patient_id"`
-	DoctorID    uuid.UUID          `json:"doctor_id"`
-	Medication  pgtype.Text        `json:"medication"`
-	Notes       pgtype.Text        `json:"notes"`
-	FileName    pgtype.Text        `json:"file_name"`
-	CreatedAt   pgtype.Timestamptz `json:"created_at"`
-	Source      string             `json:"source"`
-	Status      string             `json:"status"`
-	OcrProvider pgtype.Text        `json:"ocr_provider"`
-	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
-	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
+	ID          uuid.UUID                 `json:"id"`
+	PatientID   uuid.UUID                 `json:"patient_id"`
+	DoctorID    uuid.UUID                 `json:"doctor_id"`
+	Medication  pgtype.Text               `json:"medication"`
+	Notes       pgtype.Text               `json:"notes"`
+	FileName    pgtype.Text               `json:"file_name"`
+	CreatedAt   pgtype.Timestamptz        `json:"created_at"`
+	Source      models.PrescriptionSource `json:"source"`
+	Status      models.PrescriptionStatus `json:"status"`
+	OcrProvider pgtype.Text               `json:"ocr_provider"`
+	UpdatedAt   pgtype.Timestamptz        `json:"updated_at"`
+	ExpiresAt   pgtype.Timestamptz        `json:"expires_at"`
 }
 
 type PrescriptionItem struct {

@@ -1,9 +1,62 @@
 package models
 
 import (
+	"encoding/json"
 	"time"
 
 	"github.com/google/uuid"
+)
+
+// Appointment Status & Types
+type AppointmentStatus string
+
+const (
+	AppointmentStatusUpcoming  AppointmentStatus = "upcoming"
+	AppointmentStatusCompleted AppointmentStatus = "completed"
+	AppointmentStatusCancelled AppointmentStatus = "cancelled"
+)
+
+type AppointmentType string
+
+const (
+	AppointmentTypeInPerson AppointmentType = "in_person"
+	AppointmentTypeVirtual  AppointmentType = "virtual"
+)
+
+// Prescription Status & Source
+type PrescriptionStatus string
+
+const (
+	PrescriptionStatusPendingOCR  PrescriptionStatus = "pending_ocr"
+	PrescriptionStatusNeedsReview PrescriptionStatus = "needs_review"
+	PrescriptionStatusApproved    PrescriptionStatus = "approved"
+	PrescriptionStatusRejected    PrescriptionStatus = "rejected"
+)
+
+type PrescriptionSource string
+
+const (
+	PrescriptionSourceUploaded PrescriptionSource = "uploaded"
+	PrescriptionSourceDigital  PrescriptionSource = "digital"
+)
+
+// Medication Log Status & Time of Day
+type MedicationLogStatus string
+
+const (
+	MedicationLogStatusPending MedicationLogStatus = "pending"
+	MedicationLogStatusTaken   MedicationLogStatus = "taken"
+	MedicationLogStatusSkipped MedicationLogStatus = "skipped"
+)
+
+type MedicationTimeOfDay string
+
+const (
+	TimeOfDayMorning   MedicationTimeOfDay = "morning"
+	TimeOfDayAfternoon MedicationTimeOfDay = "afternoon"
+	TimeOfDayEvening   MedicationTimeOfDay = "evening"
+	TimeOfDayBedtime   MedicationTimeOfDay = "bedtime"
+	TimeOfDayAsNeeded  MedicationTimeOfDay = "as_needed"
 )
 
 type Authenticatable interface {
@@ -42,6 +95,7 @@ type Patient struct {
 	HashedPassword string    `json:"-"`
 	Role           string    `json:"role"`
 	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 func (p Patient) GetID() uuid.UUID {
@@ -67,6 +121,7 @@ type Doctor struct {
 	Experience     int       `json:"experience"`
 	Available      bool      `json:"available"`
 	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 func (d Doctor) GetID() uuid.UUID {
@@ -93,6 +148,7 @@ type Admin struct {
 	HashedPassword string    `json:"-"`
 	Role           string    `json:"role"`
 	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 func (a Admin) GetID() uuid.UUID {
@@ -111,19 +167,20 @@ func (a Admin) GetRole() string {
 }
 
 type Appointment struct {
-	ID              uuid.UUID `json:"id"`
-	DoctorID        uuid.UUID `json:"doctor_id"`
-	PatientID       uuid.UUID `json:"patient_id"`
-	StartTime       time.Time `json:"start_time"`
-	EndTime         time.Time `json:"end_time"`
-	Status          string    `json:"status"`
-	Type            string    `json:"type"`
-	MeetingLink     string    `json:"meeting_link,omitempty"`
-	MeetingID       string    `json:"meeting_id,omitempty"`
-	DoctorName      string    `json:"doctor_name,omitempty"`
-	DoctorSpecialty string    `json:"doctor_specialty,omitempty"`
-	PatientName     string    `json:"patient_name,omitempty"`
-	CreatedAt       time.Time `json:"created_at"`
+	ID              uuid.UUID         `json:"id"`
+	DoctorID        uuid.UUID         `json:"doctor_id"`
+	PatientID       uuid.UUID         `json:"patient_id"`
+	StartTime       time.Time         `json:"start_time"`
+	EndTime         time.Time         `json:"end_time"`
+	Status          AppointmentStatus `json:"status"`
+	Type            AppointmentType   `json:"type"`
+	MeetingLink     string            `json:"meeting_link,omitempty"`
+	MeetingID       string            `json:"meeting_id,omitempty"`
+	DoctorName      string            `json:"doctor_name,omitempty"`
+	DoctorSpecialty string            `json:"doctor_specialty,omitempty"`
+	PatientName     string            `json:"patient_name,omitempty"`
+	CreatedAt       time.Time         `json:"created_at"`
+	UpdatedAt       time.Time         `json:"updated_at"`
 }
 
 type PrescriptionItem struct {
@@ -142,12 +199,13 @@ type Prescription struct {
 	ID          uuid.UUID          `json:"id"`
 	PatientID   uuid.UUID          `json:"patient_id"`
 	DoctorID    uuid.UUID          `json:"doctor_id"`
-	Source      string             `json:"source"`
-	Status      string             `json:"status"`
+	Source      PrescriptionSource `json:"source"`
+	Status      PrescriptionStatus `json:"status"`
 	FileName    string             `json:"file_name,omitempty"`
 	Notes       string             `json:"notes"`
 	OCRProvider string             `json:"ocr_provider,omitempty"`
 	Items       []PrescriptionItem `json:"items"`
+	ExpiresAt   *time.Time         `json:"expires_at,omitempty"`
 	CreatedAt   time.Time          `json:"created_at"`
 	UpdatedAt   time.Time          `json:"updated_at"`
 	DoctorName  string             `json:"doctor_name,omitempty"`
@@ -192,21 +250,21 @@ type PatientVital struct {
 }
 
 type MedicationLog struct {
-	ID                 uuid.UUID  `json:"id"`
-	PatientID          uuid.UUID  `json:"patient_id"`
-	PrescriptionItemID uuid.UUID  `json:"prescription_item_id"`
-	ScheduledDate      time.Time  `json:"scheduled_date"`
-	TimeOfDay          string     `json:"time_of_day"` // 'morning', 'afternoon', 'evening', 'bedtime', 'as_needed'
-	DoseNumber         int        `json:"dose_number"`
-	MealTiming         string     `json:"meal_timing,omitempty"`
-	Status             string     `json:"status"` // 'pending', 'taken', 'skipped'
-	TakenAt            *time.Time `json:"taken_at,omitempty"`
-	Notes              string     `json:"notes,omitempty"`
-	MedicationName     string     `json:"medication_name,omitempty"`
-	Dosage             string     `json:"dosage,omitempty"`
-	Timing             string     `json:"timing,omitempty"`
-	Instructions       string     `json:"instructions,omitempty"`
-	CreatedAt          time.Time  `json:"created_at"`
+	ID                 uuid.UUID           `json:"id"`
+	PatientID          uuid.UUID           `json:"patient_id"`
+	PrescriptionItemID uuid.UUID           `json:"prescription_item_id"`
+	ScheduledDate      time.Time           `json:"scheduled_date"`
+	TimeOfDay          MedicationTimeOfDay `json:"time_of_day"`
+	DoseNumber         int                 `json:"dose_number"`
+	MealTiming         string              `json:"meal_timing,omitempty"`
+	Status             MedicationLogStatus `json:"status"` // 'pending', 'taken', 'skipped'
+	TakenAt            *time.Time          `json:"taken_at,omitempty"`
+	Notes              string              `json:"notes,omitempty"`
+	MedicationName     string              `json:"medication_name,omitempty"`
+	Dosage             string              `json:"dosage,omitempty"`
+	Timing             string              `json:"timing,omitempty"`
+	Instructions       string              `json:"instructions,omitempty"`
+	CreatedAt          time.Time           `json:"created_at"`
 }
 
 type RefreshToken struct {
@@ -220,18 +278,17 @@ type RefreshToken struct {
 }
 
 type PhiAuditLog struct {
-	ID           uuid.UUID  `json:"id"`
-	UserID       *uuid.UUID `json:"user_id,omitempty"`
-	UserRole     string     `json:"user_role,omitempty"`
-	Action       string     `json:"action"`
-	ResourceType string     `json:"resource_type"`
-	ResourceID   *uuid.UUID `json:"resource_id,omitempty"`
-	PatientID    *uuid.UUID `json:"patient_id,omitempty"`
-	IPAddress    string     `json:"ip_address,omitempty"`
-	UserAgent    string     `json:"user_agent,omitempty"`
-	RequestID    *uuid.UUID `json:"request_id,omitempty"`
-	StatusCode   int        `json:"status_code"`
-	Metadata     string     `json:"metadata,omitempty"`
-	CreatedAt    time.Time  `json:"created_at"`
+	ID           uuid.UUID       `json:"id"`
+	UserID       *uuid.UUID      `json:"user_id,omitempty"`
+	UserRole     string          `json:"user_role,omitempty"`
+	Action       string          `json:"action"`
+	ResourceType string          `json:"resource_type"`
+	ResourceID   *uuid.UUID      `json:"resource_id,omitempty"`
+	PatientID    *uuid.UUID      `json:"patient_id,omitempty"`
+	IPAddress    string          `json:"ip_address,omitempty"`
+	UserAgent    string          `json:"user_agent,omitempty"`
+	RequestID    *uuid.UUID      `json:"request_id,omitempty"`
+	StatusCode   int             `json:"status_code"`
+	Metadata     json.RawMessage `json:"metadata,omitempty"`
+	CreatedAt    time.Time       `json:"created_at"`
 }
-
