@@ -2,16 +2,24 @@ package pdf
 
 import (
 	"bytes"
+	_ "embed"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jung-kurt/gofpdf"
+	"github.com/go-pdf/fpdf"
 	"github.com/skip2/go-qrcode"
 
 	"github.com/RitwikGupta-0501/vital-watch/internal/models"
 )
+
+//go:embed fonts/DejaVuSans.ttf
+var dejavuFontBytes []byte
+
+//go:embed fonts/DejaVuSans-Bold.ttf
+var dejavuBoldFontBytes []byte
+
 
 // PrescriptionData holds all metadata and medications needed to render a prescription PDF
 type PrescriptionData struct {
@@ -42,14 +50,16 @@ func NewStandardPDFGenerator() *StandardPDFGenerator {
 
 // GeneratePrescriptionPDF compiles a standardized clinic-branded prescription slip
 func (g *StandardPDFGenerator) GeneratePrescriptionPDF(data PrescriptionData) ([]byte, error) {
-	pdf := gofpdf.New("P", "mm", "A4", "")
+	pdf := fpdf.New("P", "mm", "A4", "")
 	pdf.SetMargins(15, 15, 15)
 	pdf.SetAutoPageBreak(true, 20)
 	pdf.AddPage()
 
-	tr := pdf.UnicodeTranslatorFromDescriptor("")
+	pdf.AddUTF8FontFromBytes("DejaVuSans", "", dejavuFontBytes)
+	pdf.AddUTF8FontFromBytes("DejaVuSans", "B", dejavuBoldFontBytes)
+
 	safeStr := func(s string) string {
-		return tr(strings.TrimSpace(s))
+		return strings.TrimSpace(s)
 	}
 
 	// 1. Header & Clinic Branding
@@ -57,19 +67,19 @@ func (g *StandardPDFGenerator) GeneratePrescriptionPDF(data PrescriptionData) ([
 	pdf.Rect(15, 15, 180, 24, "F")
 
 	pdf.SetTextColor(255, 255, 255)
-	pdf.SetFont("Arial", "B", 16)
+	pdf.SetFont("DejaVuSans", "B", 16)
 	pdf.SetXY(20, 19)
 	pdf.Cell(100, 8, "VITALWATCH HEALTH NETWORK")
 
-	pdf.SetFont("Arial", "", 10)
+	pdf.SetFont("DejaVuSans", "", 10)
 	pdf.SetXY(20, 27)
 	pdf.Cell(100, 6, "Verified Electronic Prescription Slip")
 
 	// Rx ID & Date in Header
-	pdf.SetFont("Arial", "B", 9)
+	pdf.SetFont("DejaVuSans", "B", 9)
 	pdf.SetXY(120, 19)
 	pdf.CellFormat(70, 5, "RX ID: "+data.PrescriptionID.String()[:8], "", 0, "R", false, 0, "")
-	pdf.SetFont("Arial", "", 9)
+	pdf.SetFont("DejaVuSans", "", 9)
 	pdf.SetXY(120, 25)
 	dateStr := data.Date.Format("02 Jan 2006, 15:04 MST")
 	if data.Date.IsZero() {
@@ -89,12 +99,12 @@ func (g *StandardPDFGenerator) GeneratePrescriptionPDF(data PrescriptionData) ([
 	pdf.Rect(15, currentY, 88, 30, "FD")
 
 	pdf.SetXY(18, currentY+3)
-	pdf.SetFont("Arial", "B", 10)
+	pdf.SetFont("DejaVuSans", "B", 10)
 	pdf.SetTextColor(15, 118, 110)
 	pdf.Cell(80, 5, "PRESCRIBING PHYSICIAN")
 
 	pdf.SetTextColor(51, 65, 85)
-	pdf.SetFont("Arial", "B", 9)
+	pdf.SetFont("DejaVuSans", "B", 9)
 	pdf.SetXY(18, currentY+9)
 	docName := strings.TrimSpace(data.DoctorName)
 	if docName == "" {
@@ -102,7 +112,7 @@ func (g *StandardPDFGenerator) GeneratePrescriptionPDF(data PrescriptionData) ([
 	}
 	pdf.Cell(80, 5, safeStr(docName))
 
-	pdf.SetFont("Arial", "", 8)
+	pdf.SetFont("DejaVuSans", "", 8)
 	pdf.SetXY(18, currentY+14)
 	spec := strings.TrimSpace(data.DoctorSpecialty)
 	if spec == "" {
@@ -121,12 +131,12 @@ func (g *StandardPDFGenerator) GeneratePrescriptionPDF(data PrescriptionData) ([
 	pdf.Rect(107, currentY, 88, 30, "FD")
 
 	pdf.SetXY(110, currentY+3)
-	pdf.SetFont("Arial", "B", 10)
+	pdf.SetFont("DejaVuSans", "B", 10)
 	pdf.SetTextColor(15, 118, 110)
 	pdf.Cell(80, 5, "PATIENT DETAILS")
 
 	pdf.SetTextColor(51, 65, 85)
-	pdf.SetFont("Arial", "B", 9)
+	pdf.SetFont("DejaVuSans", "B", 9)
 	pdf.SetXY(110, currentY+9)
 	patName := strings.TrimSpace(data.PatientName)
 	if patName == "" {
@@ -134,7 +144,7 @@ func (g *StandardPDFGenerator) GeneratePrescriptionPDF(data PrescriptionData) ([
 	}
 	pdf.Cell(80, 5, safeStr(patName))
 
-	pdf.SetFont("Arial", "", 8)
+	pdf.SetFont("DejaVuSans", "", 8)
 	pdf.SetXY(110, currentY+14)
 	patEmail := strings.TrimSpace(data.PatientEmail)
 	if patEmail == "" {
@@ -148,7 +158,7 @@ func (g *StandardPDFGenerator) GeneratePrescriptionPDF(data PrescriptionData) ([
 	pdf.SetY(currentY + 36)
 
 	// 3. Medication Items Table Header
-	pdf.SetFont("Arial", "B", 11)
+	pdf.SetFont("DejaVuSans", "B", 11)
 	pdf.SetTextColor(15, 23, 42)
 	pdf.Cell(180, 7, "Prescribed Medications")
 	pdf.Ln(8)
@@ -161,7 +171,7 @@ func (g *StandardPDFGenerator) GeneratePrescriptionPDF(data PrescriptionData) ([
 	printTableHeader := func() {
 		pdf.SetFillColor(241, 245, 249) // Slate-100
 		pdf.SetTextColor(15, 23, 42)
-		pdf.SetFont("Arial", "B", 8)
+		pdf.SetFont("DejaVuSans", "B", 8)
 		for i, h := range headers {
 			pdf.CellFormat(colW[i], 7, h, "1", 0, "C", true, 0, "")
 		}
@@ -171,7 +181,7 @@ func (g *StandardPDFGenerator) GeneratePrescriptionPDF(data PrescriptionData) ([
 	printTableHeader()
 
 	// Table Rows
-	pdf.SetFont("Arial", "", 8)
+	pdf.SetFont("DejaVuSans", "", 8)
 	pdf.SetTextColor(51, 65, 85)
 
 	if len(data.Items) == 0 {
@@ -215,7 +225,7 @@ func (g *StandardPDFGenerator) GeneratePrescriptionPDF(data PrescriptionData) ([
 
 			// Calculate row height based on text wrapping to avoid clinical truncation
 			lineH := 3.8
-			pdf.SetFont("Arial", "", 8)
+			pdf.SetFont("DejaVuSans", "", 8)
 			linesMed := pdf.SplitLines([]byte(colTexts[1]), colW[1]-3)
 			linesDosage := pdf.SplitLines([]byte(colTexts[2]), colW[2]-3)
 			linesFreq := pdf.SplitLines([]byte(colTexts[3]), colW[3]-3)
@@ -248,7 +258,7 @@ func (g *StandardPDFGenerator) GeneratePrescriptionPDF(data PrescriptionData) ([
 			if pdf.GetY()+rowH > 270.0 {
 				pdf.AddPage()
 				printTableHeader()
-				pdf.SetFont("Arial", "", 8)
+				pdf.SetFont("DejaVuSans", "", 8)
 				pdf.SetTextColor(51, 65, 85)
 			}
 
@@ -284,12 +294,12 @@ func (g *StandardPDFGenerator) GeneratePrescriptionPDF(data PrescriptionData) ([
 
 	// 4. Clinical Notes
 	if strings.TrimSpace(data.Notes) != "" {
-		pdf.SetFont("Arial", "B", 9)
+		pdf.SetFont("DejaVuSans", "B", 9)
 		pdf.SetTextColor(15, 23, 42)
 		pdf.Cell(180, 6, "Clinician Notes & Instructions:")
 		pdf.Ln(6)
 
-		pdf.SetFont("Arial", "", 8)
+		pdf.SetFont("DejaVuSans", "", 8)
 		pdf.SetTextColor(71, 85, 105)
 		pdf.MultiCell(180, 5, safeStr(data.Notes), "1", "L", false)
 		pdf.Ln(4)
@@ -319,16 +329,16 @@ func (g *StandardPDFGenerator) GeneratePrescriptionPDF(data PrescriptionData) ([
 	qrPNG, err := qrcode.Encode(qrContent, qrcode.Medium, 128)
 	if err == nil {
 		imageName := "qr_" + data.PrescriptionID.String()
-		imgOpt := gofpdf.ImageOptions{ImageType: "PNG"}
+		imgOpt := fpdf.ImageOptions{ImageType: "PNG"}
 		pdf.RegisterImageOptionsReader(imageName, imgOpt, bytes.NewReader(qrPNG))
 		pdf.ImageOptions(imageName, 15, currentFooterY, 26, 26, false, imgOpt, 0, qrContent)
 
 		pdf.SetXY(43, currentFooterY+5)
-		pdf.SetFont("Arial", "B", 8)
+		pdf.SetFont("DejaVuSans", "B", 8)
 		pdf.SetTextColor(15, 118, 110)
 		pdf.Cell(60, 4, "SCAN TO VERIFY")
 		pdf.SetXY(43, currentFooterY+10)
-		pdf.SetFont("Arial", "", 7)
+		pdf.SetFont("DejaVuSans", "", 7)
 		pdf.SetTextColor(100, 116, 139)
 		pdf.Cell(60, 4, "Digitally signed on VitalWatch Network")
 		pdf.SetXY(43, currentFooterY+14)
@@ -341,12 +351,12 @@ func (g *StandardPDFGenerator) GeneratePrescriptionPDF(data PrescriptionData) ([
 	pdf.Line(120, currentFooterY+16, 195, currentFooterY+16)
 
 	pdf.SetXY(120, currentFooterY+17)
-	pdf.SetFont("Arial", "B", 8)
+	pdf.SetFont("DejaVuSans", "B", 8)
 	pdf.SetTextColor(30, 41, 59)
 	pdf.Cell(75, 4, docName)
 
 	pdf.SetXY(120, currentFooterY+21)
-	pdf.SetFont("Arial", "", 7)
+	pdf.SetFont("DejaVuSans", "", 7)
 	pdf.SetTextColor(100, 116, 139)
 	pdf.Cell(75, 4, "Authorized Clinician Signature (e-Signed)")
 
@@ -356,7 +366,7 @@ func (g *StandardPDFGenerator) GeneratePrescriptionPDF(data PrescriptionData) ([
 		noticeY = 280
 	}
 	pdf.SetY(noticeY)
-	pdf.SetFont("Arial", "I", 7)
+	pdf.SetFont("DejaVuSans", "", 7)
 	pdf.SetTextColor(148, 163, 184)
 	pdf.CellFormat(180, 4, "Confidential Medical Document - Generated automatically by VitalWatch. For prescription dispensing verification only.", "", 0, "C", false, 0, "")
 

@@ -1731,7 +1731,11 @@ func (r *DBRepository) RotateRefreshToken(ctx context.Context, oldTokenID, userI
 		return models.RefreshToken{}, err
 	}
 
-	// Grace-window retry: old token is already revoked with a known successor.
+	// Grace-window retry: the old token was already rotated recently (within 10s).
+	// This happens when a client retries due to a dropped response (common on mobile).
+	// Correct behaviour: return the EXISTING unconsumed replacement token instead of
+	// minting a third token and voiding the second one. Voiding the replacement was
+	// the root cause of false-positive theft-detection on legitimate concurrent retries.
 	if oldToken.RevokedAt.Valid {
 		if time.Since(oldToken.RevokedAt.Time) <= 10*time.Second && oldToken.ReplacedByTokenID.Valid {
 			replacementID := uuid.UUID(oldToken.ReplacedByTokenID.Bytes)
@@ -1740,48 +1744,28 @@ func (r *DBRepository) RotateRefreshToken(ctx context.Context, oldTokenID, userI
 				UserID: userID,
 			})
 			if scanErr == nil {
-				// If the replacement token was ALREADY consumed/revoked, this is a replay of an ancestor token
+				// The replacement was already consumed (rotated onward) — this is a
+				// replay of a truly-old ancestor token, so terminate all sessions.
 				if rep.RevokedAt.Valid {
 					return models.RefreshToken{}, ErrTokenAlreadyRotated
 				}
 
-				// The replacement was never consumed! Create a new token for this retry and void the unconsumed replacement.
-				newPgExpiry := pgtype.Timestamptz{Time: expiresAt, Valid: true}
-				created, err := qtx.CreateRefreshToken(ctx, dbgen.CreateRefreshTokenParams{
-					UserID:    userID,
-					TokenHash: newHash,
-					ExpiresAt: newPgExpiry,
-				})
-				if err != nil {
-					return models.RefreshToken{}, err
-				}
-
-				// Void the abandoned replacement token with NULL replaced_by_token_id so it cannot be replayed
-				const voidRepQuery = `
-					UPDATE refresh_tokens
-					SET revoked_at = now(), replaced_by_token_id = NULL
-					WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL`
-				if _, err := tx.Exec(ctx, voidRepQuery, rep.ID, userID); err != nil {
-					return models.RefreshToken{}, err
-				}
-
-				// Update old token lineage to point to the newly issued retry token
-				const updateOldQuery = `
-					UPDATE refresh_tokens
-					SET replaced_by_token_id = $2
-					WHERE id = $1 AND user_id = $3`
-				if _, err := tx.Exec(ctx, updateOldQuery, oldTokenID, pgtype.UUID{Bytes: created.ID, Valid: true}, userID); err != nil {
-					return models.RefreshToken{}, err
-				}
-
+				// Happy path: the replacement is still valid and unrevoked.
+				// Return it directly to the caller — no writes needed, just commit.
+				// The client stores this token, replacing its now-stale copy.
 				if commitErr := tx.Commit(ctx); commitErr != nil {
 					return models.RefreshToken{}, commitErr
 				}
-				return rawToRefreshToken(created.ID, created.UserID, created.TokenHash,
-					created.ExpiresAt, created.RevokedAt, created.ReplacedByTokenID, created.CreatedAt), nil
+				return rawToRefreshToken(
+					rep.ID, rep.UserID, rep.TokenHash,
+					rep.ExpiresAt, rep.RevokedAt, rep.ReplacedByTokenID, rep.CreatedAt,
+				), nil
 			}
+			// Replacement token ID recorded in the lineage but the row is missing —
+			// treat as data-integrity failure and reject the request.
 			return models.RefreshToken{}, fmt.Errorf("replacement token not found for revoked token %s", oldTokenID)
 		}
+		// Revoked more than 10 seconds ago with no valid retry window — stolen token.
 		return models.RefreshToken{}, ErrTokenAlreadyRotated
 	}
 

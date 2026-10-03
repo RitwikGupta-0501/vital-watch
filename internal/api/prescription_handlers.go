@@ -16,6 +16,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/RitwikGupta-0501/vital-watch/internal/audit"
 	"github.com/RitwikGupta-0501/vital-watch/internal/models"
@@ -436,7 +437,10 @@ func (h *Handler) CreatePrescription(c *gin.Context) {
 		return
 	}
 
-	// HIGH-3: Check if file_name is already associated with an existing prescription
+	// Application-level fast-exit: check before the insert to give a clear error
+	// in the common (non-concurrent) case. The migration 000011 unique index on
+	// prescriptions(file_name) provides the authoritative race-proof guarantee for
+	// the concurrent window between this check and the INSERT below.
 	fileAlreadyUsed, chkErr := h.Repo.CheckPrescriptionFileNameExists(ctx, req.FileName)
 	if chkErr == nil && fileAlreadyUsed {
 		c.JSON(http.StatusConflict, gin.H{"error": "A prescription with this file name already exists"})
@@ -454,6 +458,14 @@ func (h *Handler) CreatePrescription(c *gin.Context) {
 
 	newID, status, err := h.Repo.CreateUploadedPrescriptionWithJob(ctx, req.PatientID, doctorID, req.FileName, notes, h.OCREnabled)
 	if err != nil {
+		// Unique-constraint violation: concurrent upload of the same storage key
+		// was committed between our application-level check above and the INSERT.
+		// Migration 000011 adds the partial unique index that raises SQLSTATE 23505.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" && strings.Contains(pgErr.ConstraintName, "filename") {
+			c.JSON(http.StatusConflict, gin.H{"error": "A prescription with this file name already exists"})
+			return
+		}
 		slog.ErrorContext(c.Request.Context(), "Failed to create prescription in DB", "error", err)
 		go func() {
 			rbCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -470,6 +482,7 @@ func (h *Handler) CreatePrescription(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create prescription record"})
 		return
 	}
+
 
 	h.audit(c, audit.ActionCreatePrescription, "prescription", &newID, &req.PatientID, http.StatusCreated, map[string]interface{}{
 		"source":   "upload",

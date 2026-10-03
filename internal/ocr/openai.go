@@ -79,7 +79,37 @@ func (o *OpenAIProvider) ExtractPrescription(ctx context.Context, fileBytes []by
 				},
 			},
 		},
-		"response_format": map[string]string{"type": "json_object"},
+		"response_format": map[string]any{
+			"type": "json_schema",
+			"json_schema": map[string]any{
+				"name": "prescription_extraction",
+				"schema": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"medications": map[string]any{
+							"type": "array",
+							"items": map[string]any{
+								"type": "object",
+								"properties": map[string]any{
+									"medication_name": map[string]any{"type": "string"},
+									"dosage":          map[string]any{"type": "string"},
+									"frequency":       map[string]any{"type": "string"},
+									"duration":        map[string]any{"type": "string"},
+									"timing":          map[string]any{"type": "string"},
+									"instructions":    map[string]any{"type": "string"},
+								},
+								"required":             []string{"medication_name", "dosage", "frequency", "duration", "timing", "instructions"},
+								"additionalProperties": false,
+							},
+						},
+						"confidence": map[string]any{"type": "number"},
+					},
+					"required":             []string{"medications", "confidence"},
+					"additionalProperties": false,
+				},
+				"strict": true,
+			},
+		},
 	}
 
 	bodyBytes, err := json.Marshal(reqPayload)

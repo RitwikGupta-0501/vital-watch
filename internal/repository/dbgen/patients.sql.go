@@ -105,11 +105,15 @@ func (q *Queries) GetPatientByID(ctx context.Context, id uuid.UUID) (GetPatientB
 }
 
 const getPatientsByDoctorID = `-- name: GetPatientsByDoctorID :many
-SELECT DISTINCT u.id, u.email, p.first_name, p.last_name, u.created_at
+SELECT u.id, u.email, p.first_name, p.last_name, u.created_at
 FROM users u
 JOIN patient_profiles p ON u.id = p.user_id
-JOIN appointments a ON u.id = a.patient_id
-WHERE a.doctor_id = $1
+WHERE u.role = 'patient'
+  AND u.is_active = true
+  AND EXISTS (
+      SELECT 1 FROM appointments a
+      WHERE a.patient_id = u.id AND a.doctor_id = $1
+  )
 ORDER BY u.created_at DESC, u.id DESC
 LIMIT $2 OFFSET $3
 `

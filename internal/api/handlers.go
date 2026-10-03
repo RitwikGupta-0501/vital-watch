@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/RitwikGupta-0501/vital-watch/internal/models"
 	"github.com/RitwikGupta-0501/vital-watch/internal/audit"
@@ -45,7 +46,8 @@ type Handler struct {
 	Notifier         notifications.Broker
 	Telehealth       telehealth.Provider
 	Auditor          audit.Auditor
-	activeUserCache  sync.Map // uuid.UUID -> activeCacheEntry
+	Pool             *pgxpool.Pool // for connection pool telemetry in /healthz
+	activeUserCache  sync.Map      // uuid.UUID -> activeCacheEntry
 }
 
 // InvalidateUserActiveCache clears the cached active status of a user upon administrative deactivation/reactivation.
@@ -93,7 +95,12 @@ func (h *Handler) Ping(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "pong from the api layer!"})
 }
 
-// HealthCheck verifies backend liveness and database connectivity for container probes.
+// HealthCheck verifies backend liveness, database connectivity, and connection
+// pool health for container probes and SRE dashboards.
+//
+// A plain pool.Ping() succeeds even when all connections are checked out and
+// requests are queuing. The pool stat fields below give Kubernetes readiness
+// gates and SRE alerting real visibility into connection saturation.
 func (h *Handler) HealthCheck(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
 	defer cancel()
@@ -117,11 +124,26 @@ func (h *Handler) HealthCheck(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
+	resp := gin.H{
 		"status":   "healthy",
 		"database": "up",
-	})
+	}
+
+	// Attach connection pool telemetry when the pool reference is available.
+	// pool_empty_acquires is a leading indicator of saturation: it counts requests
+	// that had to wait because all connections were checked out.
+	if h.Pool != nil {
+		stat := h.Pool.Stat()
+		resp["pool_total_conns"] = stat.TotalConns()
+		resp["pool_acquired_conns"] = stat.AcquiredConns()
+		resp["pool_idle_conns"] = stat.IdleConns()
+		resp["pool_max_conns"] = stat.MaxConns()
+		resp["pool_empty_acquires"] = stat.EmptyAcquireCount()
+	}
+
+	c.JSON(http.StatusOK, resp)
 }
+
 
 func AuthMiddleware(jwtSecret []byte) gin.HandlerFunc {
 	return parseTokenMiddleware(jwtSecret, false, nil)

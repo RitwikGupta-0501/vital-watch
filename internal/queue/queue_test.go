@@ -512,7 +512,7 @@ func TestPrescriptionOCRWorker_NotificationOnPermanentFailure(t *testing.T) {
 	doctorID := uuid.New()
 	storageKey := "rx-file.png"
 
-	notifier := notifications.NewSSEBroker()
+	notifier := notifications.NewSSEBroker(nil)
 	defer notifier.Shutdown()
 
 	eventCh, unsub := notifier.Subscribe(doctorID)

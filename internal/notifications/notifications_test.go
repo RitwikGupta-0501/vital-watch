@@ -12,7 +12,7 @@ import (
 )
 
 func TestSSEBroker_SubscribeAndPublish(t *testing.T) {
-	broker := NewSSEBroker()
+	broker := NewSSEBroker(nil)
 	defer broker.Shutdown()
 
 	doctorID := uuid.New()
@@ -69,7 +69,7 @@ func TestSSEBroker_SubscribeAndPublish(t *testing.T) {
 }
 
 func TestSSEBroker_Shutdown(t *testing.T) {
-	broker := NewSSEBroker()
+	broker := NewSSEBroker(nil)
 	userID := uuid.New()
 
 	ch, _ := broker.Subscribe(userID)
@@ -88,7 +88,7 @@ func TestSSEBroker_Shutdown(t *testing.T) {
 
 func TestServeSSE_InitialConnection(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	broker := NewSSEBroker()
+	broker := NewSSEBroker(nil)
 	defer broker.Shutdown()
 
 	userID := uuid.New()

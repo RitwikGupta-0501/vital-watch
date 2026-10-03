@@ -316,7 +316,14 @@ func TestReciprocalDrugDrugInteraction_UpgradesModerateToContraindication(t *tes
 }
 
 func TestAllergyWordBoundaries(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"results": []interface{}{}})
+	}))
+	defer server.Close()
+
 	checker := NewOpenFDAChecker()
+	checker.SetBaseURL(server.URL)
 
 	// Allergen "ace" should not flag "acetaminophen"
 	report, err := checker.CheckPrescriptionSafety(
@@ -480,5 +487,38 @@ func TestNonInteractingPairs_CheckedOnce(t *testing.T) {
 
 	if searchesCount != 2 {
 		t.Fatalf("expected exactly 2 FDA queries for 2 distinct drugs, got %d: %v", searchesCount, searchesCopy)
+	}
+}
+
+func TestSingleflightConcurrency(t *testing.T) {
+	var mu sync.Mutex
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		time.Sleep(50 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"results": []interface{}{}})
+	}))
+	defer server.Close()
+
+	checker := NewOpenFDAChecker()
+	checker.SetBaseURL(server.URL)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			checker.getDrugLabel(context.Background(), "ibuprofen")
+		}()
+	}
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("expected exactly 1 API call due to singleflight, got %d", calls)
 	}
 }

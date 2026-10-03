@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 )
 
 // FallbackChain decorates a slice of Providers, executing them in priority order
@@ -40,7 +41,10 @@ func (fc *FallbackChain) ExtractPrescription(ctx context.Context, fileBytes []by
 		}
 		anySupported = true
 
-		res, err := p.ExtractPrescription(ctx, fileBytes, mimeType)
+		providerCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
+		res, err := p.ExtractPrescription(providerCtx, fileBytes, mimeType)
+		cancel()
+
 		if err == nil && res != nil {
 			slog.InfoContext(ctx, "Extraction succeeded via OCR provider", "provider", p.Name(), "medications_count", len(res.Medications))
 			res.Provider = p.Name()

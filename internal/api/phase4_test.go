@@ -1324,7 +1324,7 @@ func TestCreatePatientVital_CriticalAlertAndPatientOnlySSE(t *testing.T) {
 	doctorID := uuid.New()
 	vitalID := uuid.New()
 
-	mockBroker := notifications.NewSSEBroker()
+	mockBroker := notifications.NewSSEBroker(nil)
 	defer mockBroker.Shutdown()
 
 	patientCh, unsubPatient := mockBroker.Subscribe(patientID)
@@ -1415,7 +1415,7 @@ func TestCreatePatientVital_NormalVitalsNoCriticalAlert(t *testing.T) {
 	patientID := uuid.New()
 	vitalID := uuid.New()
 
-	mockBroker := notifications.NewSSEBroker()
+	mockBroker := notifications.NewSSEBroker(nil)
 	defer mockBroker.Shutdown()
 
 	patientCh, unsubPatient := mockBroker.Subscribe(patientID)
@@ -1484,7 +1484,7 @@ func TestLogMedicationAdherence_TemporalBoundsAndNotification(t *testing.T) {
 	itemID := uuid.New()
 	logID := uuid.New()
 
-	mockBroker := notifications.NewSSEBroker()
+	mockBroker := notifications.NewSSEBroker(nil)
 	defer mockBroker.Shutdown()
 
 	patientCh, unsubPatient := mockBroker.Subscribe(patientID)

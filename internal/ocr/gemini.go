@@ -91,6 +91,26 @@ func (g *GeminiProvider) ExtractPrescription(ctx context.Context, fileBytes []by
 
 	resp, err := g.client.Models.GenerateContent(ctx, g.model, []*genai.Content{content}, &genai.GenerateContentConfig{
 		ResponseMIMEType: "application/json",
+		ResponseSchema: &genai.Schema{
+			Type: genai.TypeObject,
+			Properties: map[string]*genai.Schema{
+				"medications": {
+					Type: genai.TypeArray,
+					Items: &genai.Schema{
+						Type: genai.TypeObject,
+						Properties: map[string]*genai.Schema{
+							"medication_name": {Type: genai.TypeString},
+							"dosage":          {Type: genai.TypeString},
+							"frequency":       {Type: genai.TypeString},
+							"duration":        {Type: genai.TypeString},
+							"timing":          {Type: genai.TypeString},
+							"instructions":    {Type: genai.TypeString},
+						},
+					},
+				},
+				"confidence": {Type: genai.TypeNumber},
+			},
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("gemini vision extraction failed: %w", err)

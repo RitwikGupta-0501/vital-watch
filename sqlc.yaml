@@ -11,6 +11,7 @@ sql:
       - "migrations/000008_harden_schema_integrity.up.sql"
       - "migrations/000009_patient_booking_exclusion.up.sql"
       - "migrations/000010_harden_relational_integrity.up.sql"
+      - "migrations/000011_production_hardening.up.sql"
     queries: "internal/repository/queries"
     gen:
       go:

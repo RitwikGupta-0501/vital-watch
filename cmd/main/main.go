@@ -7,6 +7,7 @@ import (
 	"log"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -24,10 +25,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/joho/godotenv"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/RitwikGupta-0501/vital-watch/internal/api"
 	"github.com/RitwikGupta-0501/vital-watch/internal/audit"
 	"github.com/RitwikGupta-0501/vital-watch/internal/logger"
+	"github.com/RitwikGupta-0501/vital-watch/internal/metrics"
 	"github.com/RitwikGupta-0501/vital-watch/internal/middleware"
 	"github.com/RitwikGupta-0501/vital-watch/internal/notifications"
 	"github.com/RitwikGupta-0501/vital-watch/internal/ocr"
@@ -44,29 +47,62 @@ import (
 =        Database Initialization       =
 ========================================
 */
-func init_db(ctx context.Context) *pgxpool.Pool {
+
+// buildDatabaseDSN constructs a connection string for pgxpool.ParseConfig.
+// Priority: DATABASE_URL env var (matches CI and 12-factor cloud deployments),
+// then individual DB_* vars assembled into a properly URL-encoded URL so that
+// passwords containing spaces, quotes, or backslashes are handled correctly.
+func buildDatabaseDSN() string {
+	if u := os.Getenv("DATABASE_URL"); u != "" {
+		return u
+	}
+
 	dbHost := os.Getenv("DB_HOST")
-	dbPortStr := os.Getenv("DB_PORT")
+	if dbHost == "" {
+		dbHost = "localhost"
+	}
+	dbPort := os.Getenv("DB_PORT")
+	if dbPort == "" {
+		dbPort = "5432"
+	}
 	dbUser := os.Getenv("DB_USER")
 	dbPassword := os.Getenv("DB_PASSWORD")
 	dbName := os.Getenv("DB_NAME")
 	sslMode := os.Getenv("DB_SSLMODE")
-
-	dbPort, err := strconv.Atoi(dbPortStr)
-	if err != nil {
-		log.Fatal("Invalid DB_PORT:", err)
+	if sslMode == "" {
+		sslMode = "disable"
 	}
 
-	connStr := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
-		dbHost, dbPort, dbUser, dbPassword, dbName, sslMode)
+	u := &url.URL{
+		Scheme: "postgres",
+		User:   url.UserPassword(dbUser, dbPassword),
+		Host:   fmt.Sprintf("%s:%s", dbHost, dbPort),
+		Path:   dbName,
+	}
+	q := url.Values{}
+	q.Set("sslmode", sslMode)
+	u.RawQuery = q.Encode()
+
+	return u.String()
+}
+
+func init_db(ctx context.Context) *pgxpool.Pool {
+	connStr := buildDatabaseDSN()
 
 	poolConfig, err := pgxpool.ParseConfig(connStr)
 	if err != nil {
 		log.Fatal("Failed to parse database pool configuration:", err)
 	}
 
-	// Tune database connection pool settings (DB-03, OPS-01)
-	maxConns := 50
+	// Pool sizing budget:
+	//   HTTP REST layer      ~40 (burst)
+	//   River worker pool    ≤12 (10 workers + 2 River internal)
+	//   HIPAA Async Auditor   5  (DefaultWorkerCount)
+	//   SSE pg_notify LISTEN  1  (permanent)
+	//   Safety buffer        17
+	//   ─────────────────────────
+	//   Total                75  (override via DB_MAX_CONNS)
+	maxConns := 75
 	if val := os.Getenv("DB_MAX_CONNS"); val != "" {
 		if n, err := strconv.Atoi(val); err == nil && n > 0 {
 			maxConns = n
@@ -82,26 +118,54 @@ func init_db(ctx context.Context) *pgxpool.Pool {
 	poolConfig.MaxConns = int32(maxConns)
 	poolConfig.MinConns = int32(minConns)
 	poolConfig.MaxConnLifetime = 1 * time.Hour
-	poolConfig.MaxConnIdleTime = 30 * time.Minute
+	// Jitter desynchronises mass connection recycling that would otherwise
+	// produce a thundering-herd TCP reconnect storm every 60 minutes.
+	poolConfig.MaxConnLifetimeJitter = 5 * time.Minute
+	poolConfig.MaxConnIdleTime = 15 * time.Minute
+	// Actively probe idle connections so silent dead sockets (cloud NAT/firewall
+	// idle-timeout drops) are evicted before a request attempts to use them.
+	poolConfig.HealthCheckPeriod = 30 * time.Second
+	// Bound the TCP handshake so a hung PostgreSQL cannot stall startup indefinitely.
+	poolConfig.ConnConfig.ConnectTimeout = 5 * time.Second
+
+	// Per-session server-side safety guards:
+	//   application_name  – identifies this service in pg_stat_activity / pg_locks
+	//   statement_timeout – aborts runaway queries before they hold row-level locks
+	//   idle_in_transaction_session_timeout – evicts stalled transactions that block VACUUM/DDL
+	if poolConfig.ConnConfig.RuntimeParams == nil {
+		poolConfig.ConnConfig.RuntimeParams = make(map[string]string)
+	}
+	poolConfig.ConnConfig.RuntimeParams["application_name"] = "vital-watch-backend"
+	poolConfig.ConnConfig.RuntimeParams["statement_timeout"] = "30000"                   // 30 s
+	poolConfig.ConnConfig.RuntimeParams["idle_in_transaction_session_timeout"] = "10000" // 10 s
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
 		log.Fatal("Failed to initialize database connection pool:", err)
 	}
 
-	// Retry loop for pool.Ping()
-	var dbErr error
-	for i := 0; i < 5; i++ {
-		err = pool.Ping(ctx)
-		if err == nil {
-			slog.Info("Successfully connected to database pool!")
+	// Retry loop: each attempt is individually time-bounded so a partially
+	// reachable PostgreSQL cannot block startup longer than 5 × 3 s + 10 s backoff.
+	backoff := 500 * time.Millisecond
+	var lastErr error
+	for i := 1; i <= 5; i++ {
+		pingCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		lastErr = pool.Ping(pingCtx)
+		cancel()
+		if lastErr == nil {
+			slog.Info("Successfully connected to database pool",
+				"max_conns", maxConns,
+				"min_conns", minConns,
+			)
+			// Register Prometheus DB pool metrics collector
+			metrics.Register(pool)
 			return pool
 		}
-		dbErr = err
-		slog.Warn("Failed to ping database, retrying in 2 seconds...", "error", err)
-		time.Sleep(2 * time.Second)
+		slog.Warn("Database ping failed, retrying...", "attempt", i, "error", lastErr)
+		time.Sleep(backoff)
+		backoff *= 2
 	}
-	log.Fatal("Failed to ping database after retries:", dbErr)
+	log.Fatal("Failed to connect to database after retries:", lastErr)
 	return nil
 }
 
@@ -111,9 +175,17 @@ func init_db(ctx context.Context) *pgxpool.Pool {
 ========================================
 */
 func run_migrations(pool *pgxpool.Pool) {
+	// AUTO_MIGRATE=false lets multi-replica deployments skip in-process DDL
+	// and rely on a dedicated migration job / initContainer instead.
+	if os.Getenv("AUTO_MIGRATE") == "false" {
+		slog.Info("AUTO_MIGRATE=false; skipping in-process migration runner")
+		return
+	}
+
 	slog.Info("Running database migrations...")
 	sqlDB := stdlib.OpenDBFromPool(pool)
 	defer sqlDB.Close()
+
 	driver, err := pgxmigrate.WithInstance(sqlDB, &pgxmigrate.Config{})
 	if err != nil {
 		log.Fatal("Failed to create migration driver:", err)
@@ -124,10 +196,19 @@ func run_migrations(pool *pgxpool.Pool) {
 	if err != nil {
 		log.Fatal("Failed to create migration instance:", err)
 	}
+	// Release the file-system source reader and the database driver reference.
+	defer func() {
+		srcErr, dbErr := m.Close()
+		if srcErr != nil {
+			slog.Warn("Migration source close notice", "error", srcErr)
+		}
+		if dbErr != nil {
+			slog.Warn("Migration database driver close notice", "error", dbErr)
+		}
+	}()
 
 	// Run the migrations "up"
-	err = m.Up()
-	if err != nil && err != migrate.ErrNoChange {
+	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
 		log.Fatal("Failed to run migrations:", err)
 	}
 
@@ -248,7 +329,7 @@ func main() {
 	// Initialize PDF Generator, DDI Safety Engine, Real-Time SSE Broker, and Telehealth
 	pdfGen := pdf.NewStandardPDFGenerator()
 	safetyChecker := safety.NewOpenFDAChecker()
-	notifier := notifications.NewSSEBroker()
+	notifier := notifications.NewSSEBroker(pool)
 	telehealthProv := telehealth.NewTelehealthManager(jwtSecret)
 	dlqFilePath := os.Getenv("AUDIT_DLQ_PATH")
 	if dlqFilePath == "" {
@@ -285,6 +366,7 @@ func main() {
 		Notifier:         notifier,
 		Telehealth:       telehealthProv,
 		Auditor:          auditor,
+		Pool:             pool,
 	}
 
 	// Set up Gin Router
@@ -300,19 +382,28 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 	}
 
-	// Run server in a goroutine
+	// Run server in a goroutine. Errors are funnelled back to main so the
+	// graceful shutdown sequence always executes (pool.Close, auditor.Shutdown,
+	// riverClient.Stop). Using log.Fatalf here would call os.Exit and bypass all
+	// deferred functions, risking HIPAA audit data loss.
+	serverErr := make(chan error, 1)
 	go func() {
 		slog.Info("Starting HTTP server", "port", port)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("HTTP server listen error: %v", err)
+			serverErr <- err
 		}
 	}()
 
-	// Listen for OS signals for graceful shutdown (OPS-02)
+	// Block until an OS signal or an unexpected server failure is received.
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	sig := <-quit
-	slog.Info("Received shutdown signal. Draining in-flight connections and queue workers...", "signal", sig.String())
+
+	select {
+	case sig := <-quit:
+		slog.Info("Received shutdown signal. Draining in-flight connections and queue workers...", "signal", sig.String())
+	case err := <-serverErr:
+		slog.Error("HTTP server failed unexpectedly; initiating emergency graceful shutdown", "error", err)
+	}
 
 	// Graceful shutdown: Real-time notification broker (unblocks active SSE streams so HTTP server can drain)
 	slog.Info("Closing notification broker subscriptions...")
@@ -354,6 +445,11 @@ func setupRouter(h *api.Handler, storageType string, jwtSecret []byte) *gin.Engi
 	r := gin.New()
 	r.Use(gin.Recovery())
 	r.Use(middleware.RequestIDMiddleware())
+	
+	// HTTP Metrics Middleware
+	metricsMiddleware := middleware.NewMetricsMiddleware()
+	r.Use(metricsMiddleware.Middleware())
+
 	r.Use(middleware.SecurityHeadersMiddleware())
 
 	// Rate Limiting: 120 req/min general, 10 req/min for authentication endpoints
@@ -389,6 +485,7 @@ func setupRouter(h *api.Handler, storageType string, jwtSecret []byte) *gin.Engi
 	// -----------------------
 	// -       Routes        -
 	// -----------------------
+	r.GET("/metrics", gin.WrapH(promhttp.Handler())) // Prometheus metrics endpoint
 	r.GET("/healthz", h.HealthCheck)
 	r.GET("/api/healthz", h.HealthCheck)
 	r.GET("/api/ping", h.Ping)

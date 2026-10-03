@@ -515,7 +515,11 @@ func (h *Handler) GetAppointmentMeetingRoom(c *gin.Context) {
 			if strings.Contains(meetingLink, "?") {
 				separator = "&"
 			}
-			meetingLink = fmt.Sprintf("%s%st=%s", meetingLink, separator, token)
+			tokenParam := "t"
+			if h.Telehealth != nil && h.Telehealth.Name() == "jitsi" {
+				tokenParam = "jwt"
+			}
+			meetingLink = fmt.Sprintf("%s%s%s=%s", meetingLink, separator, tokenParam, token)
 		}
 	}
 

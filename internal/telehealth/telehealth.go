@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 )
 
@@ -78,6 +79,52 @@ func (j *JitsiProvider) CreateRoom(ctx context.Context, appointmentID uuid.UUID,
 		MeetingLink: roomLink,
 		Provider:    j.Name(),
 	}, nil
+}
+
+func (j *JitsiProvider) CreateMeetingToken(ctx context.Context, roomName string, isOwner bool, exp time.Time) (string, error) {
+	if strings.TrimSpace(j.secret) == "" {
+		return "", fmt.Errorf("jitsi secret is not configured")
+	}
+
+	expUnix := exp.Unix()
+	if minExp := time.Now().Add(30 * time.Minute).Unix(); expUnix < minExp {
+		expUnix = minExp
+	}
+
+	userContext := map[string]interface{}{
+		"name": "VitalWatch Participant",
+	}
+	if isOwner {
+		userContext["affiliation"] = "owner"
+		userContext["moderator"] = true
+	} else {
+		userContext["affiliation"] = "member"
+		userContext["moderator"] = false
+	}
+
+	claims := jwt.MapClaims{
+		"aud":  "jitsi",
+		"iss":  "vitalwatch",
+		"sub":  j.domain,
+		"room": roomName,
+		"exp":  expUnix,
+		"nbf":  time.Now().Add(-1 * time.Minute).Unix(),
+		"context": map[string]interface{}{
+			"user": userContext,
+			"features": map[string]interface{}{
+				"livestreaming": false,
+				"recording":     false,
+			},
+		},
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tokenString, err := token.SignedString([]byte(j.secret))
+	if err != nil {
+		return "", fmt.Errorf("failed to sign jitsi jwt: %w", err)
+	}
+
+	return tokenString, nil
 }
 
 // DailyProvider creates ephemeral video rooms using the Daily.co REST API

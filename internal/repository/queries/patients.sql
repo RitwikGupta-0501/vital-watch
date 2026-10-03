@@ -20,11 +20,19 @@ JOIN patient_profiles p ON u.id = p.user_id
 WHERE u.id = $1 AND u.role = 'patient' AND u.is_active = true;
 
 -- name: GetPatientsByDoctorID :many
-SELECT DISTINCT u.id, u.email, p.first_name, p.last_name, u.created_at
+-- Uses an EXISTS semi-join instead of SELECT DISTINCT to avoid a full
+-- hash-aggregate/deduplication pass over all appointment rows.
+-- The EXISTS subquery short-circuits at the first matching appointment
+-- per patient, allowing PostgreSQL to use an index scan with pagination.
+SELECT u.id, u.email, p.first_name, p.last_name, u.created_at
 FROM users u
 JOIN patient_profiles p ON u.id = p.user_id
-JOIN appointments a ON u.id = a.patient_id
-WHERE a.doctor_id = $1
+WHERE u.role = 'patient'
+  AND u.is_active = true
+  AND EXISTS (
+      SELECT 1 FROM appointments a
+      WHERE a.patient_id = u.id AND a.doctor_id = $1
+  )
 ORDER BY u.created_at DESC, u.id DESC
 LIMIT $2 OFFSET $3;
 

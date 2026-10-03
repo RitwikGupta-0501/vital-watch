@@ -14,6 +14,8 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"golang.org/x/sync/singleflight"
 )
 
 type AlertSeverity string
@@ -68,6 +70,7 @@ type OpenFDAChecker struct {
 	cache      map[string]cachedLabel
 	cacheTTL   time.Duration
 	mu         sync.RWMutex
+	sf         singleflight.Group
 }
 
 const maxCacheEntries = 2000
@@ -148,10 +151,15 @@ func CleanDrugName(name string) string {
 	return strings.ToLower(cleaned)
 }
 
-func (c *OpenFDAChecker) getDrugLabel(ctx context.Context, drugName string) (*cachedLabel, error) {
+type sfResult struct {
+	label cachedLabel
+	found bool
+}
+
+func (c *OpenFDAChecker) getDrugLabel(ctx context.Context, drugName string) (cachedLabel, bool, error) {
 	clean := CleanDrugName(drugName)
 	if clean == "" {
-		return nil, nil
+		return cachedLabel{}, false, nil
 	}
 
 	c.mu.RLock()
@@ -159,75 +167,85 @@ func (c *OpenFDAChecker) getDrugLabel(ctx context.Context, drugName string) (*ca
 	c.mu.RUnlock()
 
 	if exists && time.Since(entry.cachedAt) < c.cacheTTL {
-		return &entry, nil
+		if len(entry.interactions) == 0 && len(entry.contraindications) == 0 && len(entry.warnings) == 0 {
+			// This was a 404 cache entry (empty)
+			return cachedLabel{}, false, nil
+		}
+		return entry, true, nil
 	}
 
-	// Query OpenFDA: search by brand_name or generic_name
-	queryParam := fmt.Sprintf(`openfda.brand_name:"%s" OR openfda.generic_name:"%s"`, clean, clean)
-	reqURL := fmt.Sprintf("%s?search=%s&limit=1", c.baseURL, url.QueryEscape(queryParam))
-	if c.apiKey != "" {
-		reqURL += fmt.Sprintf("&api_key=%s", url.QueryEscape(c.apiKey))
-	}
+	// Singleflight fetch
+	res, err, _ := c.sf.Do(clean, func() (interface{}, error) {
+		queryParam := fmt.Sprintf(`openfda.brand_name:"%s" OR openfda.generic_name:"%s"`, clean, clean)
+		reqURL := fmt.Sprintf("%s?search=%s&limit=1", c.baseURL, url.QueryEscape(queryParam))
+		if c.apiKey != "" {
+			reqURL += fmt.Sprintf("&api_key=%s", url.QueryEscape(c.apiKey))
+		}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			slog.WarnContext(ctx, "Failed to query OpenFDA", "drug", clean, "error", err)
+			return nil, err
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode == http.StatusNotFound {
+			// Drug not found in OpenFDA label database, cache empty to prevent repeated queries
+			c.putCache(clean, cachedLabel{cachedAt: time.Now()})
+			return sfResult{found: false}, nil
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			slog.WarnContext(ctx, "Non-200 from OpenFDA", "drug", clean, "status", resp.StatusCode, "response_body", string(body))
+			return nil, fmt.Errorf("openfda service returned status %d", resp.StatusCode)
+		}
+
+		var fdaResp struct {
+			Results []struct {
+				DrugInteractions  []string `json:"drug_interactions"`
+				Contraindications []string `json:"contraindications"`
+				Warnings          []string `json:"warnings"`
+			} `json:"results"`
+		}
+
+		if err := json.NewDecoder(resp.Body).Decode(&fdaResp); err != nil {
+			return nil, err
+		}
+
+		label := cachedLabel{cachedAt: time.Now()}
+		if len(fdaResp.Results) > 0 {
+			label.interactions = fdaResp.Results[0].DrugInteractions
+			label.contraindications = fdaResp.Results[0].Contraindications
+			label.warnings = fdaResp.Results[0].Warnings
+		}
+
+		c.putCache(clean, label)
+
+		return sfResult{label: label, found: true}, nil
+	})
+
 	if err != nil {
-		return nil, err
+		return cachedLabel{}, false, err
 	}
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		slog.WarnContext(ctx, "Failed to query OpenFDA", "drug", clean, "error", err)
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusNotFound {
-		// Drug not found in OpenFDA label database, cache empty to prevent repeated queries
-		c.putCache(clean, cachedLabel{cachedAt: time.Now()})
-		return nil, nil
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		slog.WarnContext(ctx, "Non-200 from OpenFDA", "drug", clean, "status", resp.StatusCode, "response_body", string(body))
-		return nil, fmt.Errorf("openfda service returned status %d", resp.StatusCode)
-	}
-
-	var fdaResp struct {
-		Results []struct {
-			DrugInteractions  []string `json:"drug_interactions"`
-			Contraindications []string `json:"contraindications"`
-			Warnings          []string `json:"warnings"`
-		} `json:"results"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&fdaResp); err != nil {
-		return nil, err
-	}
-
-	label := cachedLabel{cachedAt: time.Now()}
-	if len(fdaResp.Results) > 0 {
-		label.interactions = fdaResp.Results[0].DrugInteractions
-		label.contraindications = fdaResp.Results[0].Contraindications
-		label.warnings = fdaResp.Results[0].Warnings
-	}
-
-	c.putCache(clean, label)
-
-	return &label, nil
+	sfr := res.(sfResult)
+	return sfr.label, sfr.found, nil
 }
 
-func matchAllergen(cleanMed, allergen string) bool {
-	cleanAllergen := strings.ToLower(strings.TrimSpace(allergen))
+func matchAllergen(cleanMed string, cleanAllergen string, re *regexp.Regexp) bool {
 	if cleanMed == "" || cleanAllergen == "" {
 		return false
 	}
-	pattern := `(?i)\b` + regexp.QuoteMeta(cleanAllergen) + `\b`
-	re, err := regexp.Compile(pattern)
-	if err != nil {
-		return strings.EqualFold(cleanMed, cleanAllergen)
+	if re != nil {
+		return re.MatchString(cleanMed)
 	}
-	return re.MatchString(cleanMed)
+	return strings.EqualFold(cleanMed, cleanAllergen)
 }
 
 func canonicalPairKey(a, b string) string {
@@ -244,14 +262,29 @@ func (c *OpenFDAChecker) CheckPrescriptionSafety(ctx context.Context, newMedicat
 		AllergyAlerts:     make([]AllergyAlert, 0),
 	}
 
-	// 1. Check Allergy Contraindications with word boundaries
+	// 1. Compile regexes for allergies (N)
+	allergyRegexes := make(map[string]*regexp.Regexp, len(patientAllergies))
+	for _, allergen := range patientAllergies {
+		cleanAllergen := strings.ToLower(strings.TrimSpace(allergen))
+		if cleanAllergen == "" {
+			continue
+		}
+		pattern := `(?i)\b` + regexp.QuoteMeta(cleanAllergen) + `\b`
+		if re, err := regexp.Compile(pattern); err == nil {
+			allergyRegexes[allergen] = re
+		}
+	}
+
+	// 2. Check Allergy Contraindications with word boundaries
 	for _, newMed := range newMedications {
 		cleanNew := CleanDrugName(newMed)
 		if cleanNew == "" {
 			continue
 		}
 		for _, allergen := range patientAllergies {
-			if matchAllergen(cleanNew, allergen) {
+			re := allergyRegexes[allergen]
+			cleanAllergen := strings.ToLower(strings.TrimSpace(allergen))
+			if matchAllergen(cleanNew, cleanAllergen, re) {
 				report.AllergyAlerts = append(report.AllergyAlerts, AllergyAlert{
 					DrugName:    newMed,
 					Allergen:    allergen,
@@ -263,7 +296,7 @@ func (c *OpenFDAChecker) CheckPrescriptionSafety(ctx context.Context, newMedicat
 		}
 	}
 
-	// 2. Concurrently pre-fetch OpenFDA labels for all unique medications to avoid sequential network latency
+	// 3. Concurrently pre-fetch OpenFDA labels for all unique medications to avoid sequential network latency
 	uniqueDrugs := make(map[string]struct{})
 	for _, m := range newMedications {
 		if cName := CleanDrugName(m); cName != "" {
@@ -294,7 +327,7 @@ func (c *OpenFDAChecker) CheckPrescriptionSafety(ctx context.Context, newMedicat
 				defer wg.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
-				_, err := c.getDrugLabel(ctx, d)
+				_, _, err := c.getDrugLabel(ctx, d)
 				if err != nil {
 					recordDegraded(d)
 				}
@@ -303,10 +336,22 @@ func (c *OpenFDAChecker) CheckPrescriptionSafety(ctx context.Context, newMedicat
 		wg.Wait()
 	}
 
-	// 3. Check Drug-Drug Interactions (between new medications, and new vs active)
+	// 4. Check Drug-Drug Interactions (between new medications, and new vs active)
 	allDrugsToCompareAgainst := make([]string, 0, len(newMedications)+len(activeMedications))
 	allDrugsToCompareAgainst = append(allDrugsToCompareAgainst, activeMedications...)
 	allDrugsToCompareAgainst = append(allDrugsToCompareAgainst, newMedications...)
+
+	// Pre-compile interaction regexes
+	targetRegexes := make(map[string]*regexp.Regexp)
+	for _, targetDrug := range allDrugsToCompareAgainst {
+		cleanTarget := strings.TrimSpace(CleanDrugName(targetDrug))
+		if cleanTarget != "" && targetRegexes[cleanTarget] == nil {
+			pattern := `(?i)\b` + regexp.QuoteMeta(cleanTarget) + `\b`
+			if re, err := regexp.Compile(pattern); err == nil {
+				targetRegexes[cleanTarget] = re
+			}
+		}
+	}
 
 	checkedPairs := make(map[string]bool)
 
@@ -329,21 +374,28 @@ func (c *OpenFDAChecker) CheckPrescriptionSafety(ctx context.Context, newMedicat
 			checkedPairs[pairKey] = true
 
 			// Check label of primary drug first
-			labelPrimary, errPrimary := c.getDrugLabel(ctx, cleanPrimary)
+			labelPrimary, foundPrimary, errPrimary := c.getDrugLabel(ctx, cleanPrimary)
 			if errPrimary != nil {
 				recordDegraded(cleanPrimary)
 			}
-			foundPrimary, isHighPrimary := c.scanLabelForInteraction(report, labelPrimary, primaryDrug, secondaryDrug, cleanSecondary)
+			
+			secondaryRe := targetRegexes[cleanSecondary]
+
+			var interactionFoundPrimary, isHighPrimary bool
+			if foundPrimary && secondaryRe != nil {
+				interactionFoundPrimary, isHighPrimary = c.scanLabelForInteraction(report, labelPrimary, primaryDrug, secondaryDrug, secondaryRe)
+			}
 
 			// HIGH-1: If primary drug did not yield a High severity contraindication, check reciprocal (secondary drug label)
-			// to ensure a high-severity contraindication in the secondary drug's FDA label is never masked
-			// by a moderate interaction in the primary drug's label.
 			if !isHighPrimary {
-				labelSecondary, errSecondary := c.getDrugLabel(ctx, cleanSecondary)
+				labelSecondary, foundSecondary, errSecondary := c.getDrugLabel(ctx, cleanSecondary)
 				if errSecondary != nil {
 					recordDegraded(cleanSecondary)
 				}
-				c.scanLabelForReciprocalInteraction(report, labelSecondary, secondaryDrug, primaryDrug, cleanPrimary, foundPrimary)
+				primaryRe := targetRegexes[cleanPrimary]
+				if foundSecondary && primaryRe != nil {
+					c.scanLabelForReciprocalInteraction(report, labelSecondary, secondaryDrug, primaryDrug, primaryRe, interactionFoundPrimary)
+				}
 			}
 		}
 	}
@@ -367,24 +419,14 @@ func (c *OpenFDAChecker) CheckPrescriptionSafety(ctx context.Context, newMedicat
 	return report, nil
 }
 
-func (c *OpenFDAChecker) scanLabelForInteraction(report *SafetyReport, label *cachedLabel, drugA, drugB, cleanTarget string) (found bool, isHigh bool) {
-	if label == nil {
-		return false, false
-	}
-	target := strings.TrimSpace(cleanTarget)
-	if target == "" {
-		return false, false
-	}
-
-	pattern := `(?i)\b` + regexp.QuoteMeta(target) + `\b`
-	re, err := regexp.Compile(pattern)
-	if err != nil {
+func (c *OpenFDAChecker) scanLabelForInteraction(report *SafetyReport, label cachedLabel, drugA, drugB string, targetRe *regexp.Regexp) (found bool, isHigh bool) {
+	if targetRe == nil {
 		return false, false
 	}
 
 	// 1. Check Contraindications (High severity)
 	for _, contra := range label.contraindications {
-		if matchSnippet := findInteractionSnippetWithRegex(contra, re); matchSnippet != "" {
+		if matchSnippet := findInteractionSnippetWithRegex(contra, targetRe); matchSnippet != "" {
 			report.InteractionAlerts = append(report.InteractionAlerts, InteractionAlert{
 				DrugA:       drugA,
 				DrugB:       drugB,
@@ -399,7 +441,7 @@ func (c *OpenFDAChecker) scanLabelForInteraction(report *SafetyReport, label *ca
 
 	// 2. Check Drug Interactions (Moderate severity)
 	for _, inter := range label.interactions {
-		if matchSnippet := findInteractionSnippetWithRegex(inter, re); matchSnippet != "" {
+		if matchSnippet := findInteractionSnippetWithRegex(inter, targetRe); matchSnippet != "" {
 			report.InteractionAlerts = append(report.InteractionAlerts, InteractionAlert{
 				DrugA:       drugA,
 				DrugB:       drugB,
@@ -414,24 +456,14 @@ func (c *OpenFDAChecker) scanLabelForInteraction(report *SafetyReport, label *ca
 	return false, false
 }
 
-func (c *OpenFDAChecker) scanLabelForReciprocalInteraction(report *SafetyReport, label *cachedLabel, drugA, drugB, cleanTarget string, alreadyFoundModerate bool) (found bool, isHigh bool) {
-	if label == nil {
-		return false, false
-	}
-	target := strings.TrimSpace(cleanTarget)
-	if target == "" {
-		return false, false
-	}
-
-	pattern := `(?i)\b` + regexp.QuoteMeta(target) + `\b`
-	re, err := regexp.Compile(pattern)
-	if err != nil {
+func (c *OpenFDAChecker) scanLabelForReciprocalInteraction(report *SafetyReport, label cachedLabel, drugA, drugB string, targetRe *regexp.Regexp, alreadyFoundModerate bool) (found bool, isHigh bool) {
+	if targetRe == nil {
 		return false, false
 	}
 
 	// 1. Always check Contraindications (High severity) across the reciprocal label
 	for _, contra := range label.contraindications {
-		if matchSnippet := findInteractionSnippetWithRegex(contra, re); matchSnippet != "" {
+		if matchSnippet := findInteractionSnippetWithRegex(contra, targetRe); matchSnippet != "" {
 			report.InteractionAlerts = append(report.InteractionAlerts, InteractionAlert{
 				DrugA:       drugA,
 				DrugB:       drugB,
@@ -447,7 +479,7 @@ func (c *OpenFDAChecker) scanLabelForReciprocalInteraction(report *SafetyReport,
 	// 2. Check Drug Interactions (Moderate severity) only if not already discovered on the primary label
 	if !alreadyFoundModerate {
 		for _, inter := range label.interactions {
-			if matchSnippet := findInteractionSnippetWithRegex(inter, re); matchSnippet != "" {
+			if matchSnippet := findInteractionSnippetWithRegex(inter, targetRe); matchSnippet != "" {
 				report.InteractionAlerts = append(report.InteractionAlerts, InteractionAlert{
 					DrugA:       drugA,
 					DrugB:       drugB,

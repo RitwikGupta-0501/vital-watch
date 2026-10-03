@@ -120,6 +120,12 @@ func (rl *RateLimiter) cleanupRoutine(interval time.Duration) {
 // Middleware returns a Gin middleware that enforces the configured rate limit.
 func (rl *RateLimiter) Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		path := c.Request.URL.Path
+		if path == "/healthz" || path == "/api/healthz" || path == "/metrics" {
+			c.Next()
+			return
+		}
+
 		ip := c.ClientIP()
 		if ip == "" {
 			ip = "unknown"

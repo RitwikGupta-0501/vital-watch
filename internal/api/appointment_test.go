@@ -681,7 +681,7 @@ func TestCancelAppointment_FlowAndAuthorization(t *testing.T) {
 	intruderID := uuid.New()
 	apptID := uuid.New()
 
-	mockBroker := notifications.NewSSEBroker()
+	mockBroker := notifications.NewSSEBroker(nil)
 	var cancelRepoCalled bool
 
 	mockRepo := &repository.MockRepository{

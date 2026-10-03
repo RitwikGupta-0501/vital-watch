@@ -20,103 +20,103 @@ func TestParseDailySlots(t *testing.T) {
 			name:      "Twice daily",
 			frequency: "Twice daily",
 			timing:    "After food",
-			expected:  []string{"morning", "evening"},
+			expected:  []string{SlotMorning, SlotEvening},
 		},
 		{
 			name:      "BID abbreviation",
 			frequency: "1 tab BID",
 			timing:    "",
-			expected:  []string{"morning", "evening"},
+			expected:  []string{SlotMorning, SlotEvening},
 		},
 		{
 			name:      "Three times daily",
 			frequency: "Three times a day",
 			timing:    "Before meals",
-			expected:  []string{"morning", "afternoon", "evening"},
+			expected:  []string{SlotMorning, SlotAfternoon, SlotEvening},
 		},
 		{
 			name:      "QDS / 4 times daily",
 			frequency: "QDS",
 			timing:    "",
-			expected:  []string{"morning", "afternoon", "evening", "bedtime"},
+			expected:  []string{SlotMorning, SlotAfternoon, SlotEvening, SlotBedtime},
 		},
 		{
 			name:      "Bedtime medication",
 			frequency: "Once daily",
 			timing:    "At bedtime",
-			expected:  []string{"bedtime"},
+			expected:  []string{SlotBedtime},
 		},
 		{
 			name:      "PRN / As needed",
 			frequency: "As needed for pain",
 			timing:    "PRN",
-			expected:  []string{"as_needed"},
+			expected:  []string{SlotAsNeeded},
 		},
 		{
 			name:      "Default once daily",
 			frequency: "Once daily",
 			timing:    "Morning",
-			expected:  []string{"morning"},
+			expected:  []string{SlotMorning},
 		},
 		{
 			name:      "Q4H 6 times daily",
 			frequency: "Every 4 hours",
 			timing:    "with water",
-			expected:  []string{"morning", "afternoon", "evening", "bedtime"},
+			expected:  []string{SlotMorning, SlotAfternoon, SlotEvening, SlotBedtime},
 		},
 		{
 			name:      "Abdominal pain does not trigger BD",
 			frequency: "Once daily",
 			timing:    "Take for severe abdominal cramps",
-			expected:  []string{"morning"},
+			expected:  []string{SlotUnknown},
 		},
 		{
 			name:      "Liquid suspension does not trigger QID",
 			frequency: "Once daily",
 			timing:    "Liquid suspension 10ml",
-			expected:  []string{"morning"},
+			expected:  []string{SlotUnknown},
 		},
 		{
 			name:      "Antidiabetic does not trigger TID",
 			frequency: "Once daily",
 			timing:    "Antidiabetic agent with breakfast",
-			expected:  []string{"morning"},
+			expected:  []string{SlotMorning},
 		},
 		{
 			name:      "Sprained ankle does not trigger PRN",
 			frequency: "Once daily",
 			timing:    "Apply ointment for sprained ankle",
-			expected:  []string{"morning"},
+			expected:  []string{SlotUnknown},
 		},
 		{
 			name:      "Morbid obesity does not trigger BID",
 			frequency: "Once daily",
 			timing:    "Therapy for morbid obesity",
-			expected:  []string{"morning"},
+			expected:  []string{SlotUnknown},
 		},
 		{
 			name:      "Legitimate standalone BID with meal notes",
 			frequency: "1 tab bid",
 			timing:    "after meals",
-			expected:  []string{"morning", "evening"},
+			expected:  []string{SlotMorning, SlotEvening},
 		},
 		{
 			name:      "Legitimate standalone TID",
 			frequency: "take 1 capsule tid",
 			timing:    "with water",
-			expected:  []string{"morning", "afternoon", "evening"},
+			expected:  []string{SlotMorning, SlotAfternoon, SlotEvening},
 		},
 		{
 			name:      "Legitimate standalone QID",
 			frequency: "2 puffs qid",
 			timing:    "",
-			expected:  []string{"morning", "afternoon", "evening", "bedtime"},
+			expected:  []string{SlotMorning, SlotAfternoon, SlotEvening, SlotBedtime},
 		},
 		{
 			name:      "Legitimate standalone PRN",
 			frequency: "take 1 tab prn for pain",
 			timing:    "",
-			expected:  []string{"as_needed"},
+			expected:  []string{SlotAsNeeded},
 		},
 	}
 
@@ -166,7 +166,7 @@ func TestBuildDailySchedule(t *testing.T) {
 			PatientID:          patientID,
 			PrescriptionItemID: item1ID,
 			ScheduledDate:      now,
-			TimeOfDay:          "morning",
+			TimeOfDay:          SlotMorning,
 			DoseNumber:         1,
 			Status:             "taken",
 			TakenAt:            &takenTime,
@@ -181,13 +181,13 @@ func TestBuildDailySchedule(t *testing.T) {
 	}
 
 	// 1. Verify chronological sorting: morning -> evening -> bedtime
-	if sched[0].TimeOfDay != "morning" {
+	if sched[0].TimeOfDay != SlotMorning {
 		t.Errorf("expected slot 0 to be morning, got %s", sched[0].TimeOfDay)
 	}
-	if sched[1].TimeOfDay != "evening" {
+	if sched[1].TimeOfDay != SlotEvening {
 		t.Errorf("expected slot 1 to be evening, got %s", sched[1].TimeOfDay)
 	}
-	if sched[2].TimeOfDay != "bedtime" {
+	if sched[2].TimeOfDay != SlotBedtime {
 		t.Errorf("expected slot 2 to be bedtime, got %s", sched[2].TimeOfDay)
 	}
 
@@ -201,7 +201,7 @@ func TestBuildDailySchedule(t *testing.T) {
 
 	var foundTaken bool
 	for _, entry := range sched {
-		if entry.PrescriptionItemID == item1ID && entry.TimeOfDay == "morning" {
+		if entry.PrescriptionItemID == item1ID && entry.TimeOfDay == SlotMorning {
 			if entry.Status != "taken" {
 				t.Errorf("expected taken status for morning metformin, got %s", entry.Status)
 			}
@@ -240,7 +240,7 @@ func TestBuildDailySchedule_MultiplePRNDosesRetained(t *testing.T) {
 			PatientID:          patientID,
 			PrescriptionItemID: prnItemID,
 			ScheduledDate:      now,
-			TimeOfDay:          "as_needed",
+			TimeOfDay:          SlotAsNeeded,
 			DoseNumber:         1,
 			Status:             "taken",
 			TakenAt:            &t1,
@@ -251,7 +251,7 @@ func TestBuildDailySchedule_MultiplePRNDosesRetained(t *testing.T) {
 			PatientID:          patientID,
 			PrescriptionItemID: prnItemID,
 			ScheduledDate:      now,
-			TimeOfDay:          "as_needed",
+			TimeOfDay:          SlotAsNeeded,
 			DoseNumber:         2,
 			Status:             "taken",
 			TakenAt:            &t2,

@@ -1662,7 +1662,7 @@ func TestCreateDigitalPrescription_SafetyAndPDF(t *testing.T) {
 			},
 		}
 
-		notifier := notifications.NewSSEBroker()
+		notifier := notifications.NewSSEBroker(nil)
 		defer notifier.Shutdown()
 
 		h := &Handler{
@@ -1773,7 +1773,7 @@ func TestCreateDigitalPrescription_SafetyAndPDF(t *testing.T) {
 
 func TestStreamNotifications(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	notifier := notifications.NewSSEBroker()
+	notifier := notifications.NewSSEBroker(nil)
 	defer notifier.Shutdown()
 
 	userID := uuid.New()

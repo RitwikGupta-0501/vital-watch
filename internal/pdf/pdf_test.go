@@ -85,13 +85,13 @@ func TestGeneratePrescriptionPDF_UnicodeAndRuneClamping(t *testing.T) {
 		PrescriptionID:  uuid.New(),
 		DoctorName:      "Dr. José González Müller",
 		DoctorSpecialty: "Endocrinology",
-		PatientName:     "François Hélène d'Orléans",
-		Notes:           "Monitor blood glucose daily — keep notes.",
+		PatientName:     "张伟 (Zhang Wei)",
+		Notes:           "Monitor blood glucose daily — keep notes. 每日监测血糖。",
 		Items: []models.PrescriptionItem{
 			{
 				MedicationName: "Levothyroxine Sodium Supercalifragilistic",
 				Dosage:         "125µg / morning",
-				Frequency:      "Once daily at sunrise",
+				Frequency:      "Once daily at sunrise (每天一次)",
 				Duration:       "30 consecutive days",
 				Timing:         "Early morning",
 				Instructions:   "Take with full glass of water 30 minutes before meal",

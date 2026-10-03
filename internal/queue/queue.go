@@ -64,12 +64,21 @@ func (w *PrescriptionOCRWorker) Work(ctx context.Context, job *river.Job[Prescri
 		attempt = job.Attempt
 	}
 
+	// Helper to perform guaranteed cleanup even if the parent context is timed out
+	doCleanup := func(status, notes, provider string, items []models.PrescriptionItem, notificationMsg string) error {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cleanupCancel()
+		err := w.repo.UpdatePrescriptionOCRResults(cleanupCtx, job.Args.PrescriptionID, status, notes, provider, items)
+		if notificationMsg != "" {
+			w.notifyDoctor(cleanupCtx, job.Args.PrescriptionID, notificationMsg, len(items), provider)
+		}
+		return err
+	}
+
 	// 1. If OCR is disabled, cleanly transition to needs_review for manual clinician entry
 	if w.ocrManager == nil || !w.ocrManager.IsEnabled() {
 		slog.InfoContext(ctx, "OCR disabled; transitioning prescription to needs_review", "prescription_id", job.Args.PrescriptionID)
-		err := w.repo.UpdatePrescriptionOCRResults(ctx, job.Args.PrescriptionID, "needs_review", "[OCR disabled: manual entry required]", "", nil)
-		w.notifyDoctor(ctx, job.Args.PrescriptionID, "OCR disabled: manual clinical review required", 0, "")
-		return err
+		return doCleanup("needs_review", "[OCR disabled: manual entry required]", "", nil, "OCR disabled: manual clinical review required")
 	}
 
 	// 2. Fetch file bytes from storage provider
@@ -83,19 +92,17 @@ func (w *PrescriptionOCRWorker) Work(ctx context.Context, job *river.Job[Prescri
 
 		if isPermanent {
 			slog.ErrorContext(ctx, "Permanent storage failure for prescription; marking needs_review", "prescription_id", job.Args.PrescriptionID, "error", err)
-			if updateErr := w.repo.UpdatePrescriptionOCRResults(ctx, job.Args.PrescriptionID, "needs_review", fmt.Sprintf("[Storage error: %v]", err), "", nil); updateErr != nil {
+			if updateErr := doCleanup("needs_review", fmt.Sprintf("[Storage error: %v]", err), "", nil, "Prescription file could not be retrieved from storage; manual review required"); updateErr != nil {
 				return fmt.Errorf("failed to update prescription status after permanent storage failure: %w", updateErr)
 			}
-			w.notifyDoctor(ctx, job.Args.PrescriptionID, "Prescription file could not be retrieved from storage; manual review required", 0, "")
 			return nil
 		}
 
 		if attempt >= 3 {
 			slog.WarnContext(ctx, "Max retry attempts reached for storage retrieval; marking needs_review", "prescription_id", job.Args.PrescriptionID)
-			if updateErr := w.repo.UpdatePrescriptionOCRResults(ctx, job.Args.PrescriptionID, "needs_review", fmt.Sprintf("[Storage failed after %d attempts: %v]", attempt, err), "", nil); updateErr != nil {
+			if updateErr := doCleanup("needs_review", fmt.Sprintf("[Storage failed after %d attempts: %v]", attempt, err), "", nil, "Storage retrieval retry budget exhausted; manual review required"); updateErr != nil {
 				return fmt.Errorf("failed to update prescription status after max storage attempts: %w", updateErr)
 			}
-			w.notifyDoctor(ctx, job.Args.PrescriptionID, "Storage retrieval retry budget exhausted; manual review required", 0, "")
 			return nil
 		}
 
@@ -108,18 +115,16 @@ func (w *PrescriptionOCRWorker) Work(ctx context.Context, job *river.Job[Prescri
 	if err != nil {
 		if errors.Is(err, ocr.ErrUnsupportedMIME) || errors.Is(err, ocr.ErrPermanent) {
 			slog.ErrorContext(ctx, "Permanent unrecoverable OCR failure; marking needs_review", "prescription_id", job.Args.PrescriptionID, "error", err)
-			if updateErr := w.repo.UpdatePrescriptionOCRResults(ctx, job.Args.PrescriptionID, "needs_review", fmt.Sprintf("[OCR Extraction failed: %v]", err), "", nil); updateErr != nil {
+			if updateErr := doCleanup("needs_review", fmt.Sprintf("[OCR Extraction failed: %v]", err), "", nil, "Prescription OCR could not extract text; manual review required"); updateErr != nil {
 				return fmt.Errorf("failed to update prescription status after permanent OCR failure: %w", updateErr)
 			}
-			w.notifyDoctor(ctx, job.Args.PrescriptionID, "Prescription OCR could not extract text; manual review required", 0, "")
 			return nil // Fatal: return nil to avoid burning River retry attempts
 		}
 		if attempt >= 3 {
 			slog.WarnContext(ctx, "Max retry attempts reached for prescription OCR; marking needs_review", "prescription_id", job.Args.PrescriptionID)
-			if updateErr := w.repo.UpdatePrescriptionOCRResults(ctx, job.Args.PrescriptionID, "needs_review", fmt.Sprintf("[OCR failed after %d attempts: %v]", attempt, err), "", nil); updateErr != nil {
+			if updateErr := doCleanup("needs_review", fmt.Sprintf("[OCR failed after %d attempts: %v]", attempt, err), "", nil, "Prescription OCR failed after max retries; manual review required"); updateErr != nil {
 				return fmt.Errorf("failed to update prescription status after max attempts: %w", updateErr)
 			}
-			w.notifyDoctor(ctx, job.Args.PrescriptionID, "Prescription OCR failed after max retries; manual review required", 0, "")
 			return nil
 		}
 		// Transient failure: return error to River for exponential backoff retry
@@ -149,15 +154,14 @@ func (w *PrescriptionOCRWorker) Work(ctx context.Context, job *river.Job[Prescri
 	if len(items) == 0 {
 		notes = "[OCR Completed: No medications detected, manual review required]"
 	}
-	err = w.repo.UpdatePrescriptionOCRResults(ctx, job.Args.PrescriptionID, "needs_review", notes, clampString(res.Provider, 50), items)
+	
+	err = doCleanup("needs_review", notes, clampString(res.Provider, 50), items, "Prescription OCR analysis ready for clinician review")
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to update prescription with OCR results", "prescription_id", job.Args.PrescriptionID, "error", err)
 		return err // Transient DB error, retry
 	}
 
 	slog.InfoContext(ctx, "Successfully extracted medications for prescription", "medications_count", len(items), "prescription_id", job.Args.PrescriptionID, "provider", res.Provider, "status", "needs_review")
-
-	w.notifyDoctor(ctx, job.Args.PrescriptionID, "Prescription OCR analysis ready for clinician review", len(items), res.Provider)
 	return nil
 }
 
@@ -165,7 +169,11 @@ func (w *PrescriptionOCRWorker) notifyDoctor(ctx context.Context, prescriptionID
 	if w.notifier == nil {
 		return
 	}
-	rx, fetchErr := w.repo.GetPrescriptionByID(ctx, prescriptionID)
+	// Detach context to guarantee notification delivery even if parent timed out
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+
+	rx, fetchErr := w.repo.GetPrescriptionByID(cleanupCtx, prescriptionID)
 	if fetchErr != nil {
 		return
 	}

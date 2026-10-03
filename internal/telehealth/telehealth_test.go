@@ -3,12 +3,14 @@ package telehealth
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 )
 
@@ -133,6 +135,87 @@ func TestJitsiProvider_CreateRoom(t *testing.T) {
 	if err == nil {
 		t.Error("expected error for nil appointment ID, got nil")
 	}
+}
+
+func TestJitsiProvider_CreateMeetingToken(t *testing.T) {
+	secret := "super-secure-jitsi-secret-key"
+	domain := "telehealth.vitalwatch.org"
+	provider := NewJitsiProvider(domain, secret)
+
+	roomName := "vitalwatch-test-room-101"
+	exp := time.Now().Add(1 * time.Hour)
+
+	t.Run("CreateMeetingToken Doctor Owner", func(t *testing.T) {
+		tokenStr, err := provider.CreateMeetingToken(context.Background(), roomName, true, exp)
+		if err != nil {
+			t.Fatalf("unexpected error creating doctor meeting token: %v", err)
+		}
+		if tokenStr == "" {
+			t.Fatal("expected non-empty token string")
+		}
+
+		// Parse and validate JWT
+		parsedToken, err := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
+			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+			}
+			return []byte(secret), nil
+		})
+		if err != nil || !parsedToken.Valid {
+			t.Fatalf("failed to validate generated jitsi token: %v", err)
+		}
+
+		claims, ok := parsedToken.Claims.(jwt.MapClaims)
+		if !ok {
+			t.Fatal("expected MapClaims")
+		}
+
+		if claims["room"] != roomName {
+			t.Errorf("expected room %s, got %v", roomName, claims["room"])
+		}
+		if claims["sub"] != domain {
+			t.Errorf("expected sub %s, got %v", domain, claims["sub"])
+		}
+		if claims["iss"] != "vitalwatch" {
+			t.Errorf("expected iss vitalwatch, got %v", claims["iss"])
+		}
+		if claims["aud"] != "jitsi" {
+			t.Errorf("expected aud jitsi, got %v", claims["aud"])
+		}
+
+		ctxMap, ok := claims["context"].(map[string]interface{})
+		if !ok {
+			t.Fatal("expected context object in claims")
+		}
+		userMap, ok := ctxMap["user"].(map[string]interface{})
+		if !ok {
+			t.Fatal("expected user object in context claims")
+		}
+		if userMap["affiliation"] != "owner" || userMap["moderator"] != true {
+			t.Errorf("expected owner/moderator privileges for doctor, got: %+v", userMap)
+		}
+	})
+
+	t.Run("CreateMeetingToken Patient Member", func(t *testing.T) {
+		tokenStr, err := provider.CreateMeetingToken(context.Background(), roomName, false, exp)
+		if err != nil {
+			t.Fatalf("unexpected error creating patient meeting token: %v", err)
+		}
+
+		parsedToken, err := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
+			return []byte(secret), nil
+		})
+		if err != nil || !parsedToken.Valid {
+			t.Fatalf("failed to validate generated jitsi token: %v", err)
+		}
+
+		claims := parsedToken.Claims.(jwt.MapClaims)
+		ctxMap := claims["context"].(map[string]interface{})
+		userMap := ctxMap["user"].(map[string]interface{})
+		if userMap["affiliation"] != "member" || userMap["moderator"] != false {
+			t.Errorf("expected member/non-moderator privileges for patient, got: %+v", userMap)
+		}
+	})
 }
 
 func TestMockProvider(t *testing.T) {

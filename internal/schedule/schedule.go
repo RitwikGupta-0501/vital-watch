@@ -1,7 +1,6 @@
 package schedule
 
 import (
-	"fmt"
 	"regexp"
 	"sort"
 	"strings"
@@ -19,14 +18,24 @@ const (
 	SlotEvening   = "evening"
 	SlotBedtime   = "bedtime"
 	SlotAsNeeded  = "as_needed"
+	SlotUnknown   = "unknown"
 )
 
-var SlotOrder = map[string]int{
-	SlotMorning:   1,
-	SlotAfternoon: 2,
-	SlotEvening:   3,
-	SlotBedtime:   4,
-	SlotAsNeeded:  5,
+func getSlotOrder(slot string) int {
+	switch slot {
+	case SlotMorning:
+		return 1
+	case SlotAfternoon:
+		return 2
+	case SlotEvening:
+		return 3
+	case SlotBedtime:
+		return 4
+	case SlotAsNeeded:
+		return 5
+	default:
+		return 99
+	}
 }
 
 var (
@@ -84,8 +93,36 @@ func ParseDailySlots(frequency, timing string) []string {
 		return []string{SlotAfternoon}
 	}
 
-	// Default for once daily / morning
-	return []string{SlotMorning}
+	if reMorning.MatchString(combined) {
+		return []string{SlotMorning}
+	}
+
+	// Default for unknown schedule
+	return []string{SlotUnknown}
+}
+
+type logKey struct {
+	itemID uuid.UUID
+	slot   string
+	dNum   int
+}
+
+func hydrateLog(existing *models.MedicationLog, item models.PrescriptionItem) {
+	if existing.MedicationName == "" {
+		existing.MedicationName = item.MedicationName
+	}
+	if existing.Dosage == "" {
+		existing.Dosage = item.Dosage
+	}
+	if existing.Timing == "" {
+		existing.Timing = item.Timing
+	}
+	if existing.MealTiming == "" {
+		existing.MealTiming = item.Timing
+	}
+	if existing.Instructions == "" {
+		existing.Instructions = item.Instructions
+	}
 }
 
 // BuildDailySchedule merges active prescription items with logged adherence records for a specific date
@@ -96,7 +133,7 @@ func BuildDailySchedule(
 	existingLogs []models.MedicationLog,
 ) []models.MedicationLog {
 	// Index existing logs by item_id:slot:dose_number
-	logMap := make(map[string]models.MedicationLog)
+	logMap := make(map[logKey]models.MedicationLog)
 	matchedLogIDs := make(map[uuid.UUID]bool)
 
 	for _, l := range existingLogs {
@@ -104,7 +141,7 @@ func BuildDailySchedule(
 		if dNum <= 0 {
 			dNum = 1
 		}
-		key := fmt.Sprintf("%s:%s:%d", l.PrescriptionItemID.String(), l.TimeOfDay, dNum)
+		key := logKey{itemID: l.PrescriptionItemID, slot: string(l.TimeOfDay), dNum: dNum}
 		logMap[key] = l
 	}
 
@@ -113,27 +150,13 @@ func BuildDailySchedule(
 		itemMap[item.ID] = item
 	}
 
-	var results []models.MedicationLog
+	results := make([]models.MedicationLog, 0, len(items)*2)
 	for _, item := range items {
 		slots := ParseDailySlots(item.Frequency, item.Timing)
 		for _, slot := range slots {
-			key := fmt.Sprintf("%s:%s:1", item.ID.String(), slot)
+			key := logKey{itemID: item.ID, slot: slot, dNum: 1}
 			if existing, found := logMap[key]; found {
-				if existing.MedicationName == "" {
-					existing.MedicationName = item.MedicationName
-				}
-				if existing.Dosage == "" {
-					existing.Dosage = item.Dosage
-				}
-				if existing.Timing == "" {
-					existing.Timing = item.Timing
-				}
-				if existing.MealTiming == "" {
-					existing.MealTiming = item.Timing
-				}
-				if existing.Instructions == "" {
-					existing.Instructions = item.Instructions
-				}
+				hydrateLog(&existing, item)
 				results = append(results, existing)
 				matchedLogIDs[existing.ID] = true
 			} else {
@@ -161,21 +184,7 @@ func BuildDailySchedule(
 	for _, l := range existingLogs {
 		if l.ID != uuid.Nil && !matchedLogIDs[l.ID] {
 			if item, exists := itemMap[l.PrescriptionItemID]; exists {
-				if l.MedicationName == "" {
-					l.MedicationName = item.MedicationName
-				}
-				if l.Dosage == "" {
-					l.Dosage = item.Dosage
-				}
-				if l.Timing == "" {
-					l.Timing = item.Timing
-				}
-				if l.MealTiming == "" {
-					l.MealTiming = item.Timing
-				}
-				if l.Instructions == "" {
-					l.Instructions = item.Instructions
-				}
+				hydrateLog(&l, item)
 			}
 			results = append(results, l)
 		}
@@ -183,14 +192,8 @@ func BuildDailySchedule(
 
 	// Sort chronologically by slot order, dose number, and medication name
 	sort.SliceStable(results, func(i, j int) bool {
-		orderI := SlotOrder[string(results[i].TimeOfDay)]
-		if orderI == 0 {
-			orderI = 99
-		}
-		orderJ := SlotOrder[string(results[j].TimeOfDay)]
-		if orderJ == 0 {
-			orderJ = 99
-		}
+		orderI := getSlotOrder(string(results[i].TimeOfDay))
+		orderJ := getSlotOrder(string(results[j].TimeOfDay))
 		if orderI != orderJ {
 			return orderI < orderJ
 		}

@@ -1,7 +1,9 @@
 package notifications
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type EventType string
@@ -47,11 +50,75 @@ type SSEBroker struct {
 	mu      sync.RWMutex
 	clients map[uuid.UUID]map[chan NotificationEvent]struct{}
 	closed  bool
+	pool    *pgxpool.Pool
+	ctx     context.Context
+	cancel  context.CancelFunc
 }
 
-func NewSSEBroker() *SSEBroker {
-	return &SSEBroker{
+func NewSSEBroker(pool *pgxpool.Pool) *SSEBroker {
+	ctx, cancel := context.WithCancel(context.Background())
+	b := &SSEBroker{
 		clients: make(map[uuid.UUID]map[chan NotificationEvent]struct{}),
+		pool:    pool,
+		ctx:     ctx,
+		cancel:  cancel,
+	}
+
+	if pool != nil {
+		go b.listenForNotifications()
+	}
+
+	return b
+}
+
+func (b *SSEBroker) listenForNotifications() {
+	for {
+		if b.ctx.Err() != nil {
+			return
+		}
+
+		conn, err := b.pool.Acquire(b.ctx)
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			slog.Error("Failed to acquire pgx connection for LISTEN", "error", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		_, err = conn.Exec(b.ctx, "LISTEN sse_notifications")
+		if err != nil {
+			conn.Release()
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			slog.Error("Failed to execute LISTEN", "error", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		slog.Info("SSE Broker connected to Postgres LISTEN/NOTIFY channel")
+
+		for {
+			notification, err := conn.Conn().WaitForNotification(b.ctx)
+			if err != nil {
+				conn.Release()
+				if errors.Is(err, context.Canceled) {
+					return
+				}
+				slog.Error("Error waiting for pg_notify", "error", err)
+				time.Sleep(2 * time.Second)
+				break // break inner loop to re-acquire connection
+			}
+
+			var event NotificationEvent
+			if err := json.Unmarshal([]byte(notification.Payload), &event); err != nil {
+				slog.Error("Failed to unmarshal notification payload", "error", err)
+				continue
+			}
+			b.deliverLocal(event)
+		}
 	}
 }
 
@@ -86,14 +153,36 @@ func (b *SSEBroker) Subscribe(userID uuid.UUID) (chan NotificationEvent, func())
 
 func (b *SSEBroker) Publish(event NotificationEvent) {
 	b.mu.RLock()
+	if b.closed {
+		b.mu.RUnlock()
+		return
+	}
+	b.mu.RUnlock()
+
+	if event.Timestamp.IsZero() {
+		event.Timestamp = time.Now().UTC()
+	}
+
+	if b.pool != nil {
+		dataBytes, _ := json.Marshal(event)
+		ctx, cancel := context.WithTimeout(b.ctx, 5*time.Second)
+		defer cancel()
+		_, err := b.pool.Exec(ctx, "SELECT pg_notify('sse_notifications', $1)", string(dataBytes))
+		if err != nil {
+			slog.Error("Failed to publish SSE notification to postgres", "error", err)
+		}
+		return
+	}
+
+	b.deliverLocal(event)
+}
+
+func (b *SSEBroker) deliverLocal(event NotificationEvent) {
+	b.mu.RLock()
 	defer b.mu.RUnlock()
 
 	if b.closed {
 		return
-	}
-
-	if event.Timestamp.IsZero() {
-		event.Timestamp = time.Now().UTC()
 	}
 
 	deliver := func(targetID uuid.UUID) {
@@ -121,6 +210,8 @@ func (b *SSEBroker) Publish(event NotificationEvent) {
 }
 
 func (b *SSEBroker) Shutdown() {
+	b.cancel() // Stop the listener goroutine
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
 

@@ -418,14 +418,25 @@ FROM prescriptions p
 JOIN doctor_profiles d ON p.doctor_id = d.user_id
 JOIN patient_profiles pat ON p.patient_id = pat.user_id
 WHERE p.status = 'needs_review'
-  AND (
-    p.doctor_id = $1
-    OR EXISTS (
+  AND p.doctor_id = $1
+
+UNION
+
+SELECT
+    p.id, p.patient_id, p.doctor_id, p.source, p.status, p.file_name, p.notes, p.ocr_provider, p.created_at, p.updated_at,
+    d.first_name AS doctor_first_name, d.last_name AS doctor_last_name,
+    pat.first_name AS patient_first_name, pat.last_name AS patient_last_name
+FROM prescriptions p
+JOIN doctor_profiles d ON p.doctor_id = d.user_id
+JOIN patient_profiles pat ON p.patient_id = pat.user_id
+WHERE p.status = 'needs_review'
+  AND EXISTS (
       SELECT 1 FROM appointments a
       WHERE a.patient_id = p.patient_id AND a.doctor_id = $1 AND a.status != 'cancelled'
-    )
   )
-ORDER BY p.created_at DESC, p.id DESC
+  AND p.doctor_id != $1
+
+ORDER BY created_at DESC, id DESC
 LIMIT $2 OFFSET $3
 `
 
