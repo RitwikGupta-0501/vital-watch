@@ -197,8 +197,19 @@ type OCRSettingsResponse struct {
 	Configurations []map[string]any `json:"configurations"`
 }
 
+func (h *Handler) getTenantID(c *gin.Context) uuid.UUID {
+	if tIDVal, ok := c.Get("tenant_id"); ok {
+		if tIDStr, ok := tIDVal.(string); ok && tIDStr != "" {
+			if parsed, err := uuid.Parse(tIDStr); err == nil && parsed != uuid.Nil {
+				return parsed
+			}
+		}
+	}
+	return models.SystemDefaultTenantID
+}
+
 func (h *Handler) GetOCRSettings(c *gin.Context) {
-	tenantID := models.SystemDefaultTenantID
+	tenantID := h.getTenantID(c)
 
 	settings, err := h.Repo.GetTenantSettings(c.Request.Context(), tenantID)
 	if err != nil && err != pgx.ErrNoRows {
@@ -249,7 +260,7 @@ func (h *Handler) CreateOCRConfig(c *gin.Context) {
 		return
 	}
 
-	tenantID := models.SystemDefaultTenantID
+	tenantID := h.getTenantID(c)
 
 	aad := append(tenantID[:], []byte(req.ProviderName)...)
 	ciphertext, nonce, err := h.CipherService.Encrypt(req.APIKey, aad)
@@ -283,7 +294,7 @@ func (h *Handler) UpdateOCRChain(c *gin.Context) {
 		return
 	}
 
-	tenantID := models.SystemDefaultTenantID
+	tenantID := h.getTenantID(c)
 
 	// Ensure all UUIDs exist
 	configs, err := h.Repo.GetOCRProviderConfigsByIDs(c.Request.Context(), dbgen.GetOCRProviderConfigsByIDsParams{

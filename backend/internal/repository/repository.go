@@ -99,6 +99,7 @@ type Repository interface {
 	GetAdminByEmail(ctx context.Context, email string) (models.Admin, error)
 	GetAdminByID(ctx context.Context, id uuid.UUID) (models.Admin, error)
 	GetAllUsers(ctx context.Context, limit, offset int) ([]models.User, error)
+	GetUserByIDGlobal(ctx context.Context, id uuid.UUID) (dbgen.GetUserByIDGlobalRow, error)
 	UpdateUserActiveStatus(ctx context.Context, id uuid.UUID, isActive bool) error
 
 	// OCR Configurations

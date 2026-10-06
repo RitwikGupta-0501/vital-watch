@@ -218,8 +218,8 @@ func parseTokenMiddleware(jwtSecret []byte, checker userActiveChecker) gin.Handl
 				return
 			}
 
-			tenantID := uuid.Nil
-			if tenantStr, ok := claims["tenant_id"].(string); ok {
+			tenantID := models.SystemDefaultTenantID
+			if tenantStr, ok := claims["tenant_id"].(string); ok && tenantStr != "" {
 				if parsed, err := uuid.Parse(tenantStr); err == nil {
 					tenantID = parsed
 				}

@@ -189,6 +189,33 @@ func (q *Queries) GetAllUsers(ctx context.Context, arg GetAllUsersParams) ([]Get
 	return items, nil
 }
 
+const getUserByIDGlobal = `-- name: GetUserByIDGlobal :one
+SELECT u.id, u.email, u.role, u.tenant_id, u.is_active
+FROM users u
+WHERE u.id = $1
+`
+
+type GetUserByIDGlobalRow struct {
+	ID       uuid.UUID `json:"id"`
+	Email    string    `json:"email"`
+	Role     string    `json:"role"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	IsActive bool      `json:"is_active"`
+}
+
+func (q *Queries) GetUserByIDGlobal(ctx context.Context, id uuid.UUID) (GetUserByIDGlobalRow, error) {
+	row := q.db.QueryRow(ctx, getUserByIDGlobal, id)
+	var i GetUserByIDGlobalRow
+	err := row.Scan(
+		&i.ID,
+		&i.Email,
+		&i.Role,
+		&i.TenantID,
+		&i.IsActive,
+	)
+	return i, err
+}
+
 const updateUserActiveStatus = `-- name: UpdateUserActiveStatus :execrows
 UPDATE users
 SET is_active = $2, updated_at = now()

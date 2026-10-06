@@ -54,7 +54,7 @@ func (q *Queries) CreatePatientUser(ctx context.Context, arg CreatePatientUserPa
 }
 
 const getPatientByEmail = `-- name: GetPatientByEmail :one
-SELECT u.id, u.email, p.first_name, p.last_name, u.hashed_password, u.created_at
+SELECT u.id, u.email, p.first_name, p.last_name, u.hashed_password, u.tenant_id, u.created_at
 FROM users u
 JOIN patient_profiles p ON u.id = p.user_id
 WHERE u.email = $1 AND u.role = 'patient' AND u.is_active = true AND u.tenant_id = $2
@@ -71,6 +71,7 @@ type GetPatientByEmailRow struct {
 	FirstName      string             `json:"first_name"`
 	LastName       string             `json:"last_name"`
 	HashedPassword string             `json:"hashed_password"`
+	TenantID       uuid.UUID          `json:"tenant_id"`
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 }
 
@@ -83,13 +84,14 @@ func (q *Queries) GetPatientByEmail(ctx context.Context, arg GetPatientByEmailPa
 		&i.FirstName,
 		&i.LastName,
 		&i.HashedPassword,
+		&i.TenantID,
 		&i.CreatedAt,
 	)
 	return i, err
 }
 
 const getPatientByID = `-- name: GetPatientByID :one
-SELECT u.id, u.email, p.first_name, p.last_name, u.created_at
+SELECT u.id, u.email, p.first_name, p.last_name, u.tenant_id, u.created_at
 FROM users u
 JOIN patient_profiles p ON u.id = p.user_id
 WHERE u.id = $1 AND u.role = 'patient' AND u.is_active = true AND u.tenant_id = $2
@@ -105,6 +107,7 @@ type GetPatientByIDRow struct {
 	Email     string             `json:"email"`
 	FirstName string             `json:"first_name"`
 	LastName  string             `json:"last_name"`
+	TenantID  uuid.UUID          `json:"tenant_id"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
@@ -116,13 +119,14 @@ func (q *Queries) GetPatientByID(ctx context.Context, arg GetPatientByIDParams) 
 		&i.Email,
 		&i.FirstName,
 		&i.LastName,
+		&i.TenantID,
 		&i.CreatedAt,
 	)
 	return i, err
 }
 
 const getPatientsByDoctorID = `-- name: GetPatientsByDoctorID :many
-SELECT u.id, u.email, p.first_name, p.last_name, u.created_at
+SELECT u.id, u.email, p.first_name, p.last_name, u.tenant_id, u.created_at
 FROM users u
 JOIN patient_profiles p ON u.id = p.user_id
 WHERE u.role = 'patient'
@@ -148,6 +152,7 @@ type GetPatientsByDoctorIDRow struct {
 	Email     string             `json:"email"`
 	FirstName string             `json:"first_name"`
 	LastName  string             `json:"last_name"`
+	TenantID  uuid.UUID          `json:"tenant_id"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
@@ -174,6 +179,7 @@ func (q *Queries) GetPatientsByDoctorID(ctx context.Context, arg GetPatientsByDo
 			&i.Email,
 			&i.FirstName,
 			&i.LastName,
+			&i.TenantID,
 			&i.CreatedAt,
 		); err != nil {
 			return nil, err

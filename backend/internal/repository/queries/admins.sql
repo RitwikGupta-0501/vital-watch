@@ -30,3 +30,9 @@ LIMIT $1 OFFSET $2;
 UPDATE users
 SET is_active = $2, updated_at = now()
 WHERE id = $1 AND tenant_id = @tenant_id;
+
+-- name: GetUserByIDGlobal :one
+SELECT u.id, u.email, u.role, u.tenant_id, u.is_active
+FROM users u
+WHERE u.id = $1;
+
