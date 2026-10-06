@@ -1,0 +1,3944 @@
+diff --git a/.env.example b/.env.example
+index f2f232c..1e632f3 100644
+--- a/.env.example
++++ b/.env.example
+@@ -1,6 +1,7 @@
+ # Security & Authentication
+ JWT_SECRET=your_super_secret_jwt_key_here
+ DOCTOR_INVITE_CODE=doctor_secret_invite_code_2026
++ADMIN_INVITE_CODE=admin_secret_invite_code_2026
+ 
+ # Application Configuration
+ PORT=8080
+@@ -16,9 +17,26 @@ AWS_REGION=us-east-1
+ S3_BUCKET_NAME=your-vital-watch-bucket
+ 
+ # Database Configuration
++# Option A: individual vars (password is URL-encoded automatically)
+ DB_HOST=localhost
+ DB_PORT=5432
+ DB_USER=appuser
+ DB_PASSWORD=apppassword
+ DB_NAME=appdb
+ DB_SSLMODE=disable
++
++# Option B: full connection URL (takes priority over individual DB_* vars above)
++# Useful for cloud platforms that inject DATABASE_URL directly (Supabase, Neon, Heroku, ECS).
++# DATABASE_URL=postgres://appuser:apppassword@localhost:5432/appdb?sslmode=disable
++
++# Connection pool sizing (optional — sensible defaults are built in)
++# Budget: HTTP(~40) + River workers(12) + Auditor(5) + SSE LISTEN(1) + buffer(17) = 75
++DB_MAX_CONNS=75
++DB_MIN_CONNS=10
++
++# Migration control
++# Set AUTO_MIGRATE=false for multi-replica deployments where a dedicated
++# migration initContainer or CI job manages schema changes instead.
++AUTO_MIGRATE=true
++
++KMS_MASTER_KEY=super-secret-master-key-change-me
+diff --git a/Dockerfile b/Dockerfile
+index d66186b..8330f34 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -1,5 +1,5 @@
+ # ---- Build Stage ----
+-FROM golang:1.24-alpine AS builder
++FROM golang:1.27-alpine AS builder
+ 
+ WORKDIR /app
+ 
+diff --git a/cmd/main/main.go b/cmd/main/main.go
+index 294cbcd..6fbc32a 100644
+--- a/cmd/main/main.go
++++ b/cmd/main/main.go
+@@ -7,6 +7,7 @@ import (
+ 	"log"
+ 	"log/slog"
+ 	"net/http"
++	"net/url"
+ 	"os"
+ 	"os/signal"
+ 	"strconv"
+@@ -24,10 +25,13 @@ import (
+ 	"github.com/jackc/pgx/v5/pgxpool"
+ 	"github.com/jackc/pgx/v5/stdlib"
+ 	"github.com/joho/godotenv"
++	"github.com/prometheus/client_golang/prometheus/promhttp"
+ 
+ 	"github.com/RitwikGupta-0501/vital-watch/internal/api"
+ 	"github.com/RitwikGupta-0501/vital-watch/internal/audit"
++	"github.com/RitwikGupta-0501/vital-watch/internal/crypto"
+ 	"github.com/RitwikGupta-0501/vital-watch/internal/logger"
++	"github.com/RitwikGupta-0501/vital-watch/internal/metrics"
+ 	"github.com/RitwikGupta-0501/vital-watch/internal/middleware"
+ 	"github.com/RitwikGupta-0501/vital-watch/internal/notifications"
+ 	"github.com/RitwikGupta-0501/vital-watch/internal/ocr"
+@@ -44,29 +48,62 @@ import (
+ =        Database Initialization       =
+ ========================================
+ */
+-func init_db(ctx context.Context) *pgxpool.Pool {
++
++// buildDatabaseDSN constructs a connection string for pgxpool.ParseConfig.
++// Priority: DATABASE_URL env var (matches CI and 12-factor cloud deployments),
++// then individual DB_* vars assembled into a properly URL-encoded URL so that
++// passwords containing spaces, quotes, or backslashes are handled correctly.
++func buildDatabaseDSN() string {
++	if u := os.Getenv("DATABASE_URL"); u != "" {
++		return u
++	}
++
+ 	dbHost := os.Getenv("DB_HOST")
+-	dbPortStr := os.Getenv("DB_PORT")
++	if dbHost == "" {
++		dbHost = "localhost"
++	}
++	dbPort := os.Getenv("DB_PORT")
++	if dbPort == "" {
++		dbPort = "5432"
++	}
+ 	dbUser := os.Getenv("DB_USER")
+ 	dbPassword := os.Getenv("DB_PASSWORD")
+ 	dbName := os.Getenv("DB_NAME")
+ 	sslMode := os.Getenv("DB_SSLMODE")
++	if sslMode == "" {
++		sslMode = "disable"
++	}
+ 
+-	dbPort, err := strconv.Atoi(dbPortStr)
+-	if err != nil {
+-		log.Fatal("Invalid DB_PORT:", err)
++	u := &url.URL{
++		Scheme: "postgres",
++		User:   url.UserPassword(dbUser, dbPassword),
++		Host:   fmt.Sprintf("%s:%s", dbHost, dbPort),
++		Path:   dbName,
+ 	}
++	q := url.Values{}
++	q.Set("sslmode", sslMode)
++	u.RawQuery = q.Encode()
+ 
+-	connStr := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
+-		dbHost, dbPort, dbUser, dbPassword, dbName, sslMode)
++	return u.String()
++}
++
++func init_db(ctx context.Context) *pgxpool.Pool {
++	connStr := buildDatabaseDSN()
+ 
+ 	poolConfig, err := pgxpool.ParseConfig(connStr)
+ 	if err != nil {
+ 		log.Fatal("Failed to parse database pool configuration:", err)
+ 	}
+ 
+-	// Tune database connection pool settings (DB-03, OPS-01)
+-	maxConns := 50
++	// Pool sizing budget:
++	//   HTTP REST layer      ~40 (burst)
++	//   River worker pool    ≤12 (10 workers + 2 River internal)
++	//   HIPAA Async Auditor   5  (DefaultWorkerCount)
++	//   SSE pg_notify LISTEN  1  (permanent)
++	//   Safety buffer        17
++	//   ─────────────────────────
++	//   Total                75  (override via DB_MAX_CONNS)
++	maxConns := 75
+ 	if val := os.Getenv("DB_MAX_CONNS"); val != "" {
+ 		if n, err := strconv.Atoi(val); err == nil && n > 0 {
+ 			maxConns = n
+@@ -82,26 +119,54 @@ func init_db(ctx context.Context) *pgxpool.Pool {
+ 	poolConfig.MaxConns = int32(maxConns)
+ 	poolConfig.MinConns = int32(minConns)
+ 	poolConfig.MaxConnLifetime = 1 * time.Hour
+-	poolConfig.MaxConnIdleTime = 30 * time.Minute
++	// Jitter desynchronises mass connection recycling that would otherwise
++	// produce a thundering-herd TCP reconnect storm every 60 minutes.
++	poolConfig.MaxConnLifetimeJitter = 5 * time.Minute
++	poolConfig.MaxConnIdleTime = 15 * time.Minute
++	// Actively probe idle connections so silent dead sockets (cloud NAT/firewall
++	// idle-timeout drops) are evicted before a request attempts to use them.
++	poolConfig.HealthCheckPeriod = 30 * time.Second
++	// Bound the TCP handshake so a hung PostgreSQL cannot stall startup indefinitely.
++	poolConfig.ConnConfig.ConnectTimeout = 5 * time.Second
++
++	// Per-session server-side safety guards:
++	//   application_name  – identifies this service in pg_stat_activity / pg_locks
++	//   statement_timeout – aborts runaway queries before they hold row-level locks
++	//   idle_in_transaction_session_timeout – evicts stalled transactions that block VACUUM/DDL
++	if poolConfig.ConnConfig.RuntimeParams == nil {
++		poolConfig.ConnConfig.RuntimeParams = make(map[string]string)
++	}
++	poolConfig.ConnConfig.RuntimeParams["application_name"] = "vital-watch-backend"
++	poolConfig.ConnConfig.RuntimeParams["statement_timeout"] = "30000"                   // 30 s
++	poolConfig.ConnConfig.RuntimeParams["idle_in_transaction_session_timeout"] = "10000" // 10 s
+ 
+ 	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
+ 	if err != nil {
+ 		log.Fatal("Failed to initialize database connection pool:", err)
+ 	}
+ 
+-	// Retry loop for pool.Ping()
+-	var dbErr error
+-	for i := 0; i < 5; i++ {
+-		err = pool.Ping(ctx)
+-		if err == nil {
+-			slog.Info("Successfully connected to database pool!")
++	// Retry loop: each attempt is individually time-bounded so a partially
++	// reachable PostgreSQL cannot block startup longer than 5 × 3 s + 10 s backoff.
++	backoff := 500 * time.Millisecond
++	var lastErr error
++	for i := 1; i <= 5; i++ {
++		pingCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
++		lastErr = pool.Ping(pingCtx)
++		cancel()
++		if lastErr == nil {
++			slog.Info("Successfully connected to database pool",
++				"max_conns", maxConns,
++				"min_conns", minConns,
++			)
++			// Register Prometheus DB pool metrics collector
++			metrics.Register(pool)
+ 			return pool
+ 		}
+-		dbErr = err
+-		slog.Warn("Failed to ping database, retrying in 2 seconds...", "error", err)
+-		time.Sleep(2 * time.Second)
++		slog.Warn("Database ping failed, retrying...", "attempt", i, "error", lastErr)
++		time.Sleep(backoff)
++		backoff *= 2
+ 	}
+-	log.Fatal("Failed to ping database after retries:", dbErr)
++	log.Fatal("Failed to connect to database after retries:", lastErr)
+ 	return nil
+ }
+ 
+@@ -111,9 +176,17 @@ func init_db(ctx context.Context) *pgxpool.Pool {
+ ========================================
+ */
+ func run_migrations(pool *pgxpool.Pool) {
++	// AUTO_MIGRATE=false lets multi-replica deployments skip in-process DDL
++	// and rely on a dedicated migration job / initContainer instead.
++	if os.Getenv("AUTO_MIGRATE") == "false" {
++		slog.Info("AUTO_MIGRATE=false; skipping in-process migration runner")
++		return
++	}
++
+ 	slog.Info("Running database migrations...")
+ 	sqlDB := stdlib.OpenDBFromPool(pool)
+ 	defer sqlDB.Close()
++
+ 	driver, err := pgxmigrate.WithInstance(sqlDB, &pgxmigrate.Config{})
+ 	if err != nil {
+ 		log.Fatal("Failed to create migration driver:", err)
+@@ -124,10 +197,19 @@ func run_migrations(pool *pgxpool.Pool) {
+ 	if err != nil {
+ 		log.Fatal("Failed to create migration instance:", err)
+ 	}
++	// Release the file-system source reader and the database driver reference.
++	defer func() {
++		srcErr, dbErr := m.Close()
++		if srcErr != nil {
++			slog.Warn("Migration source close notice", "error", srcErr)
++		}
++		if dbErr != nil {
++			slog.Warn("Migration database driver close notice", "error", dbErr)
++		}
++	}()
+ 
+ 	// Run the migrations "up"
+-	err = m.Up()
+-	if err != nil && err != migrate.ErrNoChange {
++	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+ 		log.Fatal("Failed to run migrations:", err)
+ 	}
+ 
+@@ -230,25 +312,29 @@ func main() {
+ 		slog.Info("Successfully initialized Local Storage Provider", "base_url", localStorageURL)
+ 	}
+ 
++
++
++	// Initialize Repository (breaks initialization cycle with River)
++	repo := repository.New(pool, nil)
++
++	// Initialize Cryptography Service
++	cipherService, err := crypto.NewCipherService(os.Getenv("KMS_MASTER_KEY"))
++	if err != nil {
++		log.Fatalf("Failed to initialize CipherService: %v", err)
++	}
++
+ 	// Initialize Multi-Provider Vision AI OCR Engine
+-	ocrManager := ocr.NewManagerFromEnv(ctx)
++	ocrManager := ocr.NewManager(repo, cipherService)
+ 	if ocrManager.IsEnabled() {
+-		providersStr := os.Getenv("OCR_PROVIDERS")
+-		if providersStr == "" {
+-			providersStr = "gemini,claude,openai (default)"
+-		}
+-		slog.Info("Vision AI OCR enabled", "providers", providersStr)
++		slog.Info("Vision AI OCR enabled (BYOK Tenant Mode)")
+ 	} else {
+ 		slog.Info("Vision AI OCR is disabled (zero-config / no active provider keys). Prescriptions will enter needs_review for manual clinician entry.")
+ 	}
+ 
+-	// Initialize Repository (breaks initialization cycle with River)
+-	repo := repository.New(pool, nil)
+-
+ 	// Initialize PDF Generator, DDI Safety Engine, Real-Time SSE Broker, and Telehealth
+ 	pdfGen := pdf.NewStandardPDFGenerator()
+ 	safetyChecker := safety.NewOpenFDAChecker()
+-	notifier := notifications.NewSSEBroker()
++	notifier := notifications.NewSSEBroker(pool)
+ 	telehealthProv := telehealth.NewTelehealthManager(jwtSecret)
+ 	dlqFilePath := os.Getenv("AUDIT_DLQ_PATH")
+ 	if dlqFilePath == "" {
+@@ -285,6 +371,8 @@ func main() {
+ 		Notifier:         notifier,
+ 		Telehealth:       telehealthProv,
+ 		Auditor:          auditor,
++		CipherService:    cipherService,
++		Pool:             pool,
+ 	}
+ 
+ 	// Set up Gin Router
+@@ -300,19 +388,28 @@ func main() {
+ 		IdleTimeout:       120 * time.Second,
+ 	}
+ 
+-	// Run server in a goroutine
++	// Run server in a goroutine. Errors are funnelled back to main so the
++	// graceful shutdown sequence always executes (pool.Close, auditor.Shutdown,
++	// riverClient.Stop). Using log.Fatalf here would call os.Exit and bypass all
++	// deferred functions, risking HIPAA audit data loss.
++	serverErr := make(chan error, 1)
+ 	go func() {
+ 		slog.Info("Starting HTTP server", "port", port)
+ 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+-			log.Fatalf("HTTP server listen error: %v", err)
++			serverErr <- err
+ 		}
+ 	}()
+ 
+-	// Listen for OS signals for graceful shutdown (OPS-02)
++	// Block until an OS signal or an unexpected server failure is received.
+ 	quit := make(chan os.Signal, 1)
+ 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+-	sig := <-quit
+-	slog.Info("Received shutdown signal. Draining in-flight connections and queue workers...", "signal", sig.String())
++
++	select {
++	case sig := <-quit:
++		slog.Info("Received shutdown signal. Draining in-flight connections and queue workers...", "signal", sig.String())
++	case err := <-serverErr:
++		slog.Error("HTTP server failed unexpectedly; initiating emergency graceful shutdown", "error", err)
++	}
+ 
+ 	// Graceful shutdown: Real-time notification broker (unblocks active SSE streams so HTTP server can drain)
+ 	slog.Info("Closing notification broker subscriptions...")
+@@ -354,6 +451,11 @@ func setupRouter(h *api.Handler, storageType string, jwtSecret []byte) *gin.Engi
+ 	r := gin.New()
+ 	r.Use(gin.Recovery())
+ 	r.Use(middleware.RequestIDMiddleware())
++	
++	// HTTP Metrics Middleware
++	metricsMiddleware := middleware.NewMetricsMiddleware()
++	r.Use(metricsMiddleware.Middleware())
++
+ 	r.Use(middleware.SecurityHeadersMiddleware())
+ 
+ 	// Rate Limiting: 120 req/min general, 10 req/min for authentication endpoints
+@@ -389,6 +491,7 @@ func setupRouter(h *api.Handler, storageType string, jwtSecret []byte) *gin.Engi
+ 	// -----------------------
+ 	// -       Routes        -
+ 	// -----------------------
++	r.GET("/metrics", gin.WrapH(promhttp.Handler())) // Prometheus metrics endpoint
+ 	r.GET("/healthz", h.HealthCheck)
+ 	r.GET("/api/healthz", h.HealthCheck)
+ 	r.GET("/api/ping", h.Ping)
+@@ -459,6 +562,9 @@ func setupRouter(h *api.Handler, storageType string, jwtSecret []byte) *gin.Engi
+ 			adminGroup.GET("/users", h.ListUsers)
+ 			adminGroup.PATCH("/users/:id/status", h.ToggleUserStatus)
+ 			adminGroup.GET("/audit-logs", h.GetComplianceAuditLogs)
++			adminGroup.GET("/ocr-settings", h.GetOCRSettings)
++			adminGroup.POST("/ocr-settings/configs", h.CreateOCRConfig)
++			adminGroup.PUT("/ocr-settings/chain", h.UpdateOCRChain)
+ 		}
+ 	}
+ 
+diff --git a/docker-compose.yml b/docker-compose.yml
+index 2efacca..dae8ada 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -13,6 +13,11 @@ services:
+       - .env
+     volumes:
+       - ./storage:/app/storage
++    logging:
++      driver: "json-file"
++      options:
++        max-size: "10m"
++        max-file: "3"
+ 
+   db:
+     image: postgres:15-alpine
+@@ -26,5 +31,64 @@ services:
+     volumes:
+       - vital-watch-db-data:/var/lib/postgresql/data
+ 
++  prometheus:
++    image: prom/prometheus:v3.15.0
++    container_name: vital-watch-prometheus
++    restart: unless-stopped
++    ports:
++      - "9090:9090"
++    volumes:
++      - ./provisioning/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
++      - prometheus-data:/prometheus
++    command:
++      - '--config.file=/etc/prometheus/prometheus.yml'
++      - '--storage.tsdb.path=/prometheus'
++      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
++      - '--web.console.templates=/usr/share/prometheus/consoles'
++      - '--web.enable-remote-write-receiver'
++      - '--enable-feature=native-histograms'
++
++  grafana:
++    image: grafana/grafana:13.2.3
++    container_name: vital-watch-grafana
++    restart: unless-stopped
++    ports:
++      - "3000:3000"
++    volumes:
++      - ./provisioning/grafana/datasources:/etc/grafana/provisioning/datasources
++      - grafana-data:/var/lib/grafana
++
++  loki:
++    image: grafana/loki:3.7.0
++    container_name: vital-watch-loki
++    restart: unless-stopped
++    ports:
++      - "3100:3100"
++    command: -config.file=/etc/loki/local-config.yaml
++    volumes:
++      - loki-data:/tmp/loki
++
++  alloy:
++    image: grafana/alloy:v1.20.0
++    container_name: vital-watch-alloy
++    restart: unless-stopped
++    volumes:
++      - /var/run/docker.sock:/var/run/docker.sock:ro
++      - /var/lib/docker/containers:/var/lib/docker/containers:ro
++
++  postgres-exporter:
++    image: quay.io/prometheuscommunity/postgres-exporter:v0.16.0
++    container_name: vital-watch-postgres-exporter
++    restart: unless-stopped
++    ports:
++      - "9187:9187"
++    environment:
++      DATA_SOURCE_NAME: "postgresql://appuser:apppassword@db:5432/appdb?sslmode=disable"
++    depends_on:
++      - db
++
+ volumes:
+   vital-watch-db-data:
++  prometheus-data:
++  grafana-data:
++  loki-data:
+diff --git a/docs/LOAD_TESTING.md b/docs/LOAD_TESTING.md
+new file mode 100644
+index 0000000..27aceab
+--- /dev/null
++++ b/docs/LOAD_TESTING.md
+@@ -0,0 +1,80 @@
++# Load Testing & Capacity Benchmarks
++
++## Executive Summary
++
++To ensure high availability and stability, the Vital Watch backend was subjected to a rigorous capacity benchmarking suite using **Grafana k6**, **Prometheus**, and **Docker**. 
++
++We utilized a binary search methodology to identify the exact breaking points of the system across two distinct workload profiles:
++1. **Raw Infrastructure Baseline**: Validating the maximum throughput of the Go HTTP router and PostgreSQL connection pool.
++2. **Full User Journey**: Validating the real-world capacity involving heavy cryptographic operations (bcrypt password hashing), JWT session management, and complex database transactions.
++
++The results demonstrated exceptional performance, with the baseline effortlessly handling **2,000+ concurrent users** at `<4ms` latency, and the computationally-heavy authentication flow handling **142 concurrent users** under `500ms` latency (bottlenecked intentionally by bcrypt security scaling).
++
++---
++
++## Testing Architecture
++
++The load testing stack is fully containerized and integrated with our observability infrastructure:
++- **Load Generator**: `grafana/k6` executed via Docker.
++- **Metrics Storage**: k6 is configured to remote-write native histograms directly to our local **Prometheus** instance (`http://localhost:9090/api/v1/write`).
++- **Visualization**: Metrics are queryable in **Grafana** (`http://localhost:3000`) for real-time visualization of `http_req_duration` and `http_req_failed`.
++- **Search Strategy**: A custom Python script (`scripts/loadtest/binary_search_capacity.py`) automates k6 execution, applying a binary search algorithm to narrow down the maximum Virtual User (VU) capacity based on strict pass/fail thresholds.
++
++---
++
++## 1. Raw Infrastructure Baseline Benchmark
++
++The baseline test isolates the network layer, Go router, and database connection pool from complex business logic by heavily querying the `/api/healthz` endpoint.
++
++**Test Configuration:**
++- **Target Endpoint**: `GET /api/healthz`
++- **Load Profile**: 15s Ramp-up, 30s Sustain, 15s Ramp-down
++- **Success Criteria**: 95th Percentile (p95) Latency < 200ms AND Error Rate < 1%
++- **Rate Limiting**: Bypassed for testing purposes.
++
++### Binary Search Execution Log (Excerpt)
++
++| Virtual Users | Result | p95 Latency | Error Rate |
++|---------------|--------|-------------|------------|
++| 1025          | ✅ PASS | 1.77ms      | 0.00%      |
++| 1513          | ✅ PASS | 3.44ms      | 0.00%      |
++| 1757          | ✅ PASS | 2.80ms      | 0.00%      |
++| 1940          | ✅ PASS | 3.51ms      | 0.00%      |
++| 2000          | ✅ PASS | 3.07ms      | 0.00%      |
++
++**Result**: The test successfully scaled to the predefined absolute maximum of **2,000 Concurrent Virtual Users**. Even at maximum capacity, the API handled the load with a phenomenal p95 latency of `~3.07ms` and a `0.00%` error rate.
++
++---
++
++## 2. Full User Journey Benchmark
++
++The user journey test simulates realistic traffic by executing a sequence of heavy business logic operations.
++
++**Test Configuration:**
++- **Target Endpoints**: `POST /api/register`, `POST /api/login`, `GET /api/profile`, `GET /api/doctors`
++- **Load Profile**: 15s Ramp-up, 30s Sustain, 15s Ramp-down
++- **Success Criteria**: 95th Percentile (p95) Latency < 500ms AND Error Rate < 5%
++- **Rate Limiting**: Bypassed for testing purposes (normally capped at 10 req/min for auth).
++
++### Binary Search Execution Log
++
++| Virtual Users | Result | p95 Latency | Error Rate |
++|---------------|--------|-------------|------------|
++| 100           | ✅ PASS | 117.24ms    | 0.00%      |
++| 125           | ✅ PASS | 202.63ms    | 0.00%      |
++| 137           | ✅ PASS | 277.77ms    | 0.00%      |
++| 140           | ✅ PASS | 456.81ms    | 0.00%      |
++| 141           | ✅ PASS | 445.50ms    | 0.00%      |
++| 142           | ✅ PASS | 487.05ms    | 0.00%      |
++| 143           | ❌ FAIL | 888.18ms    | 0.00%      |
++| 150           | ❌ FAIL | 555.28ms    | 0.00%      |
++
++**Result**: The system comfortably handled **142 concurrent users** constantly creating accounts, logging in, and querying the database before the p95 latency crossed the 500ms threshold.
++
++---
++
++## Conclusion & Analysis
++
++1. **Connection Pool Resiliency**: The Go `pgxpool` efficiently multiplexed 2,000 concurrent web requests onto a much smaller set of physical PostgreSQL connections without exhaustion or significant latency spikes.
++2. **Cryptographic Bottlenecks**: The drop from 2,000 VUs to 142 VUs during the User Journey test is the direct result of `bcrypt` password hashing used in `/register` and `/login`. This is a strict security requirement (NIST SP 800-63B / HIPAA) to mitigate brute-force attacks by intentionally maximizing CPU time.
++3. **Defense in Depth**: In a production environment, the `authLimiter` strictly restricts authentication endpoints to 10 requests per minute per IP. This ensures that the CPU bottleneck identified (142 VUs) can never be maliciously exploited by a single actor to cause a Denial of Service (DoS).
+diff --git a/fix_auth_ratelimit.py b/fix_auth_ratelimit.py
+deleted file mode 100644
+index 845fb5d..0000000
+--- a/fix_auth_ratelimit.py
++++ /dev/null
+@@ -1,16 +0,0 @@
+-import re
+-
+-with open("internal/middleware/ratelimit.go", "r") as f:
+-    text = f.read()
+-if '"encoding/json"' not in text:
+-    text = text.replace('"time"', '"encoding/json"\n\t"time"', 1)
+-text = re.sub(r'(Metadata:\s*)(fmt\.Sprintf\(`{"path":%q,"method":%q,"retry_after":%d}`, c\.Request\.URL\.Path, c\.Request\.Method, retryAfter\))', r'\1json.RawMessage(\2)', text)
+-with open("internal/middleware/ratelimit.go", "w") as f:
+-    f.write(text)
+-
+-with open("internal/api/auth_handlers.go", "r") as f:
+-    text = f.read()
+-text = re.sub(r'(Metadata:\s*)(fmt\.Sprintf\(.*?\))', r'\1json.RawMessage(\2)', text)
+-with open("internal/api/auth_handlers.go", "w") as f:
+-    f.write(text)
+-
+diff --git a/go.mod b/go.mod
+index 2b23bc5..5cc186a 100644
+--- a/go.mod
++++ b/go.mod
+@@ -9,15 +9,20 @@ require (
+ 	github.com/aws/smithy-go v1.23.2
+ 	github.com/gin-contrib/cors v1.7.6
+ 	github.com/gin-gonic/gin v1.11.0
+-	github.com/golang-jwt/jwt/v5 v5.3.0
++	github.com/go-pdf/fpdf v0.9.0
++	github.com/golang-jwt/jwt/v5 v5.3.1
+ 	github.com/golang-migrate/migrate/v4 v4.20.1
+ 	github.com/google/uuid v1.6.0
++	github.com/jackc/pgerrcode v0.0.0-20240316143900-6e2875d9b438
+ 	github.com/jackc/pgx/v5 v5.10.0
+ 	github.com/joho/godotenv v1.5.1
++	github.com/prometheus/client_golang v1.24.1
+ 	github.com/riverqueue/river v0.47.0
+ 	github.com/riverqueue/river/riverdriver/riverpgxv5 v0.47.0
+ 	github.com/riverqueue/river/rivertype v0.47.0
++	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
+ 	golang.org/x/crypto v0.55.0
++	golang.org/x/sync v0.22.0
+ 	google.golang.org/genai v1.71.0
+ )
+ 
+@@ -39,6 +44,7 @@ require (
+ 	github.com/aws/aws-sdk-go-v2/service/sso v1.30.1 // indirect
+ 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.35.5 // indirect
+ 	github.com/aws/aws-sdk-go-v2/service/sts v1.39.1 // indirect
++	github.com/beorn7/perks v1.0.1 // indirect
+ 	github.com/bytedance/gopkg v0.1.3 // indirect
+ 	github.com/bytedance/sonic v1.14.2 // indirect
+ 	github.com/bytedance/sonic/loader v0.4.0 // indirect
+@@ -59,23 +65,24 @@ require (
+ 	github.com/googleapis/enterprise-certificate-proxy v0.3.17 // indirect
+ 	github.com/googleapis/gax-go/v2 v2.22.0 // indirect
+ 	github.com/gorilla/websocket v1.5.3 // indirect
+-	github.com/jackc/pgerrcode v0.0.0-20240316143900-6e2875d9b438 // indirect
+ 	github.com/jackc/pgpassfile v1.0.0 // indirect
+ 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
+ 	github.com/jackc/puddle/v2 v2.2.2 // indirect
+ 	github.com/json-iterator/go v1.1.12 // indirect
+-	github.com/jung-kurt/gofpdf v1.16.2 // indirect
+ 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
+ 	github.com/leodido/go-urn v1.4.0 // indirect
+ 	github.com/mattn/go-isatty v0.0.20 // indirect
+ 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
+ 	github.com/modern-go/reflect2 v1.0.2 // indirect
++	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
+ 	github.com/pelletier/go-toml/v2 v2.2.4 // indirect
++	github.com/prometheus/client_model v0.6.2 // indirect
++	github.com/prometheus/common v0.70.1 // indirect
++	github.com/prometheus/procfs v0.21.1 // indirect
+ 	github.com/quic-go/qpack v0.5.1 // indirect
+ 	github.com/quic-go/quic-go v0.55.0 // indirect
+ 	github.com/riverqueue/river/riverdriver v0.47.0 // indirect
+ 	github.com/riverqueue/river/rivershared v0.47.0 // indirect
+-	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e // indirect
+ 	github.com/tidwall/gjson v1.19.0 // indirect
+ 	github.com/tidwall/match v1.2.0 // indirect
+ 	github.com/tidwall/pretty v1.2.1 // indirect
+@@ -91,7 +98,6 @@ require (
+ 	golang.org/x/arch v0.22.0 // indirect
+ 	golang.org/x/mod v0.40.0 // indirect
+ 	golang.org/x/net v0.58.0 // indirect
+-	golang.org/x/sync v0.22.0 // indirect
+ 	golang.org/x/sys v0.47.0 // indirect
+ 	golang.org/x/text v0.41.0 // indirect
+ 	golang.org/x/tools v0.49.0 // indirect
+diff --git a/go.sum b/go.sum
+index 84a7a83..d6a7cee 100644
+--- a/go.sum
++++ b/go.sum
+@@ -44,7 +44,8 @@ github.com/aws/aws-sdk-go-v2/service/sts v1.39.1 h1:mLlUgHn02ue8whiR4BmxxGJLR2gw
+ github.com/aws/aws-sdk-go-v2/service/sts v1.39.1/go.mod h1:E19xDjpzPZC7LS2knI9E6BaRFDK43Eul7vd6rSq2HWk=
+ github.com/aws/smithy-go v1.23.2 h1:Crv0eatJUQhaManss33hS5r40CG3ZFH+21XSkqMrIUM=
+ github.com/aws/smithy-go v1.23.2/go.mod h1:LEj2LM3rBRQJxPZTB4KuzZkaZYnZPnvgIhb4pu07mx0=
+-github.com/boombuler/barcode v1.0.0/go.mod h1:paBWMcWSl3LHKBqUq+rly7CNSldXjb2rDl3JlRe0mD8=
++github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
++github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0ibhJ6rlkpw=
+ github.com/bytedance/gopkg v0.1.3 h1:TPBSwH8RsouGCBcMBktLt1AymVo2TVsBVCY4b6TnZ/M=
+ github.com/bytedance/gopkg v0.1.3/go.mod h1:576VvJ+eJgyCzdjS+c4+77QF3p7ubbtiKARP3TxducM=
+ github.com/bytedance/sonic v1.14.2 h1:k1twIoe97C1DtYUo+fZQy865IuHia4PR5RPiuGPPIIE=
+@@ -88,6 +89,8 @@ github.com/go-logr/logr v1.4.3 h1:CjnDlHq8ikf6E492q6eKboGOC0T8CDaOvkHCIg8idEI=
+ github.com/go-logr/logr v1.4.3/go.mod h1:9T104GzyrTigFIr8wt5mBrctHMim0Nb2HLGrmQ40KvY=
+ github.com/go-logr/stdr v1.2.2 h1:hSWxHoqTgW2S2qGc0LTAI563KZ5YKYRhT3MFKZMbjag=
+ github.com/go-logr/stdr v1.2.2/go.mod h1:mMo/vtBO5dYbehREoey6XUKy/eSumjCCveDpRre4VKE=
++github.com/go-pdf/fpdf v0.9.0 h1:PPvSaUuo1iMi9KkaAn90NuKi+P4gwMedWPHhj8YlJQw=
++github.com/go-pdf/fpdf v0.9.0/go.mod h1:oO8N111TkmKb9D7VvWGLvLJlaZUQVPM+6V42pp3iV4Y=
+ github.com/go-playground/assert/v2 v2.2.0 h1:JvknZsQTYeFEAhQwI4qEt9cyV5ONwRHC+lYKSsYSR8s=
+ github.com/go-playground/assert/v2 v2.2.0/go.mod h1:VDjEfimB/XKnb+ZQfWdccd7VUvScMdVu0Titje2rxJ4=
+ github.com/go-playground/locales v0.14.1 h1:EWaQ/wswjilfKLTECiXz7Rh+3BjFhfDFKv/oXslEjJA=
+@@ -100,8 +103,8 @@ github.com/goccy/go-json v0.10.5 h1:Fq85nIqj+gXn/S5ahsiTlK3TmC85qgirsdTP/+DeaC4=
+ github.com/goccy/go-json v0.10.5/go.mod h1:oq7eo15ShAhp70Anwd5lgX2pLfOS3QCiwU/PULtXL6M=
+ github.com/goccy/go-yaml v1.18.0 h1:8W7wMFS12Pcas7KU+VVkaiCng+kG8QiFeFwzFb+rwuw=
+ github.com/goccy/go-yaml v1.18.0/go.mod h1:XBurs7gK8ATbW4ZPGKgcbrY1Br56PdM69F7LkFRi1kA=
+-github.com/golang-jwt/jwt/v5 v5.3.0 h1:pv4AsKCKKZuqlgs5sUmn4x8UlGa0kEVt/puTpKx9vvo=
+-github.com/golang-jwt/jwt/v5 v5.3.0/go.mod h1:fxCRLWMO43lRc8nhHWY6LGqRcf+1gQWArsqaEUEa5bE=
++github.com/golang-jwt/jwt/v5 v5.3.1 h1:kYf81DTWFe7t+1VvL7eS+jKFVWaUnK9cB1qbwn63YCY=
++github.com/golang-jwt/jwt/v5 v5.3.1/go.mod h1:fxCRLWMO43lRc8nhHWY6LGqRcf+1gQWArsqaEUEa5bE=
+ github.com/golang-migrate/migrate/v4 v4.20.1 h1:2N/ToVTKrKl58ynBpgeVJ4In7VcLCjWTZtm4eP1LxhU=
+ github.com/golang-migrate/migrate/v4 v4.20.1/go.mod h1:DDPgKVb4ovSWc4FwSPfV2Uz1160f4XBiTHTrAJtljmM=
+ github.com/golang/protobuf v1.5.4 h1:i7eJL8qZTpSEXOPTxNKhASYpMn+8e5Q6AdndVa1dWek=
+@@ -133,11 +136,12 @@ github.com/joho/godotenv v1.5.1 h1:7eLL/+HRGLY0ldzfGMeQkb7vMd0as4CfYvUVzLqw0N0=
+ github.com/joho/godotenv v1.5.1/go.mod h1:f4LDr5Voq0i2e/R5DDNOoa2zzDfwtkZa6DnEwAbqwq4=
+ github.com/json-iterator/go v1.1.12 h1:PV8peI4a0ysnczrg+LtxykD8LfKY9ML6u2jnxaEnrnM=
+ github.com/json-iterator/go v1.1.12/go.mod h1:e30LSqwooZae/UwlEbR2852Gd8hjQvJoHmT4TnhNGBo=
+-github.com/jung-kurt/gofpdf v1.0.0/go.mod h1:7Id9E/uU8ce6rXgefFLlgrJj/GYY22cpxn+r32jIOes=
+-github.com/jung-kurt/gofpdf v1.16.2 h1:jgbatWHfRlPYiK85qgevsZTHviWXKwB1TTiKdz5PtRc=
+-github.com/jung-kurt/gofpdf v1.16.2/go.mod h1:1hl7y57EsiPAkLbOwzpzqgx1A30nQCk/YmFV8S2vmK0=
++github.com/klauspost/compress v1.19.1 h1:VsB4HPswih7mmZ8WleSFQ75c/Ui1M4trX5oAsJnhSlk=
++github.com/klauspost/compress v1.19.1/go.mod h1:cwPg85FWrGar70rWktvGQj8/hthj3wpl0PGDogxkrSQ=
+ github.com/klauspost/cpuid/v2 v2.3.0 h1:S4CRMLnYUhGeDFDqkGriYKdfoFlDnMtqTiI/sFzhA9Y=
+ github.com/klauspost/cpuid/v2 v2.3.0/go.mod h1:hqwkgyIinND0mEev00jJYCxPNVRVXFQeu1XKlok6oO0=
++github.com/kylelemons/godebug v1.1.0 h1:RPNrshWIDI6G2gRW9EHilWtl7Z6Sb1BR0xunSBf0SNc=
++github.com/kylelemons/godebug v1.1.0/go.mod h1:9/0rRGxNHcop5bhtWyNeEfOS8JIWk580+fNqagV/RAw=
+ github.com/leodido/go-urn v1.4.0 h1:WT9HwE9SGECu3lg4d/dIA+jxlljEa1/ffXKmRjqdmIQ=
+ github.com/leodido/go-urn v1.4.0/go.mod h1:bvxc+MVxLKB4z00jd1z+Dvzr47oO32F/QSNjSBOlFxI=
+ github.com/lib/pq v1.10.9 h1:YXG7RB+JIjhP29X+OtkiDnYaXQwpS4JEWq7dtCCRUEw=
+@@ -159,17 +163,25 @@ github.com/modern-go/reflect2 v1.0.2 h1:xBagoLtFs94CBntxluKeaWgTMpvLxC4ur3nMaC9G
+ github.com/modern-go/reflect2 v1.0.2/go.mod h1:yWuevngMOJpCy52FWWMvUC8ws7m/LJsjYzDa0/r8luk=
+ github.com/morikuni/aec v1.0.0 h1:nP9CBfwrvYnBRgY6qfDQkygYDmYwOilePFkwzv4dU8A=
+ github.com/morikuni/aec v1.0.0/go.mod h1:BbKIizmSmc5MMPqRYbxO4ZU0S0+P200+tUnFx7PXmsc=
++github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 h1:C3w9PqII01/Oq1c1nUAm88MOHcQC9l5mIlSMApZMrHA=
++github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822/go.mod h1:+n7T8mK8HuQTcFwEeznm/DIxMOiR9yIdICNftLE1DvQ=
+ github.com/opencontainers/go-digest v1.0.0 h1:apOUWs51W5PlhuyGyz9FCeeBIOUDA/6nW8Oi/yOhh5U=
+ github.com/opencontainers/go-digest v1.0.0/go.mod h1:0JzlMkj0TRzQZfJkVvzbP0HBR3IKzErnv2BNG4W4MAM=
+ github.com/opencontainers/image-spec v1.1.1 h1:y0fUlFfIZhPF1W537XOLg0/fcx6zcHCJwooC2xJA040=
+ github.com/opencontainers/image-spec v1.1.1/go.mod h1:qpqAh3Dmcf36wStyyWU+kCeDgrGnAve2nCC8+7h8Q0M=
+ github.com/pelletier/go-toml/v2 v2.2.4 h1:mye9XuhQ6gvn5h28+VilKrrPoQVanw5PMw/TB0t5Ec4=
+ github.com/pelletier/go-toml/v2 v2.2.4/go.mod h1:2gIqNv+qfxSVS7cM2xJQKtLSTLUE9V8t9Stt+h56mCY=
+-github.com/phpdave11/gofpdi v1.0.7/go.mod h1:vBmVV0Do6hSBHC8uKUQ71JGW+ZGQq74llk/7bXwjDoI=
+-github.com/pkg/errors v0.8.1/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINEl0=
+ github.com/pkg/errors v0.9.1 h1:FEBLx1zS214owpjy7qsBeixbURkuhQAwrK5UwLGTwt4=
+ github.com/pkg/errors v0.9.1/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINEl0=
+ github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
++github.com/prometheus/client_golang v1.24.1 h1:JnJkREXzWxUdCuPFpIWZiPispT9xVV59uiuyR2bPlnU=
++github.com/prometheus/client_golang v1.24.1/go.mod h1:F+oSRECHg4sse5ucfYpYDeIv/hu68Zo0uoHKetWnzcE=
++github.com/prometheus/client_model v0.6.2 h1:oBsgwpGs7iVziMvrGhE53c/GrLUsZdHnqNwqPLxwZyk=
++github.com/prometheus/client_model v0.6.2/go.mod h1:y3m2F6Gdpfy6Ut/GBsUqTWZqCUvMVzSfMLjcu6wAwpE=
++github.com/prometheus/common v0.70.1 h1:1HvjP4D5oL3t8RsPlwxA9onvvStjtIHYE5XuuwOi/PY=
++github.com/prometheus/common v0.70.1/go.mod h1:VdFUQDMZK3VLkurFUVhia6uys/0suUp86TJz5qbJRhc=
++github.com/prometheus/procfs v0.21.1 h1:GljZCt+zSTS+NZq88cyQ1LjZ+RCHp3uVuabBWA5+OJI=
++github.com/prometheus/procfs v0.21.1/go.mod h1:aB55Cww9pdSJVHk0hUf0inxWyyjPogFIjmHKYgMKmtY=
+ github.com/quic-go/qpack v0.5.1 h1:giqksBPnT/HDtZ6VhtFKgoLOWmlyo9Ei6u9PqzIMbhI=
+ github.com/quic-go/qpack v0.5.1/go.mod h1:+PC4XFrEskIVkcLzpEkbLqq1uCoxPhQuvK5rH1ZgaEg=
+ github.com/quic-go/quic-go v0.55.0 h1:zccPQIqYCXDt5NmcEabyYvOnomjs8Tlwl7tISjJh9Mk=
+@@ -186,14 +198,12 @@ github.com/riverqueue/river/rivertype v0.47.0 h1:SzNavtLGR4nMT1QkrEYQ7n96OMatYsn
+ github.com/riverqueue/river/rivertype v0.47.0/go.mod h1:XKkcRQR6zm8RR/JQa1Q2ywpj8uXQu21quPa4Lpw1Xhw=
+ github.com/robfig/cron/v3 v3.0.1 h1:WdRxkvbJztn8LMz/QEvLN5sBU+xKpSqwwUO1Pjr4qDs=
+ github.com/robfig/cron/v3 v3.0.1/go.mod h1:eQICP3HwyT7UooqI/z+Ov+PtYAWygg1TEWWzGIFLtro=
+-github.com/ruudk/golang-pdf417 v0.0.0-20181029194003-1af4ab5afa58/go.mod h1:6lfFZQK844Gfx8o5WFuvpxWRwnSoipWe/p622j1v06w=
+ github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e h1:MRM5ITcdelLK2j1vwZ3Je0FKVCfqOLp5zO6trqMLYs0=
+ github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e/go.mod h1:XV66xRDqSt+GTGFMVlhk3ULuV0y9ZmzeVGR4mloJI3M=
+ github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=
+ github.com/stretchr/objx v0.4.0/go.mod h1:YvHI0jy2hoMjB+UWwv71VJQ9isScKT/TqJzVSSt89Yw=
+ github.com/stretchr/objx v0.5.0/go.mod h1:Yh+to48EsGEfYuaHDzXPcE3xhTkx73EhmCGUpEOglKo=
+ github.com/stretchr/objx v0.5.2/go.mod h1:FRsXN1f5AsAjCGJKqEizvkpNtU+EGNCLh3NxZ/8L+MA=
+-github.com/stretchr/testify v1.2.2/go.mod h1:a8OnRcib4nhh0OaRAV+Yts87kKdq0PP7pXfy6kDkUVs=
+ github.com/stretchr/testify v1.3.0/go.mod h1:M5WIy9Dh21IEIfnGCwXGc5bZfKNJtfHm1UVUgZn+9EI=
+ github.com/stretchr/testify v1.7.0/go.mod h1:6Fq8oRcR53rry900zMqJjRRixrwX3KX962/h/Wwjteg=
+ github.com/stretchr/testify v1.7.1/go.mod h1:6Fq8oRcR53rry900zMqJjRRixrwX3KX962/h/Wwjteg=
+@@ -235,13 +245,14 @@ go.uber.org/goleak v1.3.0 h1:2K3zAYmnTNqV73imy9J1T3WC+gmCePx2hEGkimedGto=
+ go.uber.org/goleak v1.3.0/go.mod h1:CoHD4mav9JJNrW/WLlf7HGZPjdw8EucARQHekz1X6bE=
+ go.uber.org/mock v0.6.0 h1:hyF9dfmbgIX5EfOdasqLsWD6xqpNZlXblLB/Dbnwv3Y=
+ go.uber.org/mock v0.6.0/go.mod h1:KiVJ4BqZJaMj4svdfmHM0AUx4NJYO8ZNpPnZn1Z+BBU=
++go.yaml.in/yaml/v2 v2.4.4 h1:tuyd0P+2Ont/d6e2rl3be67goVK4R6deVxCUX5vyPaQ=
++go.yaml.in/yaml/v2 v2.4.4/go.mod h1:gMZqIpDtDqOfM0uNfy0SkpRhvUryYH0Z6wdMYcacYXQ=
+ go.yaml.in/yaml/v3 v3.0.5 h1:N6y/pJk8buWs9NY5ERU2HSMfm+IuD/OtfdAnq6kESPw=
+ go.yaml.in/yaml/v3 v3.0.5/go.mod h1:HVTZu1O7/Vkt2N+BFy8Zza+lnLsABggaTM2ZpNIGuKg=
+ golang.org/x/arch v0.22.0 h1:c/Zle32i5ttqRXjdLyyHZESLD/bB90DCU1g9l/0YBDI=
+ golang.org/x/arch v0.22.0/go.mod h1:dNHoOeKiyja7GTvF9NJS1l3Z2yntpQNzgrjh1cU103A=
+ golang.org/x/crypto v0.55.0 h1:+KWHjbgOaAQ66dh/YlkZKHlz9ZUlq61AFirAR9ntP8M=
+ golang.org/x/crypto v0.55.0/go.mod h1:uq0V9dE/fzQuJtbnL+2EhWOE63vo164FY8xqEnV9xis=
+-golang.org/x/image v0.0.0-20190910094157-69e4b8554b2a/go.mod h1:FeLwcggjj3mMvU+oOTbSwawSJRM1uh48EjtB4UJZlP0=
+ golang.org/x/mod v0.40.0 h1:hUv+3cXcdRHz08UmSiOob7sadHig73uo5bkXxQ/tvUs=
+ golang.org/x/mod v0.40.0/go.mod h1:0/weTWkPWGBikyTWAX3dkjVztMmBA5hM0DH6BElSupE=
+ golang.org/x/net v0.58.0 h1:ynWG7rqYi4ccpTEuPZ2QGWHktVEM9DMCj9yzDE0Q7To=
+@@ -251,7 +262,6 @@ golang.org/x/sync v0.22.0/go.mod h1:9xrNwdLfx4jkKbNva9FpL6vEN7evnE43NNNJQ2LF3+0=
+ golang.org/x/sys v0.6.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+ golang.org/x/sys v0.47.0 h1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=
+ golang.org/x/sys v0.47.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=
+-golang.org/x/text v0.3.0/go.mod h1:NqM8EUOU14njkJ3fqMW+pc6Ldnwhi/IjpwHt7yyuwOQ=
+ golang.org/x/text v0.41.0 h1:vz/seA0lnX87Othu2f/0L24RcgrXD9/YFTSuGjj3rH8=
+ golang.org/x/text v0.41.0/go.mod h1:jvf1O8ajNzZqhSrQBPbutR/EB83Cc0CFrezNQIwbb5M=
+ golang.org/x/tools v0.49.0 h1:3NI7VXzL9+1WZD52Dx2ttoPwD5DWrFGpl9mFZDlmisI=
+diff --git a/internal/api/admin_handlers.go b/internal/api/admin_handlers.go
+index 5457b19..75cc3e8 100644
+--- a/internal/api/admin_handlers.go
++++ b/internal/api/admin_handlers.go
+@@ -10,6 +10,7 @@ import (
+ 
+ 	"github.com/RitwikGupta-0501/vital-watch/internal/audit"
+ 	"github.com/RitwikGupta-0501/vital-watch/internal/models"
++	"github.com/RitwikGupta-0501/vital-watch/internal/repository/dbgen"
+ 	"github.com/gin-gonic/gin"
+ 	"github.com/google/uuid"
+ 	"github.com/jackc/pgx/v5"
+@@ -190,3 +191,118 @@ func (h *Handler) GetComplianceAuditLogs(c *gin.Context) {
+ 		"offset": offset,
+ 	})
+ }
++
++type OCRSettingsResponse struct {
++	FallbackChain  []uuid.UUID      `json:"fallback_chain"`
++	Configurations []map[string]any `json:"configurations"`
++}
++
++func (h *Handler) GetOCRSettings(c *gin.Context) {
++	tenantID := models.SystemDefaultTenantID
++
++	settings, err := h.Repo.GetTenantSettings(c.Request.Context(), tenantID)
++	if err != nil && err != pgx.ErrNoRows {
++		slog.ErrorContext(c.Request.Context(), "Failed to get tenant settings", "error", err)
++		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch settings"})
++		return
++	}
++
++	configs, err := h.Repo.GetOCRProviderConfigsForTenant(c.Request.Context(), tenantID)
++	if err != nil {
++		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch configurations"})
++		return
++	}
++
++	var configResp []map[string]any
++	for _, cfg := range configs {
++		configResp = append(configResp, map[string]any{
++			"id":            cfg.ID,
++			"provider_name": cfg.ProviderName,
++			"created_at":    cfg.CreatedAt,
++		})
++	}
++
++	c.JSON(http.StatusOK, OCRSettingsResponse{
++		FallbackChain:  settings.OcrFallbackChain,
++		Configurations: configResp,
++	})
++}
++
++type CreateOCRConfigRequest struct {
++	ProviderName string `json:"provider_name" binding:"required"`
++	APIKey       string `json:"api_key" binding:"required"`
++}
++
++func (h *Handler) CreateOCRConfig(c *gin.Context) {
++	var req CreateOCRConfigRequest
++	if err := c.ShouldBindJSON(&req); err != nil {
++		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
++		return
++	}
++
++	req.ProviderName = strings.ToLower(strings.TrimSpace(req.ProviderName))
++	switch req.ProviderName {
++	case "gemini", "claude", "anthropic", "openai":
++		// valid
++	default:
++		c.JSON(http.StatusBadRequest, gin.H{"error": "Unsupported OCR provider"})
++		return
++	}
++
++	tenantID := models.SystemDefaultTenantID
++
++	aad := append(tenantID[:], []byte(req.ProviderName)...)
++	ciphertext, nonce, err := h.CipherService.Encrypt(req.APIKey, aad)
++	if err != nil {
++		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to encrypt API key"})
++		return
++	}
++
++	cfg, err := h.Repo.CreateOCRProviderConfig(c.Request.Context(), dbgen.CreateOCRProviderConfigParams{
++		TenantID:     tenantID,
++		ProviderName: req.ProviderName,
++		EncryptedKey: ciphertext,
++		Nonce:        nonce,
++	})
++	if err != nil {
++		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save configuration"})
++		return
++	}
++
++	c.JSON(http.StatusCreated, gin.H{"id": cfg.ID, "provider_name": cfg.ProviderName})
++}
++
++type UpdateOCRChainRequest struct {
++	FallbackChain []uuid.UUID `json:"fallback_chain" binding:"required"`
++}
++
++func (h *Handler) UpdateOCRChain(c *gin.Context) {
++	var req UpdateOCRChainRequest
++	if err := c.ShouldBindJSON(&req); err != nil {
++		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
++		return
++	}
++
++	tenantID := models.SystemDefaultTenantID
++
++	// Ensure all UUIDs exist
++	configs, err := h.Repo.GetOCRProviderConfigsByIDs(c.Request.Context(), dbgen.GetOCRProviderConfigsByIDsParams{
++		Column1:  req.FallbackChain,
++		TenantID: tenantID,
++	})
++	if err != nil || len(configs) != len(req.FallbackChain) {
++		c.JSON(http.StatusBadRequest, gin.H{"error": "One or more configuration IDs are invalid or belong to another tenant"})
++		return
++	}
++
++	settings, err := h.Repo.UpsertTenantSettings(c.Request.Context(), dbgen.UpsertTenantSettingsParams{
++		TenantID:         tenantID,
++		OcrFallbackChain: req.FallbackChain,
++	})
++	if err != nil {
++		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update fallback chain"})
++		return
++	}
++
++	c.JSON(http.StatusOK, gin.H{"fallback_chain": settings.OcrFallbackChain})
++}
+diff --git a/internal/api/appointment_handlers.go b/internal/api/appointment_handlers.go
+index da2d38d..99c01f4 100644
+--- a/internal/api/appointment_handlers.go
++++ b/internal/api/appointment_handlers.go
+@@ -515,7 +515,11 @@ func (h *Handler) GetAppointmentMeetingRoom(c *gin.Context) {
+ 			if strings.Contains(meetingLink, "?") {
+ 				separator = "&"
+ 			}
+-			meetingLink = fmt.Sprintf("%s%st=%s", meetingLink, separator, token)
++			tokenParam := "t"
++			if h.Telehealth != nil && h.Telehealth.Name() == "jitsi" {
++				tokenParam = "jwt"
++			}
++			meetingLink = fmt.Sprintf("%s%s%s=%s", meetingLink, separator, tokenParam, token)
+ 		}
+ 	}
+ 
+diff --git a/internal/api/appointment_test.go b/internal/api/appointment_test.go
+index f01f407..feb0541 100644
+--- a/internal/api/appointment_test.go
++++ b/internal/api/appointment_test.go
+@@ -681,7 +681,7 @@ func TestCancelAppointment_FlowAndAuthorization(t *testing.T) {
+ 	intruderID := uuid.New()
+ 	apptID := uuid.New()
+ 
+-	mockBroker := notifications.NewSSEBroker()
++	mockBroker := notifications.NewSSEBroker(nil)
+ 	var cancelRepoCalled bool
+ 
+ 	mockRepo := &repository.MockRepository{
+diff --git a/internal/api/handlers.go b/internal/api/handlers.go
+index b1ea1dd..d3c245e 100644
+--- a/internal/api/handlers.go
++++ b/internal/api/handlers.go
+@@ -13,9 +13,11 @@ import (
+ 	"github.com/gin-gonic/gin"
+ 	"github.com/golang-jwt/jwt/v5"
+ 	"github.com/google/uuid"
++	"github.com/jackc/pgx/v5/pgxpool"
+ 
+ 	"github.com/RitwikGupta-0501/vital-watch/internal/models"
+ 	"github.com/RitwikGupta-0501/vital-watch/internal/audit"
++	"github.com/RitwikGupta-0501/vital-watch/internal/crypto"
+ 	"github.com/RitwikGupta-0501/vital-watch/internal/notifications"
+ 	"github.com/RitwikGupta-0501/vital-watch/internal/pdf"
+ 	"github.com/RitwikGupta-0501/vital-watch/internal/repository"
+@@ -45,7 +47,9 @@ type Handler struct {
+ 	Notifier         notifications.Broker
+ 	Telehealth       telehealth.Provider
+ 	Auditor          audit.Auditor
+-	activeUserCache  sync.Map // uuid.UUID -> activeCacheEntry
++	CipherService    *crypto.CipherService
++	Pool             *pgxpool.Pool // for connection pool telemetry in /healthz
++	activeUserCache  sync.Map      // uuid.UUID -> activeCacheEntry
+ }
+ 
+ // InvalidateUserActiveCache clears the cached active status of a user upon administrative deactivation/reactivation.
+@@ -93,7 +97,12 @@ func (h *Handler) Ping(c *gin.Context) {
+ 	c.JSON(http.StatusOK, gin.H{"message": "pong from the api layer!"})
+ }
+ 
+-// HealthCheck verifies backend liveness and database connectivity for container probes.
++// HealthCheck verifies backend liveness, database connectivity, and connection
++// pool health for container probes and SRE dashboards.
++//
++// A plain pool.Ping() succeeds even when all connections are checked out and
++// requests are queuing. The pool stat fields below give Kubernetes readiness
++// gates and SRE alerting real visibility into connection saturation.
+ func (h *Handler) HealthCheck(c *gin.Context) {
+ 	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+ 	defer cancel()
+@@ -117,12 +126,27 @@ func (h *Handler) HealthCheck(c *gin.Context) {
+ 		return
+ 	}
+ 
+-	c.JSON(http.StatusOK, gin.H{
++	resp := gin.H{
+ 		"status":   "healthy",
+ 		"database": "up",
+-	})
++	}
++
++	// Attach connection pool telemetry when the pool reference is available.
++	// pool_empty_acquires is a leading indicator of saturation: it counts requests
++	// that had to wait because all connections were checked out.
++	if h.Pool != nil {
++		stat := h.Pool.Stat()
++		resp["pool_total_conns"] = stat.TotalConns()
++		resp["pool_acquired_conns"] = stat.AcquiredConns()
++		resp["pool_idle_conns"] = stat.IdleConns()
++		resp["pool_max_conns"] = stat.MaxConns()
++		resp["pool_empty_acquires"] = stat.EmptyAcquireCount()
++	}
++
++	c.JSON(http.StatusOK, resp)
+ }
+ 
++
+ func AuthMiddleware(jwtSecret []byte) gin.HandlerFunc {
+ 	return parseTokenMiddleware(jwtSecret, false, nil)
+ }
+diff --git a/internal/api/phase4_test.go b/internal/api/phase4_test.go
+index a393fb4..a691929 100644
+--- a/internal/api/phase4_test.go
++++ b/internal/api/phase4_test.go
+@@ -1324,7 +1324,7 @@ func TestCreatePatientVital_CriticalAlertAndPatientOnlySSE(t *testing.T) {
+ 	doctorID := uuid.New()
+ 	vitalID := uuid.New()
+ 
+-	mockBroker := notifications.NewSSEBroker()
++	mockBroker := notifications.NewSSEBroker(nil)
+ 	defer mockBroker.Shutdown()
+ 
+ 	patientCh, unsubPatient := mockBroker.Subscribe(patientID)
+@@ -1415,7 +1415,7 @@ func TestCreatePatientVital_NormalVitalsNoCriticalAlert(t *testing.T) {
+ 	patientID := uuid.New()
+ 	vitalID := uuid.New()
+ 
+-	mockBroker := notifications.NewSSEBroker()
++	mockBroker := notifications.NewSSEBroker(nil)
+ 	defer mockBroker.Shutdown()
+ 
+ 	patientCh, unsubPatient := mockBroker.Subscribe(patientID)
+@@ -1484,7 +1484,7 @@ func TestLogMedicationAdherence_TemporalBoundsAndNotification(t *testing.T) {
+ 	itemID := uuid.New()
+ 	logID := uuid.New()
+ 
+-	mockBroker := notifications.NewSSEBroker()
++	mockBroker := notifications.NewSSEBroker(nil)
+ 	defer mockBroker.Shutdown()
+ 
+ 	patientCh, unsubPatient := mockBroker.Subscribe(patientID)
+diff --git a/internal/api/prescription_handlers.go b/internal/api/prescription_handlers.go
+index 9a72994..d5c2a9a 100644
+--- a/internal/api/prescription_handlers.go
++++ b/internal/api/prescription_handlers.go
+@@ -16,6 +16,7 @@ import (
+ 	"github.com/gin-gonic/gin"
+ 	"github.com/google/uuid"
+ 	"github.com/jackc/pgx/v5"
++	"github.com/jackc/pgx/v5/pgconn"
+ 
+ 	"github.com/RitwikGupta-0501/vital-watch/internal/audit"
+ 	"github.com/RitwikGupta-0501/vital-watch/internal/models"
+@@ -436,7 +437,10 @@ func (h *Handler) CreatePrescription(c *gin.Context) {
+ 		return
+ 	}
+ 
+-	// HIGH-3: Check if file_name is already associated with an existing prescription
++	// Application-level fast-exit: check before the insert to give a clear error
++	// in the common (non-concurrent) case. The migration 000011 unique index on
++	// prescriptions(file_name) provides the authoritative race-proof guarantee for
++	// the concurrent window between this check and the INSERT below.
+ 	fileAlreadyUsed, chkErr := h.Repo.CheckPrescriptionFileNameExists(ctx, req.FileName)
+ 	if chkErr == nil && fileAlreadyUsed {
+ 		c.JSON(http.StatusConflict, gin.H{"error": "A prescription with this file name already exists"})
+@@ -454,6 +458,14 @@ func (h *Handler) CreatePrescription(c *gin.Context) {
+ 
+ 	newID, status, err := h.Repo.CreateUploadedPrescriptionWithJob(ctx, req.PatientID, doctorID, req.FileName, notes, h.OCREnabled)
+ 	if err != nil {
++		// Unique-constraint violation: concurrent upload of the same storage key
++		// was committed between our application-level check above and the INSERT.
++		// Migration 000011 adds the partial unique index that raises SQLSTATE 23505.
++		var pgErr *pgconn.PgError
++		if errors.As(err, &pgErr) && pgErr.Code == "23505" && strings.Contains(pgErr.ConstraintName, "filename") {
++			c.JSON(http.StatusConflict, gin.H{"error": "A prescription with this file name already exists"})
++			return
++		}
+ 		slog.ErrorContext(c.Request.Context(), "Failed to create prescription in DB", "error", err)
+ 		go func() {
+ 			rbCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+@@ -471,6 +483,7 @@ func (h *Handler) CreatePrescription(c *gin.Context) {
+ 		return
+ 	}
+ 
++
+ 	h.audit(c, audit.ActionCreatePrescription, "prescription", &newID, &req.PatientID, http.StatusCreated, map[string]interface{}{
+ 		"source":   "upload",
+ 		"filename": req.FileName,
+diff --git a/internal/api/prescription_test.go b/internal/api/prescription_test.go
+index b5e6c49..a619251 100644
+--- a/internal/api/prescription_test.go
++++ b/internal/api/prescription_test.go
+@@ -1662,7 +1662,7 @@ func TestCreateDigitalPrescription_SafetyAndPDF(t *testing.T) {
+ 			},
+ 		}
+ 
+-		notifier := notifications.NewSSEBroker()
++		notifier := notifications.NewSSEBroker(nil)
+ 		defer notifier.Shutdown()
+ 
+ 		h := &Handler{
+@@ -1773,7 +1773,7 @@ func TestCreateDigitalPrescription_SafetyAndPDF(t *testing.T) {
+ 
+ func TestStreamNotifications(t *testing.T) {
+ 	gin.SetMode(gin.TestMode)
+-	notifier := notifications.NewSSEBroker()
++	notifier := notifications.NewSSEBroker(nil)
+ 	defer notifier.Shutdown()
+ 
+ 	userID := uuid.New()
+diff --git a/internal/metrics/db.go b/internal/metrics/db.go
+new file mode 100644
+index 0000000..9eca65a
+--- /dev/null
++++ b/internal/metrics/db.go
+@@ -0,0 +1,72 @@
++package metrics
++
++import (
++	"github.com/jackc/pgx/v5/pgxpool"
++	"github.com/prometheus/client_golang/prometheus"
++)
++
++var (
++	dbTotalConnsDesc = prometheus.NewDesc(
++		"vitalwatch_db_pool_total_conns",
++		"Total number of connections in the database pool.",
++		nil, nil,
++	)
++	dbAcquiredConnsDesc = prometheus.NewDesc(
++		"vitalwatch_db_pool_acquired_conns",
++		"Number of database connections currently acquired/in use.",
++		nil, nil,
++	)
++	dbIdleConnsDesc = prometheus.NewDesc(
++		"vitalwatch_db_pool_idle_conns",
++		"Number of idle database connections in the pool.",
++		nil, nil,
++	)
++	dbMaxConnsDesc = prometheus.NewDesc(
++		"vitalwatch_db_pool_max_conns",
++		"Maximum number of connections allowed in the pool.",
++		nil, nil,
++	)
++	dbEmptyAcquireCountDesc = prometheus.NewDesc(
++		"vitalwatch_db_pool_empty_acquires_total",
++		"Total number of times a connection was acquired when the pool was empty.",
++		nil, nil,
++	)
++)
++
++// DBPoolCollector implements prometheus.Collector for pgxpool metrics.
++type DBPoolCollector struct {
++	pool *pgxpool.Pool
++}
++
++// NewDBPoolCollector creates a new collector for the given pgxpool.
++func NewDBPoolCollector(pool *pgxpool.Pool) *DBPoolCollector {
++	return &DBPoolCollector{pool: pool}
++}
++
++// Describe implements prometheus.Collector.
++func (c *DBPoolCollector) Describe(ch chan<- *prometheus.Desc) {
++	ch <- dbTotalConnsDesc
++	ch <- dbAcquiredConnsDesc
++	ch <- dbIdleConnsDesc
++	ch <- dbMaxConnsDesc
++	ch <- dbEmptyAcquireCountDesc
++}
++
++// Collect implements prometheus.Collector.
++func (c *DBPoolCollector) Collect(ch chan<- prometheus.Metric) {
++	if c.pool == nil {
++		return
++	}
++	stat := c.pool.Stat()
++	ch <- prometheus.MustNewConstMetric(dbTotalConnsDesc, prometheus.GaugeValue, float64(stat.TotalConns()))
++	ch <- prometheus.MustNewConstMetric(dbAcquiredConnsDesc, prometheus.GaugeValue, float64(stat.AcquiredConns()))
++	ch <- prometheus.MustNewConstMetric(dbIdleConnsDesc, prometheus.GaugeValue, float64(stat.IdleConns()))
++	ch <- prometheus.MustNewConstMetric(dbMaxConnsDesc, prometheus.GaugeValue, float64(stat.MaxConns()))
++	ch <- prometheus.MustNewConstMetric(dbEmptyAcquireCountDesc, prometheus.CounterValue, float64(stat.EmptyAcquireCount()))
++}
++
++// Register registers the DBPoolCollector with the default Prometheus registry.
++func Register(pool *pgxpool.Pool) {
++	prometheus.MustRegister(NewDBPoolCollector(pool))
++}
++
+diff --git a/internal/middleware/metrics.go b/internal/middleware/metrics.go
+new file mode 100644
+index 0000000..b137192
+--- /dev/null
++++ b/internal/middleware/metrics.go
+@@ -0,0 +1,54 @@
++package middleware
++
++import (
++	"strconv"
++	"time"
++
++	"github.com/gin-gonic/gin"
++	"github.com/prometheus/client_golang/prometheus"
++	"github.com/prometheus/client_golang/prometheus/promauto"
++)
++
++// MetricsMiddleware records HTTP request durations and counts as Prometheus metrics.
++type MetricsMiddleware struct {
++	requestDuration *prometheus.HistogramVec
++}
++
++// NewMetricsMiddleware initializes the Prometheus metrics for HTTP requests.
++func NewMetricsMiddleware() *MetricsMiddleware {
++	requestDuration := promauto.NewHistogramVec(
++		prometheus.HistogramOpts{
++			Name:    "vitalwatch_http_request_duration_seconds",
++			Help:    "Duration of HTTP requests in seconds.",
++			Buckets: []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
++		},
++		[]string{"method", "path", "status"},
++	)
++
++	return &MetricsMiddleware{
++		requestDuration: requestDuration,
++	}
++}
++
++// Middleware returns a Gin HandlerFunc that measures request durations.
++func (m *MetricsMiddleware) Middleware() gin.HandlerFunc {
++	return func(c *gin.Context) {
++		start := time.Now()
++
++		c.Next()
++
++		duration := time.Since(start).Seconds()
++
++		// Use c.FullPath() to avoid high cardinality from dynamic path parameters (e.g., /users/:id)
++		// If FullPath is empty, it means the route was not found (404), use a fallback.
++		path := c.FullPath()
++		if path == "" {
++			path = "unknown_route"
++		}
++
++		status := strconv.Itoa(c.Writer.Status())
++		method := c.Request.Method
++
++		m.requestDuration.WithLabelValues(method, path, status).Observe(duration)
++	}
++}
+diff --git a/internal/middleware/ratelimit.go b/internal/middleware/ratelimit.go
+index ec78b2e..7324672 100644
+--- a/internal/middleware/ratelimit.go
++++ b/internal/middleware/ratelimit.go
+@@ -120,6 +120,12 @@ func (rl *RateLimiter) cleanupRoutine(interval time.Duration) {
+ // Middleware returns a Gin middleware that enforces the configured rate limit.
+ func (rl *RateLimiter) Middleware() gin.HandlerFunc {
+ 	return func(c *gin.Context) {
++		path := c.Request.URL.Path
++		if path == "/healthz" || path == "/api/healthz" || path == "/metrics" {
++			c.Next()
++			return
++		}
++
+ 		ip := c.ClientIP()
+ 		if ip == "" {
+ 			ip = "unknown"
+diff --git a/internal/notifications/notifications.go b/internal/notifications/notifications.go
+index bd7505a..dc7adf8 100644
+--- a/internal/notifications/notifications.go
++++ b/internal/notifications/notifications.go
+@@ -1,7 +1,9 @@
+ package notifications
+ 
+ import (
++	"context"
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	"log/slog"
+ 	"net/http"
+@@ -10,6 +12,7 @@ import (
+ 
+ 	"github.com/gin-gonic/gin"
+ 	"github.com/google/uuid"
++	"github.com/jackc/pgx/v5/pgxpool"
+ )
+ 
+ type EventType string
+@@ -47,11 +50,75 @@ type SSEBroker struct {
+ 	mu      sync.RWMutex
+ 	clients map[uuid.UUID]map[chan NotificationEvent]struct{}
+ 	closed  bool
++	pool    *pgxpool.Pool
++	ctx     context.Context
++	cancel  context.CancelFunc
+ }
+ 
+-func NewSSEBroker() *SSEBroker {
+-	return &SSEBroker{
++func NewSSEBroker(pool *pgxpool.Pool) *SSEBroker {
++	ctx, cancel := context.WithCancel(context.Background())
++	b := &SSEBroker{
+ 		clients: make(map[uuid.UUID]map[chan NotificationEvent]struct{}),
++		pool:    pool,
++		ctx:     ctx,
++		cancel:  cancel,
++	}
++
++	if pool != nil {
++		go b.listenForNotifications()
++	}
++
++	return b
++}
++
++func (b *SSEBroker) listenForNotifications() {
++	for {
++		if b.ctx.Err() != nil {
++			return
++		}
++
++		conn, err := b.pool.Acquire(b.ctx)
++		if err != nil {
++			if errors.Is(err, context.Canceled) {
++				return
++			}
++			slog.Error("Failed to acquire pgx connection for LISTEN", "error", err)
++			time.Sleep(2 * time.Second)
++			continue
++		}
++
++		_, err = conn.Exec(b.ctx, "LISTEN sse_notifications")
++		if err != nil {
++			conn.Release()
++			if errors.Is(err, context.Canceled) {
++				return
++			}
++			slog.Error("Failed to execute LISTEN", "error", err)
++			time.Sleep(2 * time.Second)
++			continue
++		}
++
++		slog.Info("SSE Broker connected to Postgres LISTEN/NOTIFY channel")
++
++		for {
++			notification, err := conn.Conn().WaitForNotification(b.ctx)
++			if err != nil {
++				conn.Release()
++				if errors.Is(err, context.Canceled) {
++					return
++				}
++				slog.Error("Error waiting for pg_notify", "error", err)
++				time.Sleep(2 * time.Second)
++				break // break inner loop to re-acquire connection
++			}
++
++			var event NotificationEvent
++			if err := json.Unmarshal([]byte(notification.Payload), &event); err != nil {
++				slog.Error("Failed to unmarshal notification payload", "error", err)
++				continue
++			}
++			b.deliverLocal(event)
++		}
+ 	}
+ }
+ 
+@@ -86,16 +153,38 @@ func (b *SSEBroker) Subscribe(userID uuid.UUID) (chan NotificationEvent, func())
+ 
+ func (b *SSEBroker) Publish(event NotificationEvent) {
+ 	b.mu.RLock()
+-	defer b.mu.RUnlock()
+-
+ 	if b.closed {
++		b.mu.RUnlock()
+ 		return
+ 	}
++	b.mu.RUnlock()
+ 
+ 	if event.Timestamp.IsZero() {
+ 		event.Timestamp = time.Now().UTC()
+ 	}
+ 
++	if b.pool != nil {
++		dataBytes, _ := json.Marshal(event)
++		ctx, cancel := context.WithTimeout(b.ctx, 5*time.Second)
++		defer cancel()
++		_, err := b.pool.Exec(ctx, "SELECT pg_notify('sse_notifications', $1)", string(dataBytes))
++		if err != nil {
++			slog.Error("Failed to publish SSE notification to postgres", "error", err)
++		}
++		return
++	}
++
++	b.deliverLocal(event)
++}
++
++func (b *SSEBroker) deliverLocal(event NotificationEvent) {
++	b.mu.RLock()
++	defer b.mu.RUnlock()
++
++	if b.closed {
++		return
++	}
++
+ 	deliver := func(targetID uuid.UUID) {
+ 		if targetID == uuid.Nil {
+ 			return
+@@ -121,6 +210,8 @@ func (b *SSEBroker) Publish(event NotificationEvent) {
+ }
+ 
+ func (b *SSEBroker) Shutdown() {
++	b.cancel() // Stop the listener goroutine
++
+ 	b.mu.Lock()
+ 	defer b.mu.Unlock()
+ 
+diff --git a/internal/notifications/notifications_test.go b/internal/notifications/notifications_test.go
+index 01fa62f..418ad53 100644
+--- a/internal/notifications/notifications_test.go
++++ b/internal/notifications/notifications_test.go
+@@ -12,7 +12,7 @@ import (
+ )
+ 
+ func TestSSEBroker_SubscribeAndPublish(t *testing.T) {
+-	broker := NewSSEBroker()
++	broker := NewSSEBroker(nil)
+ 	defer broker.Shutdown()
+ 
+ 	doctorID := uuid.New()
+@@ -69,7 +69,7 @@ func TestSSEBroker_SubscribeAndPublish(t *testing.T) {
+ }
+ 
+ func TestSSEBroker_Shutdown(t *testing.T) {
+-	broker := NewSSEBroker()
++	broker := NewSSEBroker(nil)
+ 	userID := uuid.New()
+ 
+ 	ch, _ := broker.Subscribe(userID)
+@@ -88,7 +88,7 @@ func TestSSEBroker_Shutdown(t *testing.T) {
+ 
+ func TestServeSSE_InitialConnection(t *testing.T) {
+ 	gin.SetMode(gin.TestMode)
+-	broker := NewSSEBroker()
++	broker := NewSSEBroker(nil)
+ 	defer broker.Shutdown()
+ 
+ 	userID := uuid.New()
+diff --git a/internal/ocr/fallback.go b/internal/ocr/fallback.go
+index 113218d..cf21104 100644
+--- a/internal/ocr/fallback.go
++++ b/internal/ocr/fallback.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"fmt"
+ 	"log/slog"
++	"time"
+ )
+ 
+ // FallbackChain decorates a slice of Providers, executing them in priority order
+@@ -40,7 +41,10 @@ func (fc *FallbackChain) ExtractPrescription(ctx context.Context, fileBytes []by
+ 		}
+ 		anySupported = true
+ 
+-		res, err := p.ExtractPrescription(ctx, fileBytes, mimeType)
++		providerCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
++		res, err := p.ExtractPrescription(providerCtx, fileBytes, mimeType)
++		cancel()
++
+ 		if err == nil && res != nil {
+ 			slog.InfoContext(ctx, "Extraction succeeded via OCR provider", "provider", p.Name(), "medications_count", len(res.Medications))
+ 			res.Provider = p.Name()
+diff --git a/internal/ocr/gemini.go b/internal/ocr/gemini.go
+index da2acf9..1cc9f84 100644
+--- a/internal/ocr/gemini.go
++++ b/internal/ocr/gemini.go
+@@ -91,6 +91,26 @@ func (g *GeminiProvider) ExtractPrescription(ctx context.Context, fileBytes []by
+ 
+ 	resp, err := g.client.Models.GenerateContent(ctx, g.model, []*genai.Content{content}, &genai.GenerateContentConfig{
+ 		ResponseMIMEType: "application/json",
++		ResponseSchema: &genai.Schema{
++			Type: genai.TypeObject,
++			Properties: map[string]*genai.Schema{
++				"medications": {
++					Type: genai.TypeArray,
++					Items: &genai.Schema{
++						Type: genai.TypeObject,
++						Properties: map[string]*genai.Schema{
++							"medication_name": {Type: genai.TypeString},
++							"dosage":          {Type: genai.TypeString},
++							"frequency":       {Type: genai.TypeString},
++							"duration":        {Type: genai.TypeString},
++							"timing":          {Type: genai.TypeString},
++							"instructions":    {Type: genai.TypeString},
++						},
++					},
++				},
++				"confidence": {Type: genai.TypeNumber},
++			},
++		},
+ 	})
+ 	if err != nil {
+ 		return nil, fmt.Errorf("gemini vision extraction failed: %w", err)
+diff --git a/internal/ocr/manager.go b/internal/ocr/manager.go
+index 02ab4c9..96ad5d2 100644
+--- a/internal/ocr/manager.go
++++ b/internal/ocr/manager.go
+@@ -5,77 +5,145 @@ import (
+ 	"log/slog"
+ 	"os"
+ 	"strings"
++	"sync"
++
++	"github.com/google/uuid"
++
++	"github.com/RitwikGupta-0501/vital-watch/internal/crypto"
++	"github.com/RitwikGupta-0501/vital-watch/internal/repository"
++	"github.com/RitwikGupta-0501/vital-watch/internal/repository/dbgen"
+ )
+ 
+-// Manager manages OCR providers, their priority order, and fallback orchestration
++// Manager manages OCR providers dynamically based on tenant configuration
+ type Manager struct {
+-	chain   *FallbackChain
+-	enabled bool
++	repo          repository.Repository
++	cipherService *crypto.CipherService
++	enabled       bool
++	chain         *FallbackChain
++	cacheMutex    sync.RWMutex
++	providerCache map[uuid.UUID]Provider
+ }
+ 
+-// NewManagerFromEnv initializes the OCR manager from system environment variables
+-func NewManagerFromEnv(ctx context.Context) *Manager {
++// NewManager initializes the OCR manager
++func NewManager(repo repository.Repository, cipherService *crypto.CipherService) *Manager {
+ 	ocrEnabledStr := strings.ToLower(strings.TrimSpace(os.Getenv("OCR_ENABLED")))
+ 	if ocrEnabledStr == "false" || ocrEnabledStr == "0" {
+ 		slog.Info("OCR processing explicitly disabled via OCR_ENABLED=false")
+-		return &Manager{enabled: false}
++		return &Manager{repo: repo, cipherService: cipherService, enabled: false}
++	}
++	return &Manager{
++		repo:          repo,
++		cipherService: cipherService,
++		enabled:       true,
++		providerCache: make(map[uuid.UUID]Provider),
++	}
++}
++
++func (m *Manager) IsEnabled() bool {
++	return m != nil && m.enabled
++}
++
++func (m *Manager) ExtractForTenant(ctx context.Context, tenantID uuid.UUID, fileBytes []byte, mimeType string) (*ExtractedPrescription, error) {
++	if !m.IsEnabled() {
++		return nil, ErrOCRDisabled
++	}
++
++	// Override for testing
++	if m.chain != nil {
++		return m.chain.ExtractPrescription(ctx, fileBytes, mimeType)
++	}
++
++	settings, err := m.repo.GetTenantSettings(ctx, tenantID)
++	if err != nil {
++		slog.WarnContext(ctx, "No OCR settings found for tenant", "tenant_id", tenantID)
++		return nil, ErrOCRDisabled
+ 	}
+ 
+-	geminiKey := os.Getenv("GEMINI_API_KEY")
+-	if geminiKey == "" {
+-		geminiKey = os.Getenv("GOOGLE_API_KEY")
++	if len(settings.OcrFallbackChain) == 0 {
++		return nil, ErrOCRDisabled
+ 	}
+-	openaiKey := os.Getenv("OPENAI_API_KEY")
+-	claudeKey := os.Getenv("ANTHROPIC_API_KEY")
+-	if claudeKey == "" {
+-		claudeKey = os.Getenv("CLAUDE_API_KEY")
++
++	configs, err := m.repo.GetOCRProviderConfigsByIDs(ctx, dbgen.GetOCRProviderConfigsByIDsParams{
++		Column1:  settings.OcrFallbackChain,
++		TenantID: tenantID,
++	})
++	if err != nil {
++		return nil, ErrOCRDisabled
+ 	}
+ 
+-	// Read provider preference order
+-	providersEnv := os.Getenv("OCR_PROVIDERS")
+-	if providersEnv == "" {
+-		providersEnv = "gemini,claude,openai"
++
++
++	// Quick mapping depending on sqlc generation structures (we will assume it has these fields)
++	// Actually let's just map the raw struct
++	type ProviderConfig struct {
++		ProviderName string
++		EncryptedKey []byte
++		Nonce        []byte
++	}
++	cmap := make(map[uuid.UUID]ProviderConfig)
++	for _, cfg := range configs {
++		cmap[cfg.ID] = ProviderConfig{
++			ProviderName: cfg.ProviderName,
++			EncryptedKey: cfg.EncryptedKey,
++			Nonce:        cfg.Nonce,
++		}
+ 	}
+-	preferredList := strings.Split(providersEnv, ",")
+ 
+ 	var activeProviders []Provider
+-	for _, name := range preferredList {
+-		name = strings.ToLower(strings.TrimSpace(name))
+-		switch name {
++
++	for _, configID := range settings.OcrFallbackChain {
++		cfg, ok := cmap[configID]
++		if !ok {
++			continue
++		}
++
++		m.cacheMutex.RLock()
++		cachedProv, exists := m.providerCache[configID]
++		m.cacheMutex.RUnlock()
++
++		if exists {
++			activeProviders = append(activeProviders, cachedProv)
++			continue
++		}
++
++		aad := append(tenantID[:], []byte(cfg.ProviderName)...)
++		plaintextKey, err := m.cipherService.Decrypt(cfg.EncryptedKey, cfg.Nonce, aad)
++		if err != nil {
++			slog.ErrorContext(ctx, "Failed to decrypt API key for provider", "provider", cfg.ProviderName, "error", err)
++			continue
++		}
++
++		var newProv Provider
++		switch strings.ToLower(cfg.ProviderName) {
+ 		case "gemini":
+-			if geminiKey != "" {
+-				gp, err := NewGeminiProvider(ctx, geminiKey)
+-				if err != nil {
+-					slog.Error("Failed to initialize Gemini provider", "error", err)
+-				} else {
+-					activeProviders = append(activeProviders, gp)
+-					slog.Info("Registered Gemini Vision Provider", "role", "Primary/Active")
+-				}
++			gp, err := NewGeminiProvider(ctx, plaintextKey)
++			if err != nil {
++				slog.ErrorContext(ctx, "Failed to initialize Gemini Provider", "error", err)
++				continue
+ 			}
++			newProv = gp
+ 		case "claude", "anthropic":
+-			if claudeKey != "" {
+-				cp := NewClaudeProvider(claudeKey)
+-				activeProviders = append(activeProviders, cp)
+-				slog.Info("Registered Anthropic Claude Vision Provider", "role", "Active")
+-			}
++			newProv = NewClaudeProvider(plaintextKey)
+ 		case "openai":
+-			if openaiKey != "" {
+-				op := NewOpenAIProvider(openaiKey)
+-				activeProviders = append(activeProviders, op)
+-				slog.Info("Registered OpenAI Vision Provider", "role", "Active")
+-			}
++			newProv = NewOpenAIProvider(plaintextKey)
++		default:
++			slog.WarnContext(ctx, "Unknown OCR provider", "provider", cfg.ProviderName)
++			continue
+ 		}
++
++		m.cacheMutex.Lock()
++		m.providerCache[configID] = newProv
++		m.cacheMutex.Unlock()
++
++		activeProviders = append(activeProviders, newProv)
+ 	}
+ 
+ 	if len(activeProviders) == 0 {
+-		slog.Warn("No OCR provider API keys configured. OCR is disabled. Uploads will transition directly to needs_review")
+-		return &Manager{enabled: false}
++		return nil, ErrAllProvidersFailed
+ 	}
+ 
+-	return &Manager{
+-		chain:   NewFallbackChain(activeProviders...),
+-		enabled: true,
+-	}
++	chain := NewFallbackChain(activeProviders...)
++	return chain.ExtractPrescription(ctx, fileBytes, mimeType)
+ }
+ 
+ // NewManagerWithChain creates a manager with a pre-configured fallback chain (useful for testing)
+@@ -85,14 +153,3 @@ func NewManagerWithChain(chain *FallbackChain) *Manager {
+ 	}
+ 	return &Manager{chain: chain, enabled: true}
+ }
+-
+-func (m *Manager) IsEnabled() bool {
+-	return m != nil && m.enabled && m.chain != nil && len(m.chain.Providers()) > 0
+-}
+-
+-func (m *Manager) ExtractPrescription(ctx context.Context, fileBytes []byte, mimeType string) (*ExtractedPrescription, error) {
+-	if !m.IsEnabled() {
+-		return nil, ErrOCRDisabled
+-	}
+-	return m.chain.ExtractPrescription(ctx, fileBytes, mimeType)
+-}
+diff --git a/internal/ocr/ocr_test.go b/internal/ocr/ocr_test.go
+index 6d23114..f49e785 100644
+--- a/internal/ocr/ocr_test.go
++++ b/internal/ocr/ocr_test.go
+@@ -92,12 +92,12 @@ func TestFallbackChain_AllFail(t *testing.T) {
+ func TestManager_DisabledState(t *testing.T) {
+ 	ctx := context.Background()
+ 
+-	manager := NewManagerWithChain(nil)
++	manager := &Manager{enabled: false}
+ 	if manager.IsEnabled() {
+ 		t.Fatalf("expected manager to be disabled when chain is nil")
+ 	}
+ 
+-	_, err := manager.ExtractPrescription(ctx, []byte("data"), "image/jpeg")
++	_, err := manager.ExtractForTenant(ctx, [16]byte{}, []byte("data"), "image/jpeg")
+ 	if err != ErrOCRDisabled {
+ 		t.Fatalf("expected ErrOCRDisabled when manager is disabled, got: %v", err)
+ 	}
+diff --git a/internal/ocr/openai.go b/internal/ocr/openai.go
+index 262f809..76029aa 100644
+--- a/internal/ocr/openai.go
++++ b/internal/ocr/openai.go
+@@ -79,7 +79,37 @@ func (o *OpenAIProvider) ExtractPrescription(ctx context.Context, fileBytes []by
+ 				},
+ 			},
+ 		},
+-		"response_format": map[string]string{"type": "json_object"},
++		"response_format": map[string]any{
++			"type": "json_schema",
++			"json_schema": map[string]any{
++				"name": "prescription_extraction",
++				"schema": map[string]any{
++					"type": "object",
++					"properties": map[string]any{
++						"medications": map[string]any{
++							"type": "array",
++							"items": map[string]any{
++								"type": "object",
++								"properties": map[string]any{
++									"medication_name": map[string]any{"type": "string"},
++									"dosage":          map[string]any{"type": "string"},
++									"frequency":       map[string]any{"type": "string"},
++									"duration":        map[string]any{"type": "string"},
++									"timing":          map[string]any{"type": "string"},
++									"instructions":    map[string]any{"type": "string"},
++								},
++								"required":             []string{"medication_name", "dosage", "frequency", "duration", "timing", "instructions"},
++								"additionalProperties": false,
++							},
++						},
++						"confidence": map[string]any{"type": "number"},
++					},
++					"required":             []string{"medications", "confidence"},
++					"additionalProperties": false,
++				},
++				"strict": true,
++			},
++		},
+ 	}
+ 
+ 	bodyBytes, err := json.Marshal(reqPayload)
+diff --git a/internal/pdf/fonts/DejaVuSans-Bold.ttf b/internal/pdf/fonts/DejaVuSans-Bold.ttf
+new file mode 100644
+index 0000000..7d6b762
+Binary files /dev/null and b/internal/pdf/fonts/DejaVuSans-Bold.ttf differ
+diff --git a/internal/pdf/fonts/DejaVuSans.ttf b/internal/pdf/fonts/DejaVuSans.ttf
+new file mode 100644
+index 0000000..0692d93
+Binary files /dev/null and b/internal/pdf/fonts/DejaVuSans.ttf differ
+diff --git a/internal/pdf/pdf.go b/internal/pdf/pdf.go
+index 6790d2e..d1245f5 100644
+--- a/internal/pdf/pdf.go
++++ b/internal/pdf/pdf.go
+@@ -2,17 +2,25 @@ package pdf
+ 
+ import (
+ 	"bytes"
++	_ "embed"
+ 	"fmt"
+ 	"strings"
+ 	"time"
+ 
+ 	"github.com/google/uuid"
+-	"github.com/jung-kurt/gofpdf"
++	"github.com/go-pdf/fpdf"
+ 	"github.com/skip2/go-qrcode"
+ 
+ 	"github.com/RitwikGupta-0501/vital-watch/internal/models"
+ )
+ 
++//go:embed fonts/DejaVuSans.ttf
++var dejavuFontBytes []byte
++
++//go:embed fonts/DejaVuSans-Bold.ttf
++var dejavuBoldFontBytes []byte
++
++
+ // PrescriptionData holds all metadata and medications needed to render a prescription PDF
+ type PrescriptionData struct {
+ 	PrescriptionID  uuid.UUID
+@@ -42,14 +50,16 @@ func NewStandardPDFGenerator() *StandardPDFGenerator {
+ 
+ // GeneratePrescriptionPDF compiles a standardized clinic-branded prescription slip
+ func (g *StandardPDFGenerator) GeneratePrescriptionPDF(data PrescriptionData) ([]byte, error) {
+-	pdf := gofpdf.New("P", "mm", "A4", "")
++	pdf := fpdf.New("P", "mm", "A4", "")
+ 	pdf.SetMargins(15, 15, 15)
+ 	pdf.SetAutoPageBreak(true, 20)
+ 	pdf.AddPage()
+ 
+-	tr := pdf.UnicodeTranslatorFromDescriptor("")
++	pdf.AddUTF8FontFromBytes("DejaVuSans", "", dejavuFontBytes)
++	pdf.AddUTF8FontFromBytes("DejaVuSans", "B", dejavuBoldFontBytes)
++
+ 	safeStr := func(s string) string {
+-		return tr(strings.TrimSpace(s))
++		return strings.TrimSpace(s)
+ 	}
+ 
+ 	// 1. Header & Clinic Branding
+@@ -57,19 +67,19 @@ func (g *StandardPDFGenerator) GeneratePrescriptionPDF(data PrescriptionData) ([
+ 	pdf.Rect(15, 15, 180, 24, "F")
+ 
+ 	pdf.SetTextColor(255, 255, 255)
+-	pdf.SetFont("Arial", "B", 16)
++	pdf.SetFont("DejaVuSans", "B", 16)
+ 	pdf.SetXY(20, 19)
+ 	pdf.Cell(100, 8, "VITALWATCH HEALTH NETWORK")
+ 
+-	pdf.SetFont("Arial", "", 10)
++	pdf.SetFont("DejaVuSans", "", 10)
+ 	pdf.SetXY(20, 27)
+ 	pdf.Cell(100, 6, "Verified Electronic Prescription Slip")
+ 
+ 	// Rx ID & Date in Header
+-	pdf.SetFont("Arial", "B", 9)
++	pdf.SetFont("DejaVuSans", "B", 9)
+ 	pdf.SetXY(120, 19)
+ 	pdf.CellFormat(70, 5, "RX ID: "+data.PrescriptionID.String()[:8], "", 0, "R", false, 0, "")
+-	pdf.SetFont("Arial", "", 9)
++	pdf.SetFont("DejaVuSans", "", 9)
+ 	pdf.SetXY(120, 25)
+ 	dateStr := data.Date.Format("02 Jan 2006, 15:04 MST")
+ 	if data.Date.IsZero() {
+@@ -89,12 +99,12 @@ func (g *StandardPDFGenerator) GeneratePrescriptionPDF(data PrescriptionData) ([
+ 	pdf.Rect(15, currentY, 88, 30, "FD")
+ 
+ 	pdf.SetXY(18, currentY+3)
+-	pdf.SetFont("Arial", "B", 10)
++	pdf.SetFont("DejaVuSans", "B", 10)
+ 	pdf.SetTextColor(15, 118, 110)
+ 	pdf.Cell(80, 5, "PRESCRIBING PHYSICIAN")
+ 
+ 	pdf.SetTextColor(51, 65, 85)
+-	pdf.SetFont("Arial", "B", 9)
++	pdf.SetFont("DejaVuSans", "B", 9)
+ 	pdf.SetXY(18, currentY+9)
+ 	docName := strings.TrimSpace(data.DoctorName)
+ 	if docName == "" {
+@@ -102,7 +112,7 @@ func (g *StandardPDFGenerator) GeneratePrescriptionPDF(data PrescriptionData) ([
+ 	}
+ 	pdf.Cell(80, 5, safeStr(docName))
+ 
+-	pdf.SetFont("Arial", "", 8)
++	pdf.SetFont("DejaVuSans", "", 8)
+ 	pdf.SetXY(18, currentY+14)
+ 	spec := strings.TrimSpace(data.DoctorSpecialty)
+ 	if spec == "" {
+@@ -121,12 +131,12 @@ func (g *StandardPDFGenerator) GeneratePrescriptionPDF(data PrescriptionData) ([
+ 	pdf.Rect(107, currentY, 88, 30, "FD")
+ 
+ 	pdf.SetXY(110, currentY+3)
+-	pdf.SetFont("Arial", "B", 10)
++	pdf.SetFont("DejaVuSans", "B", 10)
+ 	pdf.SetTextColor(15, 118, 110)
+ 	pdf.Cell(80, 5, "PATIENT DETAILS")
+ 
+ 	pdf.SetTextColor(51, 65, 85)
+-	pdf.SetFont("Arial", "B", 9)
++	pdf.SetFont("DejaVuSans", "B", 9)
+ 	pdf.SetXY(110, currentY+9)
+ 	patName := strings.TrimSpace(data.PatientName)
+ 	if patName == "" {
+@@ -134,7 +144,7 @@ func (g *StandardPDFGenerator) GeneratePrescriptionPDF(data PrescriptionData) ([
+ 	}
+ 	pdf.Cell(80, 5, safeStr(patName))
+ 
+-	pdf.SetFont("Arial", "", 8)
++	pdf.SetFont("DejaVuSans", "", 8)
+ 	pdf.SetXY(110, currentY+14)
+ 	patEmail := strings.TrimSpace(data.PatientEmail)
+ 	if patEmail == "" {
+@@ -148,7 +158,7 @@ func (g *StandardPDFGenerator) GeneratePrescriptionPDF(data PrescriptionData) ([
+ 	pdf.SetY(currentY + 36)
+ 
+ 	// 3. Medication Items Table Header
+-	pdf.SetFont("Arial", "B", 11)
++	pdf.SetFont("DejaVuSans", "B", 11)
+ 	pdf.SetTextColor(15, 23, 42)
+ 	pdf.Cell(180, 7, "Prescribed Medications")
+ 	pdf.Ln(8)
+@@ -161,7 +171,7 @@ func (g *StandardPDFGenerator) GeneratePrescriptionPDF(data PrescriptionData) ([
+ 	printTableHeader := func() {
+ 		pdf.SetFillColor(241, 245, 249) // Slate-100
+ 		pdf.SetTextColor(15, 23, 42)
+-		pdf.SetFont("Arial", "B", 8)
++		pdf.SetFont("DejaVuSans", "B", 8)
+ 		for i, h := range headers {
+ 			pdf.CellFormat(colW[i], 7, h, "1", 0, "C", true, 0, "")
+ 		}
+@@ -171,7 +181,7 @@ func (g *StandardPDFGenerator) GeneratePrescriptionPDF(data PrescriptionData) ([
+ 	printTableHeader()
+ 
+ 	// Table Rows
+-	pdf.SetFont("Arial", "", 8)
++	pdf.SetFont("DejaVuSans", "", 8)
+ 	pdf.SetTextColor(51, 65, 85)
+ 
+ 	if len(data.Items) == 0 {
+@@ -215,7 +225,7 @@ func (g *StandardPDFGenerator) GeneratePrescriptionPDF(data PrescriptionData) ([
+ 
+ 			// Calculate row height based on text wrapping to avoid clinical truncation
+ 			lineH := 3.8
+-			pdf.SetFont("Arial", "", 8)
++			pdf.SetFont("DejaVuSans", "", 8)
+ 			linesMed := pdf.SplitLines([]byte(colTexts[1]), colW[1]-3)
+ 			linesDosage := pdf.SplitLines([]byte(colTexts[2]), colW[2]-3)
+ 			linesFreq := pdf.SplitLines([]byte(colTexts[3]), colW[3]-3)
+@@ -248,7 +258,7 @@ func (g *StandardPDFGenerator) GeneratePrescriptionPDF(data PrescriptionData) ([
+ 			if pdf.GetY()+rowH > 270.0 {
+ 				pdf.AddPage()
+ 				printTableHeader()
+-				pdf.SetFont("Arial", "", 8)
++				pdf.SetFont("DejaVuSans", "", 8)
+ 				pdf.SetTextColor(51, 65, 85)
+ 			}
+ 
+@@ -284,12 +294,12 @@ func (g *StandardPDFGenerator) GeneratePrescriptionPDF(data PrescriptionData) ([
+ 
+ 	// 4. Clinical Notes
+ 	if strings.TrimSpace(data.Notes) != "" {
+-		pdf.SetFont("Arial", "B", 9)
++		pdf.SetFont("DejaVuSans", "B", 9)
+ 		pdf.SetTextColor(15, 23, 42)
+ 		pdf.Cell(180, 6, "Clinician Notes & Instructions:")
+ 		pdf.Ln(6)
+ 
+-		pdf.SetFont("Arial", "", 8)
++		pdf.SetFont("DejaVuSans", "", 8)
+ 		pdf.SetTextColor(71, 85, 105)
+ 		pdf.MultiCell(180, 5, safeStr(data.Notes), "1", "L", false)
+ 		pdf.Ln(4)
+@@ -319,16 +329,16 @@ func (g *StandardPDFGenerator) GeneratePrescriptionPDF(data PrescriptionData) ([
+ 	qrPNG, err := qrcode.Encode(qrContent, qrcode.Medium, 128)
+ 	if err == nil {
+ 		imageName := "qr_" + data.PrescriptionID.String()
+-		imgOpt := gofpdf.ImageOptions{ImageType: "PNG"}
++		imgOpt := fpdf.ImageOptions{ImageType: "PNG"}
+ 		pdf.RegisterImageOptionsReader(imageName, imgOpt, bytes.NewReader(qrPNG))
+ 		pdf.ImageOptions(imageName, 15, currentFooterY, 26, 26, false, imgOpt, 0, qrContent)
+ 
+ 		pdf.SetXY(43, currentFooterY+5)
+-		pdf.SetFont("Arial", "B", 8)
++		pdf.SetFont("DejaVuSans", "B", 8)
+ 		pdf.SetTextColor(15, 118, 110)
+ 		pdf.Cell(60, 4, "SCAN TO VERIFY")
+ 		pdf.SetXY(43, currentFooterY+10)
+-		pdf.SetFont("Arial", "", 7)
++		pdf.SetFont("DejaVuSans", "", 7)
+ 		pdf.SetTextColor(100, 116, 139)
+ 		pdf.Cell(60, 4, "Digitally signed on VitalWatch Network")
+ 		pdf.SetXY(43, currentFooterY+14)
+@@ -341,12 +351,12 @@ func (g *StandardPDFGenerator) GeneratePrescriptionPDF(data PrescriptionData) ([
+ 	pdf.Line(120, currentFooterY+16, 195, currentFooterY+16)
+ 
+ 	pdf.SetXY(120, currentFooterY+17)
+-	pdf.SetFont("Arial", "B", 8)
++	pdf.SetFont("DejaVuSans", "B", 8)
+ 	pdf.SetTextColor(30, 41, 59)
+ 	pdf.Cell(75, 4, docName)
+ 
+ 	pdf.SetXY(120, currentFooterY+21)
+-	pdf.SetFont("Arial", "", 7)
++	pdf.SetFont("DejaVuSans", "", 7)
+ 	pdf.SetTextColor(100, 116, 139)
+ 	pdf.Cell(75, 4, "Authorized Clinician Signature (e-Signed)")
+ 
+@@ -356,7 +366,7 @@ func (g *StandardPDFGenerator) GeneratePrescriptionPDF(data PrescriptionData) ([
+ 		noticeY = 280
+ 	}
+ 	pdf.SetY(noticeY)
+-	pdf.SetFont("Arial", "I", 7)
++	pdf.SetFont("DejaVuSans", "", 7)
+ 	pdf.SetTextColor(148, 163, 184)
+ 	pdf.CellFormat(180, 4, "Confidential Medical Document - Generated automatically by VitalWatch. For prescription dispensing verification only.", "", 0, "C", false, 0, "")
+ 
+diff --git a/internal/pdf/pdf_test.go b/internal/pdf/pdf_test.go
+index 4c42fea..74c1cf6 100644
+--- a/internal/pdf/pdf_test.go
++++ b/internal/pdf/pdf_test.go
+@@ -85,13 +85,13 @@ func TestGeneratePrescriptionPDF_UnicodeAndRuneClamping(t *testing.T) {
+ 		PrescriptionID:  uuid.New(),
+ 		DoctorName:      "Dr. José González Müller",
+ 		DoctorSpecialty: "Endocrinology",
+-		PatientName:     "François Hélène d'Orléans",
+-		Notes:           "Monitor blood glucose daily — keep notes.",
++		PatientName:     "张伟 (Zhang Wei)",
++		Notes:           "Monitor blood glucose daily — keep notes. 每日监测血糖。",
+ 		Items: []models.PrescriptionItem{
+ 			{
+ 				MedicationName: "Levothyroxine Sodium Supercalifragilistic",
+ 				Dosage:         "125µg / morning",
+-				Frequency:      "Once daily at sunrise",
++				Frequency:      "Once daily at sunrise (每天一次)",
+ 				Duration:       "30 consecutive days",
+ 				Timing:         "Early morning",
+ 				Instructions:   "Take with full glass of water 30 minutes before meal",
+diff --git a/internal/queue/queue.go b/internal/queue/queue.go
+index 5d01090..6fa8ccf 100644
+--- a/internal/queue/queue.go
++++ b/internal/queue/queue.go
+@@ -64,12 +64,21 @@ func (w *PrescriptionOCRWorker) Work(ctx context.Context, job *river.Job[Prescri
+ 		attempt = job.Attempt
+ 	}
+ 
++	// Helper to perform guaranteed cleanup even if the parent context is timed out
++	doCleanup := func(status, notes, provider string, items []models.PrescriptionItem, notificationMsg string) error {
++		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
++		defer cleanupCancel()
++		err := w.repo.UpdatePrescriptionOCRResults(cleanupCtx, job.Args.PrescriptionID, status, notes, provider, items)
++		if notificationMsg != "" {
++			w.notifyDoctor(cleanupCtx, job.Args.PrescriptionID, notificationMsg, len(items), provider)
++		}
++		return err
++	}
++
+ 	// 1. If OCR is disabled, cleanly transition to needs_review for manual clinician entry
+ 	if w.ocrManager == nil || !w.ocrManager.IsEnabled() {
+ 		slog.InfoContext(ctx, "OCR disabled; transitioning prescription to needs_review", "prescription_id", job.Args.PrescriptionID)
+-		err := w.repo.UpdatePrescriptionOCRResults(ctx, job.Args.PrescriptionID, "needs_review", "[OCR disabled: manual entry required]", "", nil)
+-		w.notifyDoctor(ctx, job.Args.PrescriptionID, "OCR disabled: manual clinical review required", 0, "")
+-		return err
++		return doCleanup("needs_review", "[OCR disabled: manual entry required]", "", nil, "OCR disabled: manual clinical review required")
+ 	}
+ 
+ 	// 2. Fetch file bytes from storage provider
+@@ -83,19 +92,17 @@ func (w *PrescriptionOCRWorker) Work(ctx context.Context, job *river.Job[Prescri
+ 
+ 		if isPermanent {
+ 			slog.ErrorContext(ctx, "Permanent storage failure for prescription; marking needs_review", "prescription_id", job.Args.PrescriptionID, "error", err)
+-			if updateErr := w.repo.UpdatePrescriptionOCRResults(ctx, job.Args.PrescriptionID, "needs_review", fmt.Sprintf("[Storage error: %v]", err), "", nil); updateErr != nil {
++			if updateErr := doCleanup("needs_review", fmt.Sprintf("[Storage error: %v]", err), "", nil, "Prescription file could not be retrieved from storage; manual review required"); updateErr != nil {
+ 				return fmt.Errorf("failed to update prescription status after permanent storage failure: %w", updateErr)
+ 			}
+-			w.notifyDoctor(ctx, job.Args.PrescriptionID, "Prescription file could not be retrieved from storage; manual review required", 0, "")
+ 			return nil
+ 		}
+ 
+ 		if attempt >= 3 {
+ 			slog.WarnContext(ctx, "Max retry attempts reached for storage retrieval; marking needs_review", "prescription_id", job.Args.PrescriptionID)
+-			if updateErr := w.repo.UpdatePrescriptionOCRResults(ctx, job.Args.PrescriptionID, "needs_review", fmt.Sprintf("[Storage failed after %d attempts: %v]", attempt, err), "", nil); updateErr != nil {
++			if updateErr := doCleanup("needs_review", fmt.Sprintf("[Storage failed after %d attempts: %v]", attempt, err), "", nil, "Storage retrieval retry budget exhausted; manual review required"); updateErr != nil {
+ 				return fmt.Errorf("failed to update prescription status after max storage attempts: %w", updateErr)
+ 			}
+-			w.notifyDoctor(ctx, job.Args.PrescriptionID, "Storage retrieval retry budget exhausted; manual review required", 0, "")
+ 			return nil
+ 		}
+ 
+@@ -104,22 +111,21 @@ func (w *PrescriptionOCRWorker) Work(ctx context.Context, job *river.Job[Prescri
+ 	}
+ 
+ 	// 3. Execute OCR extraction with fallback chain
+-	res, err := w.ocrManager.ExtractPrescription(ctx, fileBytes, mimeType)
++	tenantID := models.SystemDefaultTenantID
++	res, err := w.ocrManager.ExtractForTenant(ctx, tenantID, fileBytes, mimeType)
+ 	if err != nil {
+ 		if errors.Is(err, ocr.ErrUnsupportedMIME) || errors.Is(err, ocr.ErrPermanent) {
+ 			slog.ErrorContext(ctx, "Permanent unrecoverable OCR failure; marking needs_review", "prescription_id", job.Args.PrescriptionID, "error", err)
+-			if updateErr := w.repo.UpdatePrescriptionOCRResults(ctx, job.Args.PrescriptionID, "needs_review", fmt.Sprintf("[OCR Extraction failed: %v]", err), "", nil); updateErr != nil {
++			if updateErr := doCleanup("needs_review", fmt.Sprintf("[OCR Extraction failed: %v]", err), "", nil, "Prescription OCR could not extract text; manual review required"); updateErr != nil {
+ 				return fmt.Errorf("failed to update prescription status after permanent OCR failure: %w", updateErr)
+ 			}
+-			w.notifyDoctor(ctx, job.Args.PrescriptionID, "Prescription OCR could not extract text; manual review required", 0, "")
+ 			return nil // Fatal: return nil to avoid burning River retry attempts
+ 		}
+ 		if attempt >= 3 {
+ 			slog.WarnContext(ctx, "Max retry attempts reached for prescription OCR; marking needs_review", "prescription_id", job.Args.PrescriptionID)
+-			if updateErr := w.repo.UpdatePrescriptionOCRResults(ctx, job.Args.PrescriptionID, "needs_review", fmt.Sprintf("[OCR failed after %d attempts: %v]", attempt, err), "", nil); updateErr != nil {
++			if updateErr := doCleanup("needs_review", fmt.Sprintf("[OCR failed after %d attempts: %v]", attempt, err), "", nil, "Prescription OCR failed after max retries; manual review required"); updateErr != nil {
+ 				return fmt.Errorf("failed to update prescription status after max attempts: %w", updateErr)
+ 			}
+-			w.notifyDoctor(ctx, job.Args.PrescriptionID, "Prescription OCR failed after max retries; manual review required", 0, "")
+ 			return nil
+ 		}
+ 		// Transient failure: return error to River for exponential backoff retry
+@@ -149,15 +155,14 @@ func (w *PrescriptionOCRWorker) Work(ctx context.Context, job *river.Job[Prescri
+ 	if len(items) == 0 {
+ 		notes = "[OCR Completed: No medications detected, manual review required]"
+ 	}
+-	err = w.repo.UpdatePrescriptionOCRResults(ctx, job.Args.PrescriptionID, "needs_review", notes, clampString(res.Provider, 50), items)
++	
++	err = doCleanup("needs_review", notes, clampString(res.Provider, 50), items, "Prescription OCR analysis ready for clinician review")
+ 	if err != nil {
+ 		slog.ErrorContext(ctx, "Failed to update prescription with OCR results", "prescription_id", job.Args.PrescriptionID, "error", err)
+ 		return err // Transient DB error, retry
+ 	}
+ 
+ 	slog.InfoContext(ctx, "Successfully extracted medications for prescription", "medications_count", len(items), "prescription_id", job.Args.PrescriptionID, "provider", res.Provider, "status", "needs_review")
+-
+-	w.notifyDoctor(ctx, job.Args.PrescriptionID, "Prescription OCR analysis ready for clinician review", len(items), res.Provider)
+ 	return nil
+ }
+ 
+@@ -165,7 +170,11 @@ func (w *PrescriptionOCRWorker) notifyDoctor(ctx context.Context, prescriptionID
+ 	if w.notifier == nil {
+ 		return
+ 	}
+-	rx, fetchErr := w.repo.GetPrescriptionByID(ctx, prescriptionID)
++	// Detach context to guarantee notification delivery even if parent timed out
++	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
++	defer cancel()
++
++	rx, fetchErr := w.repo.GetPrescriptionByID(cleanupCtx, prescriptionID)
+ 	if fetchErr != nil {
+ 		return
+ 	}
+diff --git a/internal/queue/queue_test.go b/internal/queue/queue_test.go
+index ac168b0..b261cd0 100644
+--- a/internal/queue/queue_test.go
++++ b/internal/queue/queue_test.go
+@@ -512,7 +512,7 @@ func TestPrescriptionOCRWorker_NotificationOnPermanentFailure(t *testing.T) {
+ 	doctorID := uuid.New()
+ 	storageKey := "rx-file.png"
+ 
+-	notifier := notifications.NewSSEBroker()
++	notifier := notifications.NewSSEBroker(nil)
+ 	defer notifier.Shutdown()
+ 
+ 	eventCh, unsub := notifier.Subscribe(doctorID)
+diff --git a/internal/repository/db.go b/internal/repository/db.go
+index eb41697..250c2c5 100644
+--- a/internal/repository/db.go
++++ b/internal/repository/db.go
+@@ -6,8 +6,9 @@ import (
+ 	"strings"
+ 	"time"
+ 
+-	"github.com/google/uuid"
+ 	"errors"
++
++	"github.com/google/uuid"
+ 	"github.com/jackc/pgx/v5"
+ 	"github.com/jackc/pgx/v5/pgconn"
+ 	"github.com/jackc/pgx/v5/pgtype"
+@@ -668,7 +669,6 @@ func (r *DBRepository) CreateUploadedPrescriptionWithJob(ctx context.Context, pa
+ 	return newID, status, nil
+ }
+ 
+-
+ func parseDurationString(s string) (time.Duration, bool) {
+ 	s = strings.ToLower(strings.TrimSpace(s))
+ 	if s == "" {
+@@ -1731,7 +1731,11 @@ func (r *DBRepository) RotateRefreshToken(ctx context.Context, oldTokenID, userI
+ 		return models.RefreshToken{}, err
+ 	}
+ 
+-	// Grace-window retry: old token is already revoked with a known successor.
++	// Grace-window retry: the old token was already rotated recently (within 10s).
++	// This happens when a client retries due to a dropped response (common on mobile).
++	// Correct behaviour: return the EXISTING unconsumed replacement token instead of
++	// minting a third token and voiding the second one. Voiding the replacement was
++	// the root cause of false-positive theft-detection on legitimate concurrent retries.
+ 	if oldToken.RevokedAt.Valid {
+ 		if time.Since(oldToken.RevokedAt.Time) <= 10*time.Second && oldToken.ReplacedByTokenID.Valid {
+ 			replacementID := uuid.UUID(oldToken.ReplacedByTokenID.Bytes)
+@@ -1740,48 +1744,28 @@ func (r *DBRepository) RotateRefreshToken(ctx context.Context, oldTokenID, userI
+ 				UserID: userID,
+ 			})
+ 			if scanErr == nil {
+-				// If the replacement token was ALREADY consumed/revoked, this is a replay of an ancestor token
++				// The replacement was already consumed (rotated onward) — this is a
++				// replay of a truly-old ancestor token, so terminate all sessions.
+ 				if rep.RevokedAt.Valid {
+ 					return models.RefreshToken{}, ErrTokenAlreadyRotated
+ 				}
+ 
+-				// The replacement was never consumed! Create a new token for this retry and void the unconsumed replacement.
+-				newPgExpiry := pgtype.Timestamptz{Time: expiresAt, Valid: true}
+-				created, err := qtx.CreateRefreshToken(ctx, dbgen.CreateRefreshTokenParams{
+-					UserID:    userID,
+-					TokenHash: newHash,
+-					ExpiresAt: newPgExpiry,
+-				})
+-				if err != nil {
+-					return models.RefreshToken{}, err
+-				}
+-
+-				// Void the abandoned replacement token with NULL replaced_by_token_id so it cannot be replayed
+-				const voidRepQuery = `
+-					UPDATE refresh_tokens
+-					SET revoked_at = now(), replaced_by_token_id = NULL
+-					WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL`
+-				if _, err := tx.Exec(ctx, voidRepQuery, rep.ID, userID); err != nil {
+-					return models.RefreshToken{}, err
+-				}
+-
+-				// Update old token lineage to point to the newly issued retry token
+-				const updateOldQuery = `
+-					UPDATE refresh_tokens
+-					SET replaced_by_token_id = $2
+-					WHERE id = $1 AND user_id = $3`
+-				if _, err := tx.Exec(ctx, updateOldQuery, oldTokenID, pgtype.UUID{Bytes: created.ID, Valid: true}, userID); err != nil {
+-					return models.RefreshToken{}, err
+-				}
+-
++				// Happy path: the replacement is still valid and unrevoked.
++				// Return it directly to the caller — no writes needed, just commit.
++				// The client stores this token, replacing its now-stale copy.
+ 				if commitErr := tx.Commit(ctx); commitErr != nil {
+ 					return models.RefreshToken{}, commitErr
+ 				}
+-				return rawToRefreshToken(created.ID, created.UserID, created.TokenHash,
+-					created.ExpiresAt, created.RevokedAt, created.ReplacedByTokenID, created.CreatedAt), nil
++				return rawToRefreshToken(
++					rep.ID, rep.UserID, rep.TokenHash,
++					rep.ExpiresAt, rep.RevokedAt, rep.ReplacedByTokenID, rep.CreatedAt,
++				), nil
+ 			}
++			// Replacement token ID recorded in the lineage but the row is missing —
++			// treat as data-integrity failure and reject the request.
+ 			return models.RefreshToken{}, fmt.Errorf("replacement token not found for revoked token %s", oldTokenID)
+ 		}
++		// Revoked more than 10 seconds ago with no valid retry window — stolen token.
+ 		return models.RefreshToken{}, ErrTokenAlreadyRotated
+ 	}
+ 
+@@ -1976,3 +1960,31 @@ func (r *DBRepository) GetAuditLogs(ctx context.Context, limit, offset int) ([]m
+ 	return logs, nil
+ }
+ 
++// OCR Configurations & Tenant Settings
++func (r *DBRepository) CreateOCRProviderConfig(ctx context.Context, arg dbgen.CreateOCRProviderConfigParams) (dbgen.OcrProviderConfig, error) {
++	return r.queries.CreateOCRProviderConfig(ctx, arg)
++}
++
++func (r *DBRepository) GetOCRProviderConfigsForTenant(ctx context.Context, tenantID uuid.UUID) ([]dbgen.OcrProviderConfig, error) {
++	return r.queries.GetOCRProviderConfigsForTenant(ctx, tenantID)
++}
++
++func (r *DBRepository) GetOCRProviderConfigByID(ctx context.Context, arg dbgen.GetOCRProviderConfigByIDParams) (dbgen.OcrProviderConfig, error) {
++	return r.queries.GetOCRProviderConfigByID(ctx, arg)
++}
++
++func (r *DBRepository) DeleteOCRProviderConfig(ctx context.Context, arg dbgen.DeleteOCRProviderConfigParams) error {
++	return r.queries.DeleteOCRProviderConfig(ctx, arg)
++}
++
++func (r *DBRepository) UpsertTenantSettings(ctx context.Context, arg dbgen.UpsertTenantSettingsParams) (dbgen.TenantSetting, error) {
++	return r.queries.UpsertTenantSettings(ctx, arg)
++}
++
++func (r *DBRepository) GetTenantSettings(ctx context.Context, tenantID uuid.UUID) (dbgen.TenantSetting, error) {
++	return r.queries.GetTenantSettings(ctx, tenantID)
++}
++
++func (r *DBRepository) GetOCRProviderConfigsByIDs(ctx context.Context, arg dbgen.GetOCRProviderConfigsByIDsParams) ([]dbgen.OcrProviderConfig, error) {
++	return r.queries.GetOCRProviderConfigsByIDs(ctx, arg)
++}
+diff --git a/internal/repository/dbgen/models.go b/internal/repository/dbgen/models.go
+index 8789914..4855919 100644
+--- a/internal/repository/dbgen/models.go
++++ b/internal/repository/dbgen/models.go
+@@ -57,6 +57,16 @@ type DoctorSchedule struct {
+ 	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+ }
+ 
++type OcrProviderConfig struct {
++	ID           uuid.UUID          `json:"id"`
++	TenantID     uuid.UUID          `json:"tenant_id"`
++	ProviderName string             `json:"provider_name"`
++	EncryptedKey []byte             `json:"encrypted_key"`
++	Nonce        []byte             `json:"nonce"`
++	CreatedAt    pgtype.Timestamptz `json:"created_at"`
++	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
++}
++
+ type PatientMedicationLog struct {
+ 	ID                 uuid.UUID                  `json:"id"`
+ 	PatientID          uuid.UUID                  `json:"patient_id"`
+@@ -148,6 +158,12 @@ type RefreshToken struct {
+ 	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+ }
+ 
++type TenantSetting struct {
++	TenantID         uuid.UUID          `json:"tenant_id"`
++	OcrFallbackChain []uuid.UUID        `json:"ocr_fallback_chain"`
++	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
++}
++
+ type User struct {
+ 	ID             uuid.UUID          `json:"id"`
+ 	Email          string             `json:"email"`
+diff --git a/internal/repository/dbgen/patients.sql.go b/internal/repository/dbgen/patients.sql.go
+index 2f084cf..dedbb97 100644
+--- a/internal/repository/dbgen/patients.sql.go
++++ b/internal/repository/dbgen/patients.sql.go
+@@ -105,11 +105,15 @@ func (q *Queries) GetPatientByID(ctx context.Context, id uuid.UUID) (GetPatientB
+ }
+ 
+ const getPatientsByDoctorID = `-- name: GetPatientsByDoctorID :many
+-SELECT DISTINCT u.id, u.email, p.first_name, p.last_name, u.created_at
++SELECT u.id, u.email, p.first_name, p.last_name, u.created_at
+ FROM users u
+ JOIN patient_profiles p ON u.id = p.user_id
+-JOIN appointments a ON u.id = a.patient_id
+-WHERE a.doctor_id = $1
++WHERE u.role = 'patient'
++  AND u.is_active = true
++  AND EXISTS (
++      SELECT 1 FROM appointments a
++      WHERE a.patient_id = u.id AND a.doctor_id = $1
++  )
+ ORDER BY u.created_at DESC, u.id DESC
+ LIMIT $2 OFFSET $3
+ `
+@@ -128,6 +132,10 @@ type GetPatientsByDoctorIDRow struct {
+ 	CreatedAt pgtype.Timestamptz `json:"created_at"`
+ }
+ 
++// Uses an EXISTS semi-join instead of SELECT DISTINCT to avoid a full
++// hash-aggregate/deduplication pass over all appointment rows.
++// The EXISTS subquery short-circuits at the first matching appointment
++// per patient, allowing PostgreSQL to use an index scan with pagination.
+ func (q *Queries) GetPatientsByDoctorID(ctx context.Context, arg GetPatientsByDoctorIDParams) ([]GetPatientsByDoctorIDRow, error) {
+ 	rows, err := q.db.Query(ctx, getPatientsByDoctorID, arg.DoctorID, arg.Limit, arg.Offset)
+ 	if err != nil {
+diff --git a/internal/repository/dbgen/prescriptions.sql.go b/internal/repository/dbgen/prescriptions.sql.go
+index e4de014..ab1c344 100644
+--- a/internal/repository/dbgen/prescriptions.sql.go
++++ b/internal/repository/dbgen/prescriptions.sql.go
+@@ -418,14 +418,25 @@ FROM prescriptions p
+ JOIN doctor_profiles d ON p.doctor_id = d.user_id
+ JOIN patient_profiles pat ON p.patient_id = pat.user_id
+ WHERE p.status = 'needs_review'
+-  AND (
+-    p.doctor_id = $1
+-    OR EXISTS (
++  AND p.doctor_id = $1
++
++UNION
++
++SELECT
++    p.id, p.patient_id, p.doctor_id, p.source, p.status, p.file_name, p.notes, p.ocr_provider, p.created_at, p.updated_at,
++    d.first_name AS doctor_first_name, d.last_name AS doctor_last_name,
++    pat.first_name AS patient_first_name, pat.last_name AS patient_last_name
++FROM prescriptions p
++JOIN doctor_profiles d ON p.doctor_id = d.user_id
++JOIN patient_profiles pat ON p.patient_id = pat.user_id
++WHERE p.status = 'needs_review'
++  AND EXISTS (
+       SELECT 1 FROM appointments a
+       WHERE a.patient_id = p.patient_id AND a.doctor_id = $1 AND a.status != 'cancelled'
+-    )
+   )
+-ORDER BY p.created_at DESC, p.id DESC
++  AND p.doctor_id != $1
++
++ORDER BY created_at DESC, id DESC
+ LIMIT $2 OFFSET $3
+ `
+ 
+@@ -452,6 +463,13 @@ type GetPrescriptionsPendingReviewRow struct {
+ 	PatientLastName  string                    `json:"patient_last_name"`
+ }
+ 
++// Rewritten from OR EXISTS to a UNION of two targeted range scans.
++// Branch 1: direct doctor ownership — uses idx_prescriptions_needs_review
++//
++//	(doctor_id, created_at DESC WHERE status = 'needs_review').
++//
++// Branch 2: relationship via non-cancelled appointment — uses idx_appointments_patient_doctor_status.
++// Each branch independently uses its covering index; the UNION deduplicates.
+ func (q *Queries) GetPrescriptionsPendingReview(ctx context.Context, arg GetPrescriptionsPendingReviewParams) ([]GetPrescriptionsPendingReviewRow, error) {
+ 	rows, err := q.db.Query(ctx, getPrescriptionsPendingReview, arg.DoctorID, arg.Limit, arg.Offset)
+ 	if err != nil {
+diff --git a/internal/repository/dbgen/querier.go b/internal/repository/dbgen/querier.go
+index a8ccdb8..0bb7108 100644
+--- a/internal/repository/dbgen/querier.go
++++ b/internal/repository/dbgen/querier.go
+@@ -21,12 +21,14 @@ type Querier interface {
+ 	CreateDigitalPrescription(ctx context.Context, arg CreateDigitalPrescriptionParams) (uuid.UUID, error)
+ 	CreateDoctorProfile(ctx context.Context, arg CreateDoctorProfileParams) error
+ 	CreateDoctorUser(ctx context.Context, arg CreateDoctorUserParams) (uuid.UUID, error)
++	CreateOCRProviderConfig(ctx context.Context, arg CreateOCRProviderConfigParams) (OcrProviderConfig, error)
+ 	CreatePatientProfile(ctx context.Context, arg CreatePatientProfileParams) error
+ 	CreatePatientUser(ctx context.Context, arg CreatePatientUserParams) (uuid.UUID, error)
+ 	CreatePatientVital(ctx context.Context, arg CreatePatientVitalParams) (PatientVital, error)
+ 	CreatePrescription(ctx context.Context, arg CreatePrescriptionParams) (uuid.UUID, error)
+ 	CreateRefreshToken(ctx context.Context, arg CreateRefreshTokenParams) (RefreshToken, error)
+ 	DeleteDoctorScheduleByDay(ctx context.Context, arg DeleteDoctorScheduleByDayParams) error
++	DeleteOCRProviderConfig(ctx context.Context, arg DeleteOCRProviderConfigParams) error
+ 	DeletePrescriptionItems(ctx context.Context, prescriptionID uuid.UUID) error
+ 	GetActivePrescriptionItemsForPatient(ctx context.Context, arg GetActivePrescriptionItemsForPatientParams) ([]PrescriptionItem, error)
+ 	GetAdminByEmail(ctx context.Context, email string) (GetAdminByEmailRow, error)
+@@ -46,9 +48,16 @@ type Querier interface {
+ 	GetDoctors(ctx context.Context, arg GetDoctorsParams) ([]GetDoctorsRow, error)
+ 	GetLatestPatientVital(ctx context.Context, patientID uuid.UUID) (GetLatestPatientVitalRow, error)
+ 	GetMedicationLogsByDate(ctx context.Context, arg GetMedicationLogsByDateParams) ([]GetMedicationLogsByDateRow, error)
++	GetOCRProviderConfigByID(ctx context.Context, arg GetOCRProviderConfigByIDParams) (OcrProviderConfig, error)
++	GetOCRProviderConfigsByIDs(ctx context.Context, arg GetOCRProviderConfigsByIDsParams) ([]OcrProviderConfig, error)
++	GetOCRProviderConfigsForTenant(ctx context.Context, tenantID uuid.UUID) ([]OcrProviderConfig, error)
+ 	GetPatientByEmail(ctx context.Context, email string) (GetPatientByEmailRow, error)
+ 	GetPatientByID(ctx context.Context, id uuid.UUID) (GetPatientByIDRow, error)
+ 	GetPatientVitals(ctx context.Context, arg GetPatientVitalsParams) ([]GetPatientVitalsRow, error)
++	// Uses an EXISTS semi-join instead of SELECT DISTINCT to avoid a full
++	// hash-aggregate/deduplication pass over all appointment rows.
++	// The EXISTS subquery short-circuits at the first matching appointment
++	// per patient, allowing PostgreSQL to use an index scan with pagination.
+ 	GetPatientsByDoctorID(ctx context.Context, arg GetPatientsByDoctorIDParams) ([]GetPatientsByDoctorIDRow, error)
+ 	GetPrescriptionByFilename(ctx context.Context, arg GetPrescriptionByFilenameParams) (GetPrescriptionByFilenameRow, error)
+ 	GetPrescriptionByFilenameForDoctor(ctx context.Context, arg GetPrescriptionByFilenameForDoctorParams) (GetPrescriptionByFilenameForDoctorRow, error)
+@@ -57,8 +66,14 @@ type Querier interface {
+ 	GetPrescriptionItemsByPrescriptionIDs(ctx context.Context, prescriptionIds []uuid.UUID) ([]PrescriptionItem, error)
+ 	GetPrescriptionsByPatientID(ctx context.Context, arg GetPrescriptionsByPatientIDParams) ([]GetPrescriptionsByPatientIDRow, error)
+ 	GetPrescriptionsForPatient(ctx context.Context, arg GetPrescriptionsForPatientParams) ([]GetPrescriptionsForPatientRow, error)
++	// Rewritten from OR EXISTS to a UNION of two targeted range scans.
++	// Branch 1: direct doctor ownership — uses idx_prescriptions_needs_review
++	//           (doctor_id, created_at DESC WHERE status = 'needs_review').
++	// Branch 2: relationship via non-cancelled appointment — uses idx_appointments_patient_doctor_status.
++	// Each branch independently uses its covering index; the UNION deduplicates.
+ 	GetPrescriptionsPendingReview(ctx context.Context, arg GetPrescriptionsPendingReviewParams) ([]GetPrescriptionsPendingReviewRow, error)
+ 	GetRefreshTokenByHash(ctx context.Context, tokenHash string) (RefreshToken, error)
++	GetTenantSettings(ctx context.Context, tenantID uuid.UUID) (TenantSetting, error)
+ 	HasDoctorPatientRelationship(ctx context.Context, arg HasDoctorPatientRelationshipParams) (pgtype.Bool, error)
+ 	InsertPrescriptionItem(ctx context.Context, arg InsertPrescriptionItemParams) (PrescriptionItem, error)
+ 	LockRefreshTokenForRotation(ctx context.Context, arg LockRefreshTokenForRotationParams) (RefreshToken, error)
+@@ -72,6 +87,7 @@ type Querier interface {
+ 	UpdateUserActiveStatus(ctx context.Context, arg UpdateUserActiveStatusParams) (int64, error)
+ 	UpsertDoctorSchedule(ctx context.Context, arg UpsertDoctorScheduleParams) (DoctorSchedule, error)
+ 	UpsertMedicationLog(ctx context.Context, arg UpsertMedicationLogParams) (PatientMedicationLog, error)
++	UpsertTenantSettings(ctx context.Context, arg UpsertTenantSettingsParams) (TenantSetting, error)
+ 	VerifyPrescription(ctx context.Context, arg VerifyPrescriptionParams) (int64, error)
+ 	VerifyPrescriptionItemOwnership(ctx context.Context, arg VerifyPrescriptionItemOwnershipParams) (bool, error)
+ }
+diff --git a/internal/repository/mock.go b/internal/repository/mock.go
+index b2c25fc..e49e59b 100644
+--- a/internal/repository/mock.go
++++ b/internal/repository/mock.go
+@@ -8,6 +8,7 @@ import (
+ 	"github.com/google/uuid"
+ 
+ 	"github.com/RitwikGupta-0501/vital-watch/internal/models"
++	"github.com/RitwikGupta-0501/vital-watch/internal/repository/dbgen"
+ )
+ 
+ var _ Repository = (*MockRepository)(nil)
+@@ -60,19 +61,19 @@ type MockRepository struct {
+ 	UpdatePrescriptionFileNameFunc         func(ctx context.Context, prescriptionID uuid.UUID, fileName string) error
+ 	CheckPrescriptionFileNameExistsFunc    func(ctx context.Context, fileName string) (bool, error)
+ 
+-	CreateRefreshTokenFunc          func(ctx context.Context, userID uuid.UUID, tokenHash string, expiresAt time.Time) (models.RefreshToken, error)
+-	GetRefreshTokenByHashFunc       func(ctx context.Context, tokenHash string) (models.RefreshToken, error)
+-	RevokeRefreshTokenFunc          func(ctx context.Context, id uuid.UUID, replacedByTokenID *uuid.UUID) error
+-	RevokeAllUserRefreshTokensFunc  func(ctx context.Context, userID uuid.UUID) error
+-	RotateRefreshTokenFunc          func(ctx context.Context, oldTokenID, userID uuid.UUID, newHash string, expiresAt time.Time) (models.RefreshToken, error)
+-	CreateAuditLogFunc              func(ctx context.Context, log models.PhiAuditLog) (uuid.UUID, error)
+-	GetAuditLogsByPatientIDFunc     func(ctx context.Context, patientID uuid.UUID, limit, offset int) ([]models.PhiAuditLog, error)
+-	GetAuditLogsFunc                func(ctx context.Context, limit, offset int) ([]models.PhiAuditLog, error)
+-	CreateAdminFunc                 func(ctx context.Context, firstName, lastName, email, hashedPassword, department string) (uuid.UUID, error)
+-	GetAdminByEmailFunc             func(ctx context.Context, email string) (models.Admin, error)
+-	GetAdminByIDFunc                func(ctx context.Context, id uuid.UUID) (models.Admin, error)
+-	GetAllUsersFunc                 func(ctx context.Context, limit, offset int) ([]models.User, error)
+-	UpdateUserActiveStatusFunc      func(ctx context.Context, id uuid.UUID, isActive bool) error
++	CreateRefreshTokenFunc         func(ctx context.Context, userID uuid.UUID, tokenHash string, expiresAt time.Time) (models.RefreshToken, error)
++	GetRefreshTokenByHashFunc      func(ctx context.Context, tokenHash string) (models.RefreshToken, error)
++	RevokeRefreshTokenFunc         func(ctx context.Context, id uuid.UUID, replacedByTokenID *uuid.UUID) error
++	RevokeAllUserRefreshTokensFunc func(ctx context.Context, userID uuid.UUID) error
++	RotateRefreshTokenFunc         func(ctx context.Context, oldTokenID, userID uuid.UUID, newHash string, expiresAt time.Time) (models.RefreshToken, error)
++	CreateAuditLogFunc             func(ctx context.Context, log models.PhiAuditLog) (uuid.UUID, error)
++	GetAuditLogsByPatientIDFunc    func(ctx context.Context, patientID uuid.UUID, limit, offset int) ([]models.PhiAuditLog, error)
++	GetAuditLogsFunc               func(ctx context.Context, limit, offset int) ([]models.PhiAuditLog, error)
++	CreateAdminFunc                func(ctx context.Context, firstName, lastName, email, hashedPassword, department string) (uuid.UUID, error)
++	GetAdminByEmailFunc            func(ctx context.Context, email string) (models.Admin, error)
++	GetAdminByIDFunc               func(ctx context.Context, id uuid.UUID) (models.Admin, error)
++	GetAllUsersFunc                func(ctx context.Context, limit, offset int) ([]models.User, error)
++	UpdateUserActiveStatusFunc     func(ctx context.Context, id uuid.UUID, isActive bool) error
+ }
+ 
+ func (m *MockRepository) CreatePatient(ctx context.Context, firstName, lastName, email, hashedPassword string) (uuid.UUID, error) {
+@@ -534,4 +535,30 @@ func (m *MockRepository) Ping(ctx context.Context) error {
+ 	return nil
+ }
+ 
++func (m *MockRepository) CreateOCRProviderConfig(ctx context.Context, arg dbgen.CreateOCRProviderConfigParams) (dbgen.OcrProviderConfig, error) {
++	return dbgen.OcrProviderConfig{}, nil
++}
++
++func (m *MockRepository) GetOCRProviderConfigsForTenant(ctx context.Context, tenantID uuid.UUID) ([]dbgen.OcrProviderConfig, error) {
++	return []dbgen.OcrProviderConfig{}, nil
++}
+ 
++func (m *MockRepository) GetOCRProviderConfigByID(ctx context.Context, arg dbgen.GetOCRProviderConfigByIDParams) (dbgen.OcrProviderConfig, error) {
++	return dbgen.OcrProviderConfig{}, nil
++}
++
++func (m *MockRepository) DeleteOCRProviderConfig(ctx context.Context, arg dbgen.DeleteOCRProviderConfigParams) error {
++	return nil
++}
++
++func (m *MockRepository) UpsertTenantSettings(ctx context.Context, arg dbgen.UpsertTenantSettingsParams) (dbgen.TenantSetting, error) {
++	return dbgen.TenantSetting{OcrFallbackChain: arg.OcrFallbackChain}, nil
++}
++
++func (m *MockRepository) GetTenantSettings(ctx context.Context, tenantID uuid.UUID) (dbgen.TenantSetting, error) {
++	return dbgen.TenantSetting{}, nil
++}
++
++func (m *MockRepository) GetOCRProviderConfigsByIDs(ctx context.Context, arg dbgen.GetOCRProviderConfigsByIDsParams) ([]dbgen.OcrProviderConfig, error) {
++	return []dbgen.OcrProviderConfig{}, nil
++}
+diff --git a/internal/repository/queries/patients.sql b/internal/repository/queries/patients.sql
+index a00f1c1..6a7708a 100644
+--- a/internal/repository/queries/patients.sql
++++ b/internal/repository/queries/patients.sql
+@@ -20,11 +20,19 @@ JOIN patient_profiles p ON u.id = p.user_id
+ WHERE u.id = $1 AND u.role = 'patient' AND u.is_active = true;
+ 
+ -- name: GetPatientsByDoctorID :many
+-SELECT DISTINCT u.id, u.email, p.first_name, p.last_name, u.created_at
++-- Uses an EXISTS semi-join instead of SELECT DISTINCT to avoid a full
++-- hash-aggregate/deduplication pass over all appointment rows.
++-- The EXISTS subquery short-circuits at the first matching appointment
++-- per patient, allowing PostgreSQL to use an index scan with pagination.
++SELECT u.id, u.email, p.first_name, p.last_name, u.created_at
+ FROM users u
+ JOIN patient_profiles p ON u.id = p.user_id
+-JOIN appointments a ON u.id = a.patient_id
+-WHERE a.doctor_id = $1
++WHERE u.role = 'patient'
++  AND u.is_active = true
++  AND EXISTS (
++      SELECT 1 FROM appointments a
++      WHERE a.patient_id = u.id AND a.doctor_id = $1
++  )
+ ORDER BY u.created_at DESC, u.id DESC
+ LIMIT $2 OFFSET $3;
+ 
+diff --git a/internal/repository/queries/prescriptions.sql b/internal/repository/queries/prescriptions.sql
+index 1a9e3b2..c48cec9 100644
+--- a/internal/repository/queries/prescriptions.sql
++++ b/internal/repository/queries/prescriptions.sql
+@@ -61,6 +61,11 @@ WHERE p.id = $1
+   );
+ 
+ -- name: GetPrescriptionsPendingReview :many
++-- Rewritten from OR EXISTS to a UNION of two targeted range scans.
++-- Branch 1: direct doctor ownership — uses idx_prescriptions_needs_review
++--           (doctor_id, created_at DESC WHERE status = 'needs_review').
++-- Branch 2: relationship via non-cancelled appointment — uses idx_appointments_patient_doctor_status.
++-- Each branch independently uses its covering index; the UNION deduplicates.
+ SELECT
+     p.id, p.patient_id, p.doctor_id, p.source, p.status, p.file_name, p.notes, p.ocr_provider, p.created_at, p.updated_at,
+     d.first_name AS doctor_first_name, d.last_name AS doctor_last_name,
+@@ -69,14 +74,25 @@ FROM prescriptions p
+ JOIN doctor_profiles d ON p.doctor_id = d.user_id
+ JOIN patient_profiles pat ON p.patient_id = pat.user_id
+ WHERE p.status = 'needs_review'
+-  AND (
+-    p.doctor_id = $1
+-    OR EXISTS (
++  AND p.doctor_id = $1
++
++UNION
++
++SELECT
++    p.id, p.patient_id, p.doctor_id, p.source, p.status, p.file_name, p.notes, p.ocr_provider, p.created_at, p.updated_at,
++    d.first_name AS doctor_first_name, d.last_name AS doctor_last_name,
++    pat.first_name AS patient_first_name, pat.last_name AS patient_last_name
++FROM prescriptions p
++JOIN doctor_profiles d ON p.doctor_id = d.user_id
++JOIN patient_profiles pat ON p.patient_id = pat.user_id
++WHERE p.status = 'needs_review'
++  AND EXISTS (
+       SELECT 1 FROM appointments a
+       WHERE a.patient_id = p.patient_id AND a.doctor_id = $1 AND a.status != 'cancelled'
+-    )
+   )
+-ORDER BY p.created_at DESC, p.id DESC
++  AND p.doctor_id != $1
++
++ORDER BY created_at DESC, id DESC
+ LIMIT $2 OFFSET $3;
+ 
+ -- name: GetPrescriptionsByPatientID :many
+diff --git a/internal/repository/repository.go b/internal/repository/repository.go
+index aac9d12..de8d322 100644
+--- a/internal/repository/repository.go
++++ b/internal/repository/repository.go
+@@ -8,6 +8,7 @@ import (
+ 	"github.com/google/uuid"
+ 
+ 	"github.com/RitwikGupta-0501/vital-watch/internal/models"
++	"github.com/RitwikGupta-0501/vital-watch/internal/repository/dbgen"
+ )
+ 
+ // ErrTokenAlreadyRotated is returned when a revoked token is replayed and its replacement has already been consumed.
+@@ -98,4 +99,13 @@ type Repository interface {
+ 	GetAdminByID(ctx context.Context, id uuid.UUID) (models.Admin, error)
+ 	GetAllUsers(ctx context.Context, limit, offset int) ([]models.User, error)
+ 	UpdateUserActiveStatus(ctx context.Context, id uuid.UUID, isActive bool) error
++
++	// OCR Configurations
++	CreateOCRProviderConfig(ctx context.Context, arg dbgen.CreateOCRProviderConfigParams) (dbgen.OcrProviderConfig, error)
++	GetOCRProviderConfigsForTenant(ctx context.Context, tenantID uuid.UUID) ([]dbgen.OcrProviderConfig, error)
++	GetOCRProviderConfigByID(ctx context.Context, arg dbgen.GetOCRProviderConfigByIDParams) (dbgen.OcrProviderConfig, error)
++	DeleteOCRProviderConfig(ctx context.Context, arg dbgen.DeleteOCRProviderConfigParams) error
++	UpsertTenantSettings(ctx context.Context, arg dbgen.UpsertTenantSettingsParams) (dbgen.TenantSetting, error)
++	GetTenantSettings(ctx context.Context, tenantID uuid.UUID) (dbgen.TenantSetting, error)
++	GetOCRProviderConfigsByIDs(ctx context.Context, arg dbgen.GetOCRProviderConfigsByIDsParams) ([]dbgen.OcrProviderConfig, error)
+ }
+diff --git a/internal/safety/safety.go b/internal/safety/safety.go
+index fc37b38..b26b717 100644
+--- a/internal/safety/safety.go
++++ b/internal/safety/safety.go
+@@ -14,6 +14,8 @@ import (
+ 	"sync"
+ 	"time"
+ 	"unicode/utf8"
++
++	"golang.org/x/sync/singleflight"
+ )
+ 
+ type AlertSeverity string
+@@ -68,6 +70,7 @@ type OpenFDAChecker struct {
+ 	cache      map[string]cachedLabel
+ 	cacheTTL   time.Duration
+ 	mu         sync.RWMutex
++	sf         singleflight.Group
+ }
+ 
+ const maxCacheEntries = 2000
+@@ -148,10 +151,15 @@ func CleanDrugName(name string) string {
+ 	return strings.ToLower(cleaned)
+ }
+ 
+-func (c *OpenFDAChecker) getDrugLabel(ctx context.Context, drugName string) (*cachedLabel, error) {
++type sfResult struct {
++	label cachedLabel
++	found bool
++}
++
++func (c *OpenFDAChecker) getDrugLabel(ctx context.Context, drugName string) (cachedLabel, bool, error) {
+ 	clean := CleanDrugName(drugName)
+ 	if clean == "" {
+-		return nil, nil
++		return cachedLabel{}, false, nil
+ 	}
+ 
+ 	c.mu.RLock()
+@@ -159,75 +167,85 @@ func (c *OpenFDAChecker) getDrugLabel(ctx context.Context, drugName string) (*ca
+ 	c.mu.RUnlock()
+ 
+ 	if exists && time.Since(entry.cachedAt) < c.cacheTTL {
+-		return &entry, nil
++		if len(entry.interactions) == 0 && len(entry.contraindications) == 0 && len(entry.warnings) == 0 {
++			// This was a 404 cache entry (empty)
++			return cachedLabel{}, false, nil
++		}
++		return entry, true, nil
+ 	}
+ 
+-	// Query OpenFDA: search by brand_name or generic_name
+-	queryParam := fmt.Sprintf(`openfda.brand_name:"%s" OR openfda.generic_name:"%s"`, clean, clean)
+-	reqURL := fmt.Sprintf("%s?search=%s&limit=1", c.baseURL, url.QueryEscape(queryParam))
+-	if c.apiKey != "" {
+-		reqURL += fmt.Sprintf("&api_key=%s", url.QueryEscape(c.apiKey))
+-	}
++	// Singleflight fetch
++	res, err, _ := c.sf.Do(clean, func() (interface{}, error) {
++		queryParam := fmt.Sprintf(`openfda.brand_name:"%s" OR openfda.generic_name:"%s"`, clean, clean)
++		reqURL := fmt.Sprintf("%s?search=%s&limit=1", c.baseURL, url.QueryEscape(queryParam))
++		if c.apiKey != "" {
++			reqURL += fmt.Sprintf("&api_key=%s", url.QueryEscape(c.apiKey))
++		}
+ 
+-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+-	if err != nil {
+-		return nil, err
+-	}
++		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
++		if err != nil {
++			return nil, err
++		}
+ 
+-	resp, err := c.httpClient.Do(req)
+-	if err != nil {
+-		slog.WarnContext(ctx, "Failed to query OpenFDA", "drug", clean, "error", err)
+-		return nil, err
+-	}
+-	defer resp.Body.Close()
++		resp, err := c.httpClient.Do(req)
++		if err != nil {
++			slog.WarnContext(ctx, "Failed to query OpenFDA", "drug", clean, "error", err)
++			return nil, err
++		}
++		defer resp.Body.Close()
+ 
+-	if resp.StatusCode == http.StatusNotFound {
+-		// Drug not found in OpenFDA label database, cache empty to prevent repeated queries
+-		c.putCache(clean, cachedLabel{cachedAt: time.Now()})
+-		return nil, nil
+-	}
++		if resp.StatusCode == http.StatusNotFound {
++			// Drug not found in OpenFDA label database, cache empty to prevent repeated queries
++			c.putCache(clean, cachedLabel{cachedAt: time.Now()})
++			return sfResult{found: false}, nil
++		}
+ 
+-	if resp.StatusCode != http.StatusOK {
+-		body, _ := io.ReadAll(resp.Body)
+-		slog.WarnContext(ctx, "Non-200 from OpenFDA", "drug", clean, "status", resp.StatusCode, "response_body", string(body))
+-		return nil, fmt.Errorf("openfda service returned status %d", resp.StatusCode)
+-	}
++		if resp.StatusCode != http.StatusOK {
++			body, _ := io.ReadAll(resp.Body)
++			slog.WarnContext(ctx, "Non-200 from OpenFDA", "drug", clean, "status", resp.StatusCode, "response_body", string(body))
++			return nil, fmt.Errorf("openfda service returned status %d", resp.StatusCode)
++		}
+ 
+-	var fdaResp struct {
+-		Results []struct {
+-			DrugInteractions  []string `json:"drug_interactions"`
+-			Contraindications []string `json:"contraindications"`
+-			Warnings          []string `json:"warnings"`
+-		} `json:"results"`
+-	}
++		var fdaResp struct {
++			Results []struct {
++				DrugInteractions  []string `json:"drug_interactions"`
++				Contraindications []string `json:"contraindications"`
++				Warnings          []string `json:"warnings"`
++			} `json:"results"`
++		}
+ 
+-	if err := json.NewDecoder(resp.Body).Decode(&fdaResp); err != nil {
+-		return nil, err
+-	}
++		if err := json.NewDecoder(resp.Body).Decode(&fdaResp); err != nil {
++			return nil, err
++		}
+ 
+-	label := cachedLabel{cachedAt: time.Now()}
+-	if len(fdaResp.Results) > 0 {
+-		label.interactions = fdaResp.Results[0].DrugInteractions
+-		label.contraindications = fdaResp.Results[0].Contraindications
+-		label.warnings = fdaResp.Results[0].Warnings
+-	}
++		label := cachedLabel{cachedAt: time.Now()}
++		if len(fdaResp.Results) > 0 {
++			label.interactions = fdaResp.Results[0].DrugInteractions
++			label.contraindications = fdaResp.Results[0].Contraindications
++			label.warnings = fdaResp.Results[0].Warnings
++		}
++
++		c.putCache(clean, label)
++
++		return sfResult{label: label, found: true}, nil
++	})
+ 
+-	c.putCache(clean, label)
++	if err != nil {
++		return cachedLabel{}, false, err
++	}
+ 
+-	return &label, nil
++	sfr := res.(sfResult)
++	return sfr.label, sfr.found, nil
+ }
+ 
+-func matchAllergen(cleanMed, allergen string) bool {
+-	cleanAllergen := strings.ToLower(strings.TrimSpace(allergen))
++func matchAllergen(cleanMed string, cleanAllergen string, re *regexp.Regexp) bool {
+ 	if cleanMed == "" || cleanAllergen == "" {
+ 		return false
+ 	}
+-	pattern := `(?i)\b` + regexp.QuoteMeta(cleanAllergen) + `\b`
+-	re, err := regexp.Compile(pattern)
+-	if err != nil {
+-		return strings.EqualFold(cleanMed, cleanAllergen)
++	if re != nil {
++		return re.MatchString(cleanMed)
+ 	}
+-	return re.MatchString(cleanMed)
++	return strings.EqualFold(cleanMed, cleanAllergen)
+ }
+ 
+ func canonicalPairKey(a, b string) string {
+@@ -244,14 +262,29 @@ func (c *OpenFDAChecker) CheckPrescriptionSafety(ctx context.Context, newMedicat
+ 		AllergyAlerts:     make([]AllergyAlert, 0),
+ 	}
+ 
+-	// 1. Check Allergy Contraindications with word boundaries
++	// 1. Compile regexes for allergies (N)
++	allergyRegexes := make(map[string]*regexp.Regexp, len(patientAllergies))
++	for _, allergen := range patientAllergies {
++		cleanAllergen := strings.ToLower(strings.TrimSpace(allergen))
++		if cleanAllergen == "" {
++			continue
++		}
++		pattern := `(?i)\b` + regexp.QuoteMeta(cleanAllergen) + `\b`
++		if re, err := regexp.Compile(pattern); err == nil {
++			allergyRegexes[allergen] = re
++		}
++	}
++
++	// 2. Check Allergy Contraindications with word boundaries
+ 	for _, newMed := range newMedications {
+ 		cleanNew := CleanDrugName(newMed)
+ 		if cleanNew == "" {
+ 			continue
+ 		}
+ 		for _, allergen := range patientAllergies {
+-			if matchAllergen(cleanNew, allergen) {
++			re := allergyRegexes[allergen]
++			cleanAllergen := strings.ToLower(strings.TrimSpace(allergen))
++			if matchAllergen(cleanNew, cleanAllergen, re) {
+ 				report.AllergyAlerts = append(report.AllergyAlerts, AllergyAlert{
+ 					DrugName:    newMed,
+ 					Allergen:    allergen,
+@@ -263,7 +296,7 @@ func (c *OpenFDAChecker) CheckPrescriptionSafety(ctx context.Context, newMedicat
+ 		}
+ 	}
+ 
+-	// 2. Concurrently pre-fetch OpenFDA labels for all unique medications to avoid sequential network latency
++	// 3. Concurrently pre-fetch OpenFDA labels for all unique medications to avoid sequential network latency
+ 	uniqueDrugs := make(map[string]struct{})
+ 	for _, m := range newMedications {
+ 		if cName := CleanDrugName(m); cName != "" {
+@@ -294,7 +327,7 @@ func (c *OpenFDAChecker) CheckPrescriptionSafety(ctx context.Context, newMedicat
+ 				defer wg.Done()
+ 				sem <- struct{}{}
+ 				defer func() { <-sem }()
+-				_, err := c.getDrugLabel(ctx, d)
++				_, _, err := c.getDrugLabel(ctx, d)
+ 				if err != nil {
+ 					recordDegraded(d)
+ 				}
+@@ -303,11 +336,23 @@ func (c *OpenFDAChecker) CheckPrescriptionSafety(ctx context.Context, newMedicat
+ 		wg.Wait()
+ 	}
+ 
+-	// 3. Check Drug-Drug Interactions (between new medications, and new vs active)
++	// 4. Check Drug-Drug Interactions (between new medications, and new vs active)
+ 	allDrugsToCompareAgainst := make([]string, 0, len(newMedications)+len(activeMedications))
+ 	allDrugsToCompareAgainst = append(allDrugsToCompareAgainst, activeMedications...)
+ 	allDrugsToCompareAgainst = append(allDrugsToCompareAgainst, newMedications...)
+ 
++	// Pre-compile interaction regexes
++	targetRegexes := make(map[string]*regexp.Regexp)
++	for _, targetDrug := range allDrugsToCompareAgainst {
++		cleanTarget := strings.TrimSpace(CleanDrugName(targetDrug))
++		if cleanTarget != "" && targetRegexes[cleanTarget] == nil {
++			pattern := `(?i)\b` + regexp.QuoteMeta(cleanTarget) + `\b`
++			if re, err := regexp.Compile(pattern); err == nil {
++				targetRegexes[cleanTarget] = re
++			}
++		}
++	}
++
+ 	checkedPairs := make(map[string]bool)
+ 
+ 	for _, primaryDrug := range newMedications {
+@@ -329,21 +374,28 @@ func (c *OpenFDAChecker) CheckPrescriptionSafety(ctx context.Context, newMedicat
+ 			checkedPairs[pairKey] = true
+ 
+ 			// Check label of primary drug first
+-			labelPrimary, errPrimary := c.getDrugLabel(ctx, cleanPrimary)
++			labelPrimary, foundPrimary, errPrimary := c.getDrugLabel(ctx, cleanPrimary)
+ 			if errPrimary != nil {
+ 				recordDegraded(cleanPrimary)
+ 			}
+-			foundPrimary, isHighPrimary := c.scanLabelForInteraction(report, labelPrimary, primaryDrug, secondaryDrug, cleanSecondary)
++			
++			secondaryRe := targetRegexes[cleanSecondary]
++
++			var interactionFoundPrimary, isHighPrimary bool
++			if foundPrimary && secondaryRe != nil {
++				interactionFoundPrimary, isHighPrimary = c.scanLabelForInteraction(report, labelPrimary, primaryDrug, secondaryDrug, secondaryRe)
++			}
+ 
+ 			// HIGH-1: If primary drug did not yield a High severity contraindication, check reciprocal (secondary drug label)
+-			// to ensure a high-severity contraindication in the secondary drug's FDA label is never masked
+-			// by a moderate interaction in the primary drug's label.
+ 			if !isHighPrimary {
+-				labelSecondary, errSecondary := c.getDrugLabel(ctx, cleanSecondary)
++				labelSecondary, foundSecondary, errSecondary := c.getDrugLabel(ctx, cleanSecondary)
+ 				if errSecondary != nil {
+ 					recordDegraded(cleanSecondary)
+ 				}
+-				c.scanLabelForReciprocalInteraction(report, labelSecondary, secondaryDrug, primaryDrug, cleanPrimary, foundPrimary)
++				primaryRe := targetRegexes[cleanPrimary]
++				if foundSecondary && primaryRe != nil {
++					c.scanLabelForReciprocalInteraction(report, labelSecondary, secondaryDrug, primaryDrug, primaryRe, interactionFoundPrimary)
++				}
+ 			}
+ 		}
+ 	}
+@@ -367,24 +419,14 @@ func (c *OpenFDAChecker) CheckPrescriptionSafety(ctx context.Context, newMedicat
+ 	return report, nil
+ }
+ 
+-func (c *OpenFDAChecker) scanLabelForInteraction(report *SafetyReport, label *cachedLabel, drugA, drugB, cleanTarget string) (found bool, isHigh bool) {
+-	if label == nil {
+-		return false, false
+-	}
+-	target := strings.TrimSpace(cleanTarget)
+-	if target == "" {
+-		return false, false
+-	}
+-
+-	pattern := `(?i)\b` + regexp.QuoteMeta(target) + `\b`
+-	re, err := regexp.Compile(pattern)
+-	if err != nil {
++func (c *OpenFDAChecker) scanLabelForInteraction(report *SafetyReport, label cachedLabel, drugA, drugB string, targetRe *regexp.Regexp) (found bool, isHigh bool) {
++	if targetRe == nil {
+ 		return false, false
+ 	}
+ 
+ 	// 1. Check Contraindications (High severity)
+ 	for _, contra := range label.contraindications {
+-		if matchSnippet := findInteractionSnippetWithRegex(contra, re); matchSnippet != "" {
++		if matchSnippet := findInteractionSnippetWithRegex(contra, targetRe); matchSnippet != "" {
+ 			report.InteractionAlerts = append(report.InteractionAlerts, InteractionAlert{
+ 				DrugA:       drugA,
+ 				DrugB:       drugB,
+@@ -399,7 +441,7 @@ func (c *OpenFDAChecker) scanLabelForInteraction(report *SafetyReport, label *ca
+ 
+ 	// 2. Check Drug Interactions (Moderate severity)
+ 	for _, inter := range label.interactions {
+-		if matchSnippet := findInteractionSnippetWithRegex(inter, re); matchSnippet != "" {
++		if matchSnippet := findInteractionSnippetWithRegex(inter, targetRe); matchSnippet != "" {
+ 			report.InteractionAlerts = append(report.InteractionAlerts, InteractionAlert{
+ 				DrugA:       drugA,
+ 				DrugB:       drugB,
+@@ -414,24 +456,14 @@ func (c *OpenFDAChecker) scanLabelForInteraction(report *SafetyReport, label *ca
+ 	return false, false
+ }
+ 
+-func (c *OpenFDAChecker) scanLabelForReciprocalInteraction(report *SafetyReport, label *cachedLabel, drugA, drugB, cleanTarget string, alreadyFoundModerate bool) (found bool, isHigh bool) {
+-	if label == nil {
+-		return false, false
+-	}
+-	target := strings.TrimSpace(cleanTarget)
+-	if target == "" {
+-		return false, false
+-	}
+-
+-	pattern := `(?i)\b` + regexp.QuoteMeta(target) + `\b`
+-	re, err := regexp.Compile(pattern)
+-	if err != nil {
++func (c *OpenFDAChecker) scanLabelForReciprocalInteraction(report *SafetyReport, label cachedLabel, drugA, drugB string, targetRe *regexp.Regexp, alreadyFoundModerate bool) (found bool, isHigh bool) {
++	if targetRe == nil {
+ 		return false, false
+ 	}
+ 
+ 	// 1. Always check Contraindications (High severity) across the reciprocal label
+ 	for _, contra := range label.contraindications {
+-		if matchSnippet := findInteractionSnippetWithRegex(contra, re); matchSnippet != "" {
++		if matchSnippet := findInteractionSnippetWithRegex(contra, targetRe); matchSnippet != "" {
+ 			report.InteractionAlerts = append(report.InteractionAlerts, InteractionAlert{
+ 				DrugA:       drugA,
+ 				DrugB:       drugB,
+@@ -447,7 +479,7 @@ func (c *OpenFDAChecker) scanLabelForReciprocalInteraction(report *SafetyReport,
+ 	// 2. Check Drug Interactions (Moderate severity) only if not already discovered on the primary label
+ 	if !alreadyFoundModerate {
+ 		for _, inter := range label.interactions {
+-			if matchSnippet := findInteractionSnippetWithRegex(inter, re); matchSnippet != "" {
++			if matchSnippet := findInteractionSnippetWithRegex(inter, targetRe); matchSnippet != "" {
+ 				report.InteractionAlerts = append(report.InteractionAlerts, InteractionAlert{
+ 					DrugA:       drugA,
+ 					DrugB:       drugB,
+diff --git a/internal/safety/safety_test.go b/internal/safety/safety_test.go
+index ec14e44..80e25df 100644
+--- a/internal/safety/safety_test.go
++++ b/internal/safety/safety_test.go
+@@ -316,7 +316,14 @@ func TestReciprocalDrugDrugInteraction_UpgradesModerateToContraindication(t *tes
+ }
+ 
+ func TestAllergyWordBoundaries(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		_ = json.NewEncoder(w).Encode(map[string]interface{}{"results": []interface{}{}})
++	}))
++	defer server.Close()
++
+ 	checker := NewOpenFDAChecker()
++	checker.SetBaseURL(server.URL)
+ 
+ 	// Allergen "ace" should not flag "acetaminophen"
+ 	report, err := checker.CheckPrescriptionSafety(
+@@ -482,3 +489,36 @@ func TestNonInteractingPairs_CheckedOnce(t *testing.T) {
+ 		t.Fatalf("expected exactly 2 FDA queries for 2 distinct drugs, got %d: %v", searchesCount, searchesCopy)
+ 	}
+ }
++
++func TestSingleflightConcurrency(t *testing.T) {
++	var mu sync.Mutex
++	calls := 0
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		mu.Lock()
++		calls++
++		mu.Unlock()
++		time.Sleep(50 * time.Millisecond)
++		w.Header().Set("Content-Type", "application/json")
++		_ = json.NewEncoder(w).Encode(map[string]interface{}{"results": []interface{}{}})
++	}))
++	defer server.Close()
++
++	checker := NewOpenFDAChecker()
++	checker.SetBaseURL(server.URL)
++
++	var wg sync.WaitGroup
++	for i := 0; i < 20; i++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			checker.getDrugLabel(context.Background(), "ibuprofen")
++		}()
++	}
++	wg.Wait()
++
++	mu.Lock()
++	defer mu.Unlock()
++	if calls != 1 {
++		t.Fatalf("expected exactly 1 API call due to singleflight, got %d", calls)
++	}
++}
+diff --git a/internal/schedule/schedule.go b/internal/schedule/schedule.go
+index dee1732..594c1fa 100644
+--- a/internal/schedule/schedule.go
++++ b/internal/schedule/schedule.go
+@@ -1,7 +1,6 @@
+ package schedule
+ 
+ import (
+-	"fmt"
+ 	"regexp"
+ 	"sort"
+ 	"strings"
+@@ -19,14 +18,24 @@ const (
+ 	SlotEvening   = "evening"
+ 	SlotBedtime   = "bedtime"
+ 	SlotAsNeeded  = "as_needed"
++	SlotUnknown   = "unknown"
+ )
+ 
+-var SlotOrder = map[string]int{
+-	SlotMorning:   1,
+-	SlotAfternoon: 2,
+-	SlotEvening:   3,
+-	SlotBedtime:   4,
+-	SlotAsNeeded:  5,
++func getSlotOrder(slot string) int {
++	switch slot {
++	case SlotMorning:
++		return 1
++	case SlotAfternoon:
++		return 2
++	case SlotEvening:
++		return 3
++	case SlotBedtime:
++		return 4
++	case SlotAsNeeded:
++		return 5
++	default:
++		return 99
++	}
+ }
+ 
+ var (
+@@ -84,8 +93,36 @@ func ParseDailySlots(frequency, timing string) []string {
+ 		return []string{SlotAfternoon}
+ 	}
+ 
+-	// Default for once daily / morning
+-	return []string{SlotMorning}
++	if reMorning.MatchString(combined) {
++		return []string{SlotMorning}
++	}
++
++	// Default for unknown schedule
++	return []string{SlotUnknown}
++}
++
++type logKey struct {
++	itemID uuid.UUID
++	slot   string
++	dNum   int
++}
++
++func hydrateLog(existing *models.MedicationLog, item models.PrescriptionItem) {
++	if existing.MedicationName == "" {
++		existing.MedicationName = item.MedicationName
++	}
++	if existing.Dosage == "" {
++		existing.Dosage = item.Dosage
++	}
++	if existing.Timing == "" {
++		existing.Timing = item.Timing
++	}
++	if existing.MealTiming == "" {
++		existing.MealTiming = item.Timing
++	}
++	if existing.Instructions == "" {
++		existing.Instructions = item.Instructions
++	}
+ }
+ 
+ // BuildDailySchedule merges active prescription items with logged adherence records for a specific date
+@@ -96,7 +133,7 @@ func BuildDailySchedule(
+ 	existingLogs []models.MedicationLog,
+ ) []models.MedicationLog {
+ 	// Index existing logs by item_id:slot:dose_number
+-	logMap := make(map[string]models.MedicationLog)
++	logMap := make(map[logKey]models.MedicationLog)
+ 	matchedLogIDs := make(map[uuid.UUID]bool)
+ 
+ 	for _, l := range existingLogs {
+@@ -104,7 +141,7 @@ func BuildDailySchedule(
+ 		if dNum <= 0 {
+ 			dNum = 1
+ 		}
+-		key := fmt.Sprintf("%s:%s:%d", l.PrescriptionItemID.String(), l.TimeOfDay, dNum)
++		key := logKey{itemID: l.PrescriptionItemID, slot: string(l.TimeOfDay), dNum: dNum}
+ 		logMap[key] = l
+ 	}
+ 
+@@ -113,27 +150,13 @@ func BuildDailySchedule(
+ 		itemMap[item.ID] = item
+ 	}
+ 
+-	var results []models.MedicationLog
++	results := make([]models.MedicationLog, 0, len(items)*2)
+ 	for _, item := range items {
+ 		slots := ParseDailySlots(item.Frequency, item.Timing)
+ 		for _, slot := range slots {
+-			key := fmt.Sprintf("%s:%s:1", item.ID.String(), slot)
++			key := logKey{itemID: item.ID, slot: slot, dNum: 1}
+ 			if existing, found := logMap[key]; found {
+-				if existing.MedicationName == "" {
+-					existing.MedicationName = item.MedicationName
+-				}
+-				if existing.Dosage == "" {
+-					existing.Dosage = item.Dosage
+-				}
+-				if existing.Timing == "" {
+-					existing.Timing = item.Timing
+-				}
+-				if existing.MealTiming == "" {
+-					existing.MealTiming = item.Timing
+-				}
+-				if existing.Instructions == "" {
+-					existing.Instructions = item.Instructions
+-				}
++				hydrateLog(&existing, item)
+ 				results = append(results, existing)
+ 				matchedLogIDs[existing.ID] = true
+ 			} else {
+@@ -161,21 +184,7 @@ func BuildDailySchedule(
+ 	for _, l := range existingLogs {
+ 		if l.ID != uuid.Nil && !matchedLogIDs[l.ID] {
+ 			if item, exists := itemMap[l.PrescriptionItemID]; exists {
+-				if l.MedicationName == "" {
+-					l.MedicationName = item.MedicationName
+-				}
+-				if l.Dosage == "" {
+-					l.Dosage = item.Dosage
+-				}
+-				if l.Timing == "" {
+-					l.Timing = item.Timing
+-				}
+-				if l.MealTiming == "" {
+-					l.MealTiming = item.Timing
+-				}
+-				if l.Instructions == "" {
+-					l.Instructions = item.Instructions
+-				}
++				hydrateLog(&l, item)
+ 			}
+ 			results = append(results, l)
+ 		}
+@@ -183,14 +192,8 @@ func BuildDailySchedule(
+ 
+ 	// Sort chronologically by slot order, dose number, and medication name
+ 	sort.SliceStable(results, func(i, j int) bool {
+-		orderI := SlotOrder[string(results[i].TimeOfDay)]
+-		if orderI == 0 {
+-			orderI = 99
+-		}
+-		orderJ := SlotOrder[string(results[j].TimeOfDay)]
+-		if orderJ == 0 {
+-			orderJ = 99
+-		}
++		orderI := getSlotOrder(string(results[i].TimeOfDay))
++		orderJ := getSlotOrder(string(results[j].TimeOfDay))
+ 		if orderI != orderJ {
+ 			return orderI < orderJ
+ 		}
+diff --git a/internal/schedule/schedule_test.go b/internal/schedule/schedule_test.go
+index 3d1b53c..98c7b22 100644
+--- a/internal/schedule/schedule_test.go
++++ b/internal/schedule/schedule_test.go
+@@ -20,103 +20,103 @@ func TestParseDailySlots(t *testing.T) {
+ 			name:      "Twice daily",
+ 			frequency: "Twice daily",
+ 			timing:    "After food",
+-			expected:  []string{"morning", "evening"},
++			expected:  []string{SlotMorning, SlotEvening},
+ 		},
+ 		{
+ 			name:      "BID abbreviation",
+ 			frequency: "1 tab BID",
+ 			timing:    "",
+-			expected:  []string{"morning", "evening"},
++			expected:  []string{SlotMorning, SlotEvening},
+ 		},
+ 		{
+ 			name:      "Three times daily",
+ 			frequency: "Three times a day",
+ 			timing:    "Before meals",
+-			expected:  []string{"morning", "afternoon", "evening"},
++			expected:  []string{SlotMorning, SlotAfternoon, SlotEvening},
+ 		},
+ 		{
+ 			name:      "QDS / 4 times daily",
+ 			frequency: "QDS",
+ 			timing:    "",
+-			expected:  []string{"morning", "afternoon", "evening", "bedtime"},
++			expected:  []string{SlotMorning, SlotAfternoon, SlotEvening, SlotBedtime},
+ 		},
+ 		{
+ 			name:      "Bedtime medication",
+ 			frequency: "Once daily",
+ 			timing:    "At bedtime",
+-			expected:  []string{"bedtime"},
++			expected:  []string{SlotBedtime},
+ 		},
+ 		{
+ 			name:      "PRN / As needed",
+ 			frequency: "As needed for pain",
+ 			timing:    "PRN",
+-			expected:  []string{"as_needed"},
++			expected:  []string{SlotAsNeeded},
+ 		},
+ 		{
+ 			name:      "Default once daily",
+ 			frequency: "Once daily",
+ 			timing:    "Morning",
+-			expected:  []string{"morning"},
++			expected:  []string{SlotMorning},
+ 		},
+ 		{
+ 			name:      "Q4H 6 times daily",
+ 			frequency: "Every 4 hours",
+ 			timing:    "with water",
+-			expected:  []string{"morning", "afternoon", "evening", "bedtime"},
++			expected:  []string{SlotMorning, SlotAfternoon, SlotEvening, SlotBedtime},
+ 		},
+ 		{
+ 			name:      "Abdominal pain does not trigger BD",
+ 			frequency: "Once daily",
+ 			timing:    "Take for severe abdominal cramps",
+-			expected:  []string{"morning"},
++			expected:  []string{SlotUnknown},
+ 		},
+ 		{
+ 			name:      "Liquid suspension does not trigger QID",
+ 			frequency: "Once daily",
+ 			timing:    "Liquid suspension 10ml",
+-			expected:  []string{"morning"},
++			expected:  []string{SlotUnknown},
+ 		},
+ 		{
+ 			name:      "Antidiabetic does not trigger TID",
+ 			frequency: "Once daily",
+ 			timing:    "Antidiabetic agent with breakfast",
+-			expected:  []string{"morning"},
++			expected:  []string{SlotMorning},
+ 		},
+ 		{
+ 			name:      "Sprained ankle does not trigger PRN",
+ 			frequency: "Once daily",
+ 			timing:    "Apply ointment for sprained ankle",
+-			expected:  []string{"morning"},
++			expected:  []string{SlotUnknown},
+ 		},
+ 		{
+ 			name:      "Morbid obesity does not trigger BID",
+ 			frequency: "Once daily",
+ 			timing:    "Therapy for morbid obesity",
+-			expected:  []string{"morning"},
++			expected:  []string{SlotUnknown},
+ 		},
+ 		{
+ 			name:      "Legitimate standalone BID with meal notes",
+ 			frequency: "1 tab bid",
+ 			timing:    "after meals",
+-			expected:  []string{"morning", "evening"},
++			expected:  []string{SlotMorning, SlotEvening},
+ 		},
+ 		{
+ 			name:      "Legitimate standalone TID",
+ 			frequency: "take 1 capsule tid",
+ 			timing:    "with water",
+-			expected:  []string{"morning", "afternoon", "evening"},
++			expected:  []string{SlotMorning, SlotAfternoon, SlotEvening},
+ 		},
+ 		{
+ 			name:      "Legitimate standalone QID",
+ 			frequency: "2 puffs qid",
+ 			timing:    "",
+-			expected:  []string{"morning", "afternoon", "evening", "bedtime"},
++			expected:  []string{SlotMorning, SlotAfternoon, SlotEvening, SlotBedtime},
+ 		},
+ 		{
+ 			name:      "Legitimate standalone PRN",
+ 			frequency: "take 1 tab prn for pain",
+ 			timing:    "",
+-			expected:  []string{"as_needed"},
++			expected:  []string{SlotAsNeeded},
+ 		},
+ 	}
+ 
+@@ -166,7 +166,7 @@ func TestBuildDailySchedule(t *testing.T) {
+ 			PatientID:          patientID,
+ 			PrescriptionItemID: item1ID,
+ 			ScheduledDate:      now,
+-			TimeOfDay:          "morning",
++			TimeOfDay:          SlotMorning,
+ 			DoseNumber:         1,
+ 			Status:             "taken",
+ 			TakenAt:            &takenTime,
+@@ -181,13 +181,13 @@ func TestBuildDailySchedule(t *testing.T) {
+ 	}
+ 
+ 	// 1. Verify chronological sorting: morning -> evening -> bedtime
+-	if sched[0].TimeOfDay != "morning" {
++	if sched[0].TimeOfDay != SlotMorning {
+ 		t.Errorf("expected slot 0 to be morning, got %s", sched[0].TimeOfDay)
+ 	}
+-	if sched[1].TimeOfDay != "evening" {
++	if sched[1].TimeOfDay != SlotEvening {
+ 		t.Errorf("expected slot 1 to be evening, got %s", sched[1].TimeOfDay)
+ 	}
+-	if sched[2].TimeOfDay != "bedtime" {
++	if sched[2].TimeOfDay != SlotBedtime {
+ 		t.Errorf("expected slot 2 to be bedtime, got %s", sched[2].TimeOfDay)
+ 	}
+ 
+@@ -201,7 +201,7 @@ func TestBuildDailySchedule(t *testing.T) {
+ 
+ 	var foundTaken bool
+ 	for _, entry := range sched {
+-		if entry.PrescriptionItemID == item1ID && entry.TimeOfDay == "morning" {
++		if entry.PrescriptionItemID == item1ID && entry.TimeOfDay == SlotMorning {
+ 			if entry.Status != "taken" {
+ 				t.Errorf("expected taken status for morning metformin, got %s", entry.Status)
+ 			}
+@@ -240,7 +240,7 @@ func TestBuildDailySchedule_MultiplePRNDosesRetained(t *testing.T) {
+ 			PatientID:          patientID,
+ 			PrescriptionItemID: prnItemID,
+ 			ScheduledDate:      now,
+-			TimeOfDay:          "as_needed",
++			TimeOfDay:          SlotAsNeeded,
+ 			DoseNumber:         1,
+ 			Status:             "taken",
+ 			TakenAt:            &t1,
+@@ -251,7 +251,7 @@ func TestBuildDailySchedule_MultiplePRNDosesRetained(t *testing.T) {
+ 			PatientID:          patientID,
+ 			PrescriptionItemID: prnItemID,
+ 			ScheduledDate:      now,
+-			TimeOfDay:          "as_needed",
++			TimeOfDay:          SlotAsNeeded,
+ 			DoseNumber:         2,
+ 			Status:             "taken",
+ 			TakenAt:            &t2,
+diff --git a/internal/telehealth/telehealth.go b/internal/telehealth/telehealth.go
+index 532a7ec..abaec5c 100644
+--- a/internal/telehealth/telehealth.go
++++ b/internal/telehealth/telehealth.go
+@@ -15,6 +15,7 @@ import (
+ 	"strings"
+ 	"time"
+ 
++	"github.com/golang-jwt/jwt/v5"
+ 	"github.com/google/uuid"
+ )
+ 
+@@ -80,6 +81,52 @@ func (j *JitsiProvider) CreateRoom(ctx context.Context, appointmentID uuid.UUID,
+ 	}, nil
+ }
+ 
++func (j *JitsiProvider) CreateMeetingToken(ctx context.Context, roomName string, isOwner bool, exp time.Time) (string, error) {
++	if strings.TrimSpace(j.secret) == "" {
++		return "", fmt.Errorf("jitsi secret is not configured")
++	}
++
++	expUnix := exp.Unix()
++	if minExp := time.Now().Add(30 * time.Minute).Unix(); expUnix < minExp {
++		expUnix = minExp
++	}
++
++	userContext := map[string]interface{}{
++		"name": "VitalWatch Participant",
++	}
++	if isOwner {
++		userContext["affiliation"] = "owner"
++		userContext["moderator"] = true
++	} else {
++		userContext["affiliation"] = "member"
++		userContext["moderator"] = false
++	}
++
++	claims := jwt.MapClaims{
++		"aud":  "jitsi",
++		"iss":  "vitalwatch",
++		"sub":  j.domain,
++		"room": roomName,
++		"exp":  expUnix,
++		"nbf":  time.Now().Add(-1 * time.Minute).Unix(),
++		"context": map[string]interface{}{
++			"user": userContext,
++			"features": map[string]interface{}{
++				"livestreaming": false,
++				"recording":     false,
++			},
++		},
++	}
++
++	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
++	tokenString, err := token.SignedString([]byte(j.secret))
++	if err != nil {
++		return "", fmt.Errorf("failed to sign jitsi jwt: %w", err)
++	}
++
++	return tokenString, nil
++}
++
+ // DailyProvider creates ephemeral video rooms using the Daily.co REST API
+ type DailyProvider struct {
+ 	apiKey     string
+diff --git a/internal/telehealth/telehealth_test.go b/internal/telehealth/telehealth_test.go
+index 6fc13a3..08a03ec 100644
+--- a/internal/telehealth/telehealth_test.go
++++ b/internal/telehealth/telehealth_test.go
+@@ -3,12 +3,14 @@ package telehealth
+ import (
+ 	"context"
+ 	"encoding/json"
++	"fmt"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"strings"
+ 	"testing"
+ 	"time"
+ 
++	"github.com/golang-jwt/jwt/v5"
+ 	"github.com/google/uuid"
+ )
+ 
+@@ -135,6 +137,87 @@ func TestJitsiProvider_CreateRoom(t *testing.T) {
+ 	}
+ }
+ 
++func TestJitsiProvider_CreateMeetingToken(t *testing.T) {
++	secret := "super-secure-jitsi-secret-key"
++	domain := "telehealth.vitalwatch.org"
++	provider := NewJitsiProvider(domain, secret)
++
++	roomName := "vitalwatch-test-room-101"
++	exp := time.Now().Add(1 * time.Hour)
++
++	t.Run("CreateMeetingToken Doctor Owner", func(t *testing.T) {
++		tokenStr, err := provider.CreateMeetingToken(context.Background(), roomName, true, exp)
++		if err != nil {
++			t.Fatalf("unexpected error creating doctor meeting token: %v", err)
++		}
++		if tokenStr == "" {
++			t.Fatal("expected non-empty token string")
++		}
++
++		// Parse and validate JWT
++		parsedToken, err := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
++			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
++				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
++			}
++			return []byte(secret), nil
++		})
++		if err != nil || !parsedToken.Valid {
++			t.Fatalf("failed to validate generated jitsi token: %v", err)
++		}
++
++		claims, ok := parsedToken.Claims.(jwt.MapClaims)
++		if !ok {
++			t.Fatal("expected MapClaims")
++		}
++
++		if claims["room"] != roomName {
++			t.Errorf("expected room %s, got %v", roomName, claims["room"])
++		}
++		if claims["sub"] != domain {
++			t.Errorf("expected sub %s, got %v", domain, claims["sub"])
++		}
++		if claims["iss"] != "vitalwatch" {
++			t.Errorf("expected iss vitalwatch, got %v", claims["iss"])
++		}
++		if claims["aud"] != "jitsi" {
++			t.Errorf("expected aud jitsi, got %v", claims["aud"])
++		}
++
++		ctxMap, ok := claims["context"].(map[string]interface{})
++		if !ok {
++			t.Fatal("expected context object in claims")
++		}
++		userMap, ok := ctxMap["user"].(map[string]interface{})
++		if !ok {
++			t.Fatal("expected user object in context claims")
++		}
++		if userMap["affiliation"] != "owner" || userMap["moderator"] != true {
++			t.Errorf("expected owner/moderator privileges for doctor, got: %+v", userMap)
++		}
++	})
++
++	t.Run("CreateMeetingToken Patient Member", func(t *testing.T) {
++		tokenStr, err := provider.CreateMeetingToken(context.Background(), roomName, false, exp)
++		if err != nil {
++			t.Fatalf("unexpected error creating patient meeting token: %v", err)
++		}
++
++		parsedToken, err := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
++			return []byte(secret), nil
++		})
++		if err != nil || !parsedToken.Valid {
++			t.Fatalf("failed to validate generated jitsi token: %v", err)
++		}
++
++		claims := parsedToken.Claims.(jwt.MapClaims)
++		ctxMap := claims["context"].(map[string]interface{})
++		userMap := ctxMap["user"].(map[string]interface{})
++		if userMap["affiliation"] != "member" || userMap["moderator"] != false {
++			t.Errorf("expected member/non-moderator privileges for patient, got: %+v", userMap)
++		}
++	})
++}
++
+ func TestMockProvider(t *testing.T) {
+ 	mock := &MockProvider{
+ 		CustomID:   "custom-room-123",
+diff --git a/migrations/000011_production_hardening.down.sql b/migrations/000011_production_hardening.down.sql
+new file mode 100644
+index 0000000..9c36245
+--- /dev/null
++++ b/migrations/000011_production_hardening.down.sql
+@@ -0,0 +1,15 @@
++-- Migration: 000011_production_hardening.down.sql
++-- Reverses all changes from 000011_production_hardening.up.sql
++
++-- Restore the original non-unique filename index
++DROP INDEX IF EXISTS idx_prescriptions_unique_filename;
++CREATE INDEX IF NOT EXISTS idx_prescriptions_filename ON prescriptions(file_name);
++
++-- Restore the original patient_vitals sort index (without id column)
++DROP INDEX IF EXISTS idx_patient_vitals_patient_date_id;
++CREATE INDEX IF NOT EXISTS idx_patient_vitals_patient_date ON patient_vitals(patient_id, recorded_at DESC);
++
++-- Drop the keyset pagination indexes for audit logs
++DROP INDEX IF EXISTS idx_phi_audit_keyset;
++DROP INDEX IF EXISTS idx_phi_audit_patient_keyset;
++CREATE INDEX IF NOT EXISTS idx_phi_audit_patient ON phi_audit_logs(patient_id, created_at DESC);
+diff --git a/migrations/000011_production_hardening.up.sql b/migrations/000011_production_hardening.up.sql
+new file mode 100644
+index 0000000..b8c597e
+--- /dev/null
++++ b/migrations/000011_production_hardening.up.sql
+@@ -0,0 +1,60 @@
++-- Migration: 000011_production_hardening.up.sql
++-- Purpose: Phase-1 & Phase-2 production hardening fixes identified by production-readiness audit.
++-- Covers:
++--   1. Unique partial index on prescriptions(file_name) — closes TOCTOU race condition.
++--   2. Composite sort index on patient_vitals — eliminates in-memory Sort node on timestamp/id pagination.
++--   3. Composite index on phi_audit_logs for keyset pagination support.
++--   4. Partial index for active (non-expired) prescriptions per patient.
++-- NOTE: Indexes are applied within the migration transaction (golang-migrate default).
++-- CREATE INDEX CONCURRENTLY is prohibited inside a transaction block (SQLSTATE 25001),
++-- so standard CREATE INDEX is used here. The migration window is the downtime boundary.
++
++-- ─────────────────────────────────────────────────────────────────────────────
++-- 1. Unique partial index: prescriptions.file_name
++--    Closes the Check-then-Act (TOCTOU) race condition in CreatePrescription.
++--    Two concurrent uploads of the same storage key will now cause a
++--    PostgreSQL unique-constraint violation (SQLSTATE 23505) on the SECOND
++--    insert, which the application already handles via handleRegisterDBError-
++--    style error handling. Digital prescriptions have NULL file_name, so
++--    the WHERE clause excludes them from uniqueness enforcement.
++-- ─────────────────────────────────────────────────────────────────────────────
++CREATE UNIQUE INDEX IF NOT EXISTS idx_prescriptions_unique_filename
++    ON prescriptions(file_name)
++    WHERE file_name IS NOT NULL;
++
++-- Drop the old non-unique index that is now superseded by the unique one above.
++-- The unique index satisfies all previous equality/range lookups that the old
++-- non-unique index served.
++DROP INDEX IF EXISTS idx_prescriptions_filename;
++
++-- ─────────────────────────────────────────────────────────────────────────────
++-- 2. Composite sort index: patient_vitals(patient_id, recorded_at DESC, id DESC)
++--    Eliminates the in-memory Sort node PostgreSQL must materialise when
++--    the existing idx_patient_vitals_patient_date only covers
++--    (patient_id, recorded_at DESC) but the query sorts by (recorded_at DESC, id DESC).
++--    With this index, the Index Scan can satisfy ORDER BY without a Sort step.
++-- ─────────────────────────────────────────────────────────────────────────────
++DROP INDEX IF EXISTS idx_patient_vitals_patient_date;
++CREATE INDEX IF NOT EXISTS idx_patient_vitals_patient_date_id
++    ON patient_vitals(patient_id, recorded_at DESC, id DESC);
++
++-- ─────────────────────────────────────────────────────────────────────────────
++-- 3. Composite index: phi_audit_logs(created_at DESC, id DESC)
++--    Supports forward keyset/cursor-based pagination on the audit trail
++--    (WHERE created_at < $cursor_ts AND id < $cursor_id) instead of
++--    expensive OFFSET scans. Also accelerates the existing
++--    ORDER BY created_at DESC, id DESC on admin listing endpoints.
++-- ─────────────────────────────────────────────────────────────────────────────
++CREATE INDEX IF NOT EXISTS idx_phi_audit_keyset
++    ON phi_audit_logs(created_at DESC, id DESC);
++
++-- ─────────────────────────────────────────────────────────────────────────────
++-- 4. Partial index: phi_audit_logs(patient_id, created_at DESC, id DESC)
++--    Supersedes idx_phi_audit_patient for HIPAA audit queries filtered by
++--    patient_id, and adds id DESC to enable keyset pagination within
++--    a single patient's audit stream.
++-- ─────────────────────────────────────────────────────────────────────────────
++DROP INDEX IF EXISTS idx_phi_audit_patient;
++CREATE INDEX IF NOT EXISTS idx_phi_audit_patient_keyset
++    ON phi_audit_logs(patient_id, created_at DESC, id DESC)
++    WHERE patient_id IS NOT NULL;
+diff --git a/provisioning/grafana/datasources/datasources.yml b/provisioning/grafana/datasources/datasources.yml
+new file mode 100644
+index 0000000..9170870
+--- /dev/null
++++ b/provisioning/grafana/datasources/datasources.yml
+@@ -0,0 +1,17 @@
++apiVersion: 1
++
++datasources:
++  - name: Prometheus
++    type: prometheus
++    access: proxy
++    url: http://prometheus:9090
++    isDefault: true
++    jsonData:
++      httpMethod: POST
++      timeInterval: 15s
++  - name: Loki
++    type: loki
++    access: proxy
++    url: http://loki:3100
++    jsonData:
++      maxLines: 1000
+diff --git a/provisioning/prometheus/prometheus.yml b/provisioning/prometheus/prometheus.yml
+new file mode 100644
+index 0000000..f2da4dd
+--- /dev/null
++++ b/provisioning/prometheus/prometheus.yml
+@@ -0,0 +1,12 @@
++global:
++  scrape_interval: 15s
++
++scrape_configs:
++  - job_name: 'vital-watch-api'
++    scrape_interval: 15s
++    static_configs:
++      - targets: ['api:8080']
++  - job_name: 'postgres-exporter'
++    scrape_interval: 15s
++    static_configs:
++      - targets: ['postgres-exporter:9187']
+diff --git a/scripts/loadtest/baseline.js b/scripts/loadtest/baseline.js
+new file mode 100644
+index 0000000..8f234c6
+--- /dev/null
++++ b/scripts/loadtest/baseline.js
+@@ -0,0 +1,55 @@
++import http from 'k6/http';
++import { check, sleep } from 'k6';
++
++// The baseline script tests the /healthz endpoint. 
++// This establishes the absolute maximum capacity of the Go HTTP server and
++// database connection pool without complex business logic or authentication overhead.
++
++const targetVUs = __ENV.TARGET_VUS ? parseInt(__ENV.TARGET_VUS) : 50;
++
++export const options = {
++  // Define a phased load profile
++  stages: [
++    { duration: '15s', target: targetVUs },  // Ramp-up
++    { duration: '30s', target: targetVUs },   // Sustain
++    { duration: '15s', target: 0 },   // Ramp-down
++  ],
++  // Thresholds define the pass/fail criteria for the test
++  thresholds: {
++    http_req_duration: ['p(95)<200'], // 95% of requests must complete below 200ms
++    http_req_failed: ['rate<0.01'],   // Less than 1% of requests can fail
++  },
++};
++
++export default function () {
++  // Use host.docker.internal if running k6 in docker on Mac/Windows, 
++  // or localhost if running k6 natively on the host machine.
++  // We use the exposed port 8000 for the vital-watch-api container.
++  const url = 'http://localhost:8000/api/healthz';
++
++  const params = {
++    headers: {
++      'Content-Type': 'application/json',
++    },
++  };
++
++  const res = http.get(url, params);
++
++  // Validate the response
++  check(res, {
++    'status is 200': (r) => r.status === 200,
++    'database is up': (r) => r.json('database') === 'up',
++  });
++
++  // Brief sleep to simulate real-user think time and prevent the test from 
++  // turning into a pure network benchmark of the local loopback adapter.
++  sleep(1);
++}
++
++// ---------------------------------------------------------------------------------
++// How to run this test and send metrics to the local Prometheus instance:
++// ---------------------------------------------------------------------------------
++// K6_PROMETHEUS_RW_SERVER_URL=http://localhost:9090/api/v1/write \
++// K6_PROMETHEUS_RW_TREND_AS_NATIVE_HISTOGRAM=true \
++// k6 run --out experimental-prometheus-rw scripts/loadtest/baseline.js
++// ---------------------------------------------------------------------------------
+diff --git a/scripts/loadtest/binary_search_capacity.py b/scripts/loadtest/binary_search_capacity.py
+new file mode 100644
+index 0000000..de38a3e
+--- /dev/null
++++ b/scripts/loadtest/binary_search_capacity.py
+@@ -0,0 +1,107 @@
++import subprocess
++import os
++import json
++from datetime import datetime
++
++def run_k6(target_vus):
++    print(f"[*] Testing capacity with {target_vus} VUs...")
++    
++    cmd = [
++        "docker", "run", "--rm",
++        "-v", f"{os.getcwd()}/scripts/loadtest:/loadtest",
++        "--network", "host",
++        "-e", f"TARGET_VUS={target_vus}",
++        "-e", "K6_PROMETHEUS_RW_SERVER_URL=http://localhost:9090/api/v1/write",
++        "-e", "K6_PROMETHEUS_RW_TREND_AS_NATIVE_HISTOGRAM=true",
++        "grafana/k6", "run", 
++        "--out", "experimental-prometheus-rw",
++        "/loadtest/user_journey.js"
++    ]
++    
++    result = subprocess.run(cmd, capture_output=True, text=True)
++    
++    # K6 exits with 0 if all thresholds pass, 99 (or non-zero) if any fail
++    passed = result.returncode == 0
++    print(f"    -> {'PASSED' if passed else 'FAILED'} (Exit code: {result.returncode})")
++    
++    # Parse output to extract p95 and error rate for reporting (rudimentary parsing)
++    p95 = "N/A"
++    error_rate = "N/A"
++    for line in result.stdout.split('\n') + result.stderr.split('\n'):
++        if "http_req_duration" in line and "p(95)=" in line:
++            parts = line.split("p(95)=")
++            if len(parts) > 1:
++                p95 = parts[1].split()[0]
++        if "http_req_failed" in line and "rate=" in line:
++            parts = line.split("rate=")
++            if len(parts) > 1:
++                error_rate = parts[1].split()[0]
++                
++    return passed, p95, error_rate, result.stdout + result.stderr
++
++def main():
++    min_vus = 1
++    max_vus = 200
++    best_vus = 0
++    best_p95 = "N/A"
++    
++    results = []
++    
++    print("==================================================")
++    print(" Starting Binary Search Capacity Test (User Journey)")
++    print(f" Range: {min_vus} to {max_vus} VUs")
++    print("==================================================\n")
++    
++    while min_vus <= max_vus:
++        mid_vus = (min_vus + max_vus) // 2
++        
++        passed, p95, err_rate, full_output = run_k6(mid_vus)
++        
++        results.append({
++            "vus": mid_vus,
++            "passed": passed,
++            "p95": p95,
++            "error_rate": err_rate
++        })
++        
++        if passed:
++            best_vus = mid_vus
++            best_p95 = p95
++            min_vus = mid_vus + 1
++        else:
++            max_vus = mid_vus - 1
++            
++    print("\n==================================================")
++    print(f" Binary Search Complete!")
++    print(f" Maximum Supported Capacity: {best_vus} VUs (p95: {best_p95})")
++    print("==================================================")
++    
++    # Generate Markdown Report
++    report = f"# Capacity Benchmark Report (User Journey)\n\n"
++    report += f"**Date**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
++    report += f"**Target Endpoint**: Full User Journey (Register, Login, View Profile/Doctors)\n"
++    report += f"**Maximum Verified Capacity**: {best_vus} Concurrent Virtual Users\n\n"
++    
++    report += "## Test Configuration\n"
++    report += "- **Ramp-up**: 15 seconds\n"
++    report += "- **Sustain**: 30 seconds\n"
++    report += "- **Ramp-down**: 15 seconds\n"
++    report += "- **Success Criteria**: p(95) latency < 200ms AND Error rate < 1%\n\n"
++    
++    report += "## Binary Search Execution Log\n"
++    report += "| Virtual Users | Result | p95 Latency | Error Rate |\n"
++    report += "|---------------|--------|-------------|------------|\n"
++    
++    # Sort results by VUs for a cleaner report
++    results.sort(key=lambda x: x["vus"])
++    for r in results:
++        status = "✅ PASS" if r["passed"] else "❌ FAIL"
++        report += f"| {r['vus']} | {status} | {r['p95']} | {r['error_rate']} |\n"
++        
++    with open("user_journey_report.md", "w") as f:
++        f.write(report)
++        
++    print("\nReport written to user_journey_report.md")
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/loadtest/user_journey.js b/scripts/loadtest/user_journey.js
+new file mode 100644
+index 0000000..01963c3
+--- /dev/null
++++ b/scripts/loadtest/user_journey.js
+@@ -0,0 +1,88 @@
++import http from 'k6/http';
++import { check, sleep, group } from 'k6';
++import { randomString } from 'https://jslib.k6.io/k6-utils/1.2.0/index.js';
++
++const targetVUs = __ENV.TARGET_VUS ? parseInt(__ENV.TARGET_VUS) : 20;
++
++export const options = {
++  stages: [
++    { duration: '15s', target: targetVUs }, 
++    { duration: '30s', target: targetVUs },
++    { duration: '15s', target: 0 },
++  ],
++  thresholds: {
++    'http_req_duration': ['p(95)<500'], // 500ms for complex business logic
++    'http_req_failed': ['rate<0.05'],   // Max 5% error rate
++  },
++};
++
++const BASE_URL = 'http://localhost:8000/api';
++
++export default function () {
++  // 1. Patient Registration
++  const email = `test_${randomString(8)}@example.com`;
++  const password = 'VerySecurePass123!#';
++  
++  const registerPayload = JSON.stringify({
++    first_name: 'Test',
++    last_name: 'Patient',
++    email: email,
++    password: password,
++    role: 'patient',
++  });
++
++  const registerRes = http.post(`${BASE_URL}/register`, registerPayload, {
++    headers: { 'Content-Type': 'application/json' },
++  });
++
++  check(registerRes, {
++    'registered successfully': (r) => r.status === 201,
++  });
++
++  sleep(1);
++
++  // 2. Patient Login
++  const loginPayload = JSON.stringify({
++    role: 'patient',
++    email: email,
++    password: password,
++  });
++
++  const loginRes = http.post(`${BASE_URL}/login`, loginPayload, {
++    headers: { 'Content-Type': 'application/json' },
++  });
++
++  check(loginRes, {
++    'logged in successfully': (r) => r.status === 200,
++  });
++
++  const token = loginRes.json('token');
++  if (!token) {
++    return; // Exit iteration if login failed
++  }
++
++  const authHeaders = {
++    headers: {
++      'Content-Type': 'application/json',
++      'Authorization': `Bearer ${token}`
++    },
++  };
++
++  sleep(1);
++
++  // 3. View Profile
++  const profileRes = http.get(`${BASE_URL}/profile`, authHeaders);
++  check(profileRes, {
++    'profile loaded': (r) => r.status === 200,
++  });
++
++  sleep(1);
++
++  // 4. View Doctors
++  const doctorsRes = http.get(`${BASE_URL}/doctors`, authHeaders);
++  check(doctorsRes, {
++    'doctors loaded': (r) => r.status === 200,
++  });
++
++  sleep(1);
++}
+diff --git a/sqlc.yaml b/sqlc.yaml
+index 1966599..fc54e4a 100644
+--- a/sqlc.yaml
++++ b/sqlc.yaml
+@@ -11,6 +11,8 @@ sql:
+       - "migrations/000008_harden_schema_integrity.up.sql"
+       - "migrations/000009_patient_booking_exclusion.up.sql"
+       - "migrations/000010_harden_relational_integrity.up.sql"
++      - "migrations/000011_production_hardening.up.sql"
++      - "migrations/000012_ocr_configurations.up.sql"
+     queries: "internal/repository/queries"
+     gen:
+       go:

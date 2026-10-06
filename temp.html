@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VitalWatch Complete Prototype</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap');
+    </style>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        brand: {
+                            50: '#f0fdfa',
+                            100: '#ccfbf1',
+                            200: '#99f6e4',
+                            500: '#14b8a6',
+                            600: '#0d9488',
+                            700: '#0f766e', /* Primary Accent */
+                            800: '#115e59',
+                            900: '#134e4a',
+                        },
+                        surface: '#f8fafc',
+                        border: '#e2e8f0',
+                    },
+                    fontFamily: {
+                        sans: ['Geist', 'sans-serif'],
+                        mono: ['"Geist Mono"', 'monospace']
+                    }
+                }
+            }
+        }
+        
+        function switchApp(app) {
+            document.getElementById('patient-app').classList.add('hidden');
+            document.getElementById('doctor-app').classList.add('hidden');
+            document.getElementById('btn-patient').classList.remove('bg-white', 'shadow-sm', 'text-slate-900');
+            document.getElementById('btn-patient').classList.add('text-slate-500', 'hover:text-slate-700');
+            document.getElementById('btn-doctor').classList.remove('bg-white', 'shadow-sm', 'text-slate-900');
+            document.getElementById('btn-doctor').classList.add('text-slate-500', 'hover:text-slate-700');
+            
+            document.getElementById(app + '-app').classList.remove('hidden');
+            document.getElementById('btn-' + app).classList.remove('text-slate-500', 'hover:text-slate-700');
+            document.getElementById('btn-' + app).classList.add('bg-white', 'shadow-sm', 'text-slate-900');
+        }
+    </script>
+</head>
+<body class="bg-slate-200 min-h-screen text-slate-900 font-sans antialiased flex flex-col">
+
+    <!-- Prototype Switcher (Fixed at top right) -->
+    <div class="fixed top-4 right-4 z-50 bg-slate-200/80 backdrop-blur p-1.5 rounded-xl flex gap-1 border border-slate-300 shadow-xl">
+        <button id="btn-patient" onclick="switchApp('patient')" class="px-5 py-2 rounded-lg text-sm font-semibold transition-all bg-white shadow-sm text-slate-900">
+            Patient Portal
+        </button>
+        <button id="btn-doctor" onclick="switchApp('doctor')" class="px-5 py-2 rounded-lg text-sm font-semibold transition-all text-slate-500 hover:text-slate-700">
+            Doctor Workspace
+        </button>
+    </div>
+
+    <!-- ========================================== -->
+    <!-- 1. PATIENT PORTAL (Consumer Execution)     -->
+    <!-- ========================================== -->
+    <div id="patient-app" class="flex min-h-screen bg-surface w-full transition-opacity duration-300">
+        
+        <!-- Sidebar -->
+        <aside class="w-64 bg-white border-r border-slate-200 flex flex-col sticky top-0 h-screen">
+            <div class="p-6 flex items-center gap-3">
+                <div class="w-8 h-8 bg-brand-700 rounded-lg flex items-center justify-center text-white font-bold text-xl">V</div>
+                <span class="font-bold text-xl tracking-tight">VitalWatch</span>
+            </div>
+            
+            <nav class="flex-1 px-4 py-6 space-y-2">
+                <a href="#" class="flex items-center gap-3 px-4 py-3 bg-brand-50 text-brand-700 rounded-xl font-semibold">
+                    <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path><polyline points="9 22 9 12 15 12 15 22"></polyline></svg>
+                    Dashboard
+                </a>
+                <a href="#" class="flex items-center gap-3 px-4 py-3 text-slate-600 hover:bg-slate-50 hover:text-slate-900 rounded-xl font-medium transition-colors">
+                    <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect><line x1="16" y1="2" x2="16" y2="6"></line><line x1="8" y1="2" x2="8" y2="6"></line><line x1="3" y1="10" x2="21" y2="10"></line></svg>
+                    Appointments
+                </a>
+                <a href="#" class="flex items-center gap-3 px-4 py-3 text-slate-600 hover:bg-slate-50 hover:text-slate-900 rounded-xl font-medium transition-colors">
+                    <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>
+                    Prescriptions
+                </a>
+                <a href="#" class="flex items-center gap-3 px-4 py-3 text-slate-600 hover:bg-slate-50 hover:text-slate-900 rounded-xl font-medium transition-colors">
+                    <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"></path></svg>
+                    My Vitals
+                </a>
+            </nav>
+
+            <div class="p-6">
+                <a href="#" class="flex items-center gap-3 px-4 py-3 text-slate-600 hover:bg-slate-50 hover:text-slate-900 rounded-xl font-medium transition-colors">
+                    <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+                    Settings
+                </a>
+            </div>
+        </aside>
+
+        <!-- Main Area -->
+        <main class="flex-1 p-10 max-w-5xl mx-auto">
+            <header class="mb-10 flex justify-between items-end">
+                <div>
+                    <h1 class="text-4xl font-bold tracking-tight text-slate-900 mb-2">Good morning, Sarah</h1>
+                    <p class="text-xl text-slate-500">You're up to date. You have one appointment today.</p>
+                </div>
+                <div class="w-14 h-14 bg-brand-100 rounded-full flex items-center justify-center text-brand-700 font-bold text-xl border-4 border-white shadow-sm">
+                    SJ
+                </div>
+            </header>
+
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                
+                <!-- Left Column (Wider) -->
+                <div class="lg:col-span-2 space-y-8">
+                    <!-- Hero Card: Next Appointment -->
+                    <section class="bg-brand-700 text-white rounded-[2rem] p-8 shadow-xl shadow-brand-900/10 relative overflow-hidden">
+                        <!-- Decorative circle -->
+                        <div class="absolute -right-12 -top-12 w-64 h-64 bg-brand-600 rounded-full opacity-50 blur-3xl pointer-events-none"></div>
+                        
+                        <div class="relative z-10">
+                            <div class="flex items-start justify-between mb-8">
+                                <div>
+                                    <span class="bg-brand-600/50 text-brand-50 px-4 py-1.5 rounded-full text-sm font-semibold border border-brand-500/30 shadow-sm backdrop-blur">Upcoming Appointment</span>
+                                    <h2 class="text-3xl font-bold mt-6">Cardiology Review</h2>
+                                    <p class="text-brand-100 text-xl mt-2 font-medium">Dr. Emily Chen • Video Visit</p>
+                                </div>
+                                <div class="text-right bg-brand-800/40 p-4 rounded-2xl backdrop-blur border border-brand-600/30">
+                                    <p class="text-4xl font-bold">10:30<span class="text-2xl ml-1 font-medium text-brand-200">AM</span></p>
+                                    <p class="text-brand-100 mt-1 font-medium text-lg">Today</p>
+                                </div>
+                            </div>
+                            <div class="flex gap-4">
+                                <button class="flex-1 bg-white text-brand-800 hover:bg-slate-50 font-bold text-lg py-4 px-6 rounded-2xl transition-transform active:scale-[0.98] shadow-sm flex items-center justify-center gap-3">
+                                    <svg width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                                    Join Telehealth Room
+                                </button>
+                                <button class="w-16 h-16 bg-brand-800 hover:bg-brand-900 text-white rounded-2xl flex items-center justify-center transition-colors">
+                                    <svg width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path></svg>
+                                </button>
+                            </div>
+                        </div>
+                    </section>
+
+                    <!-- Adherence Board -->
+                    <section>
+                        <div class="flex justify-between items-end mb-6">
+                            <h2 class="text-2xl font-bold text-slate-900">Today's Medications</h2>
+                            <span class="text-slate-500 font-medium">2 of 3 taken</span>
+                        </div>
+                        <div class="space-y-4">
+                            <!-- Taken -->
+                            <div class="bg-white rounded-2xl p-5 border border-slate-200 shadow-sm flex items-center justify-between opacity-75">
+                                <div class="flex items-center gap-5">
+                                    <div class="w-8 h-8 rounded-full bg-brand-100 text-brand-700 flex items-center justify-center shrink-0">
+                                        <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="3" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7"></path></svg>
+                                    </div>
+                                    <div>
+                                        <h3 class="font-bold text-lg text-slate-900 line-through text-slate-500">Lisinopril 10mg</h3>
+                                        <p class="text-slate-500">1 tablet • Morning</p>
+                                    </div>
+                                </div>
+                                <span class="text-sm font-medium text-slate-500 bg-slate-100 px-3 py-1 rounded-full">Taken at 8:00 AM</span>
+                            </div>
+                            
+                            <!-- Pending -->
+                            <div class="bg-white rounded-2xl p-5 border-2 border-brand-200 shadow-sm flex items-center justify-between relative overflow-hidden group hover:border-brand-300 transition-colors cursor-pointer">
+                                <div class="flex items-center gap-5">
+                                    <div class="w-8 h-8 rounded-full border-2 border-slate-300 group-hover:border-brand-500 shrink-0 transition-colors"></div>
+                                    <div>
+                                        <h3 class="font-bold text-lg text-slate-900">Atorvastatin 20mg</h3>
+                                        <p class="text-slate-500">1 tablet • Evening</p>
+                                    </div>
+                                </div>
+                                <button class="bg-brand-50 text-brand-700 font-semibold px-5 py-2 rounded-xl group-hover:bg-brand-100 transition-colors">
+                                    Mark Taken
+                                </button>
+                            </div>
+                        </div>
+                    </section>
+                </div>
+
+                <!-- Right Column (Narrower) -->
+                <div class="space-y-8">
+                    <!-- Recent Vitals -->
+                    <section class="bg-white rounded-2xl p-7 border border-slate-200 shadow-sm">
+                        <div class="flex justify-between items-center mb-6">
+                            <h2 class="text-xl font-bold text-slate-900">Recent Vitals</h2>
+                            <button class="w-10 h-10 bg-slate-50 hover:bg-slate-100 rounded-full flex items-center justify-center text-brand-700 transition-colors">
+                                <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4v16m8-8H4"></path></svg>
+                            </button>
+                        </div>
+                        
+                        <div class="space-y-4">
+                            <!-- Vital Card -->
+                            <div class="p-5 bg-slate-50 rounded-xl border border-slate-100 flex flex-col justify-between h-32">
+                                <div class="flex items-center gap-3">
+                                    <div class="text-red-500">
+                                        <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z"></path></svg>
+                                    </div>
+                                    <p class="font-semibold text-slate-600">Blood Pressure</p>
+                                </div>
+                                <div class="flex items-baseline justify-between mt-auto">
+                                    <div>
+                                        <span class="font-mono font-bold text-3xl text-slate-900 tracking-tight">120/80</span>
+                                        <span class="text-slate-500 text-sm ml-1">mmHg</span>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Vital Card -->
+                            <div class="p-5 bg-slate-50 rounded-xl border border-slate-100 flex flex-col justify-between h-32">
+                                <div class="flex items-center gap-3">
+                                    <div class="text-brand-500">
+                                        <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                                    </div>
+                                    <p class="font-semibold text-slate-600">Glucose</p>
+                                </div>
+                                <div class="flex items-baseline justify-between mt-auto">
+                                    <div>
+                                        <span class="font-mono font-bold text-3xl text-slate-900 tracking-tight">95</span>
+                                        <span class="text-slate-500 text-sm ml-1">mg/dL</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+                </div>
+
+            </div>
+        </main>
+    </div>
+
+    <!-- ========================================== -->
+    <!-- 2. DOCTOR WORKSPACE (Clinical Execution)   -->
+    <!-- ========================================== -->
+    <div id="doctor-app" class="flex min-h-screen bg-white w-full hidden transition-opacity duration-300">
+        
+        <!-- Narrow, Dark Sidebar for High Contrast -->
+        <aside class="w-16 bg-slate-900 border-r border-slate-800 flex flex-col items-center py-4 sticky top-0 h-screen">
+            <div class="w-10 h-10 bg-brand-600 rounded-lg flex items-center justify-center text-white font-bold mb-8">V</div>
+            
+            <nav class="flex-1 flex flex-col gap-4 w-full px-2">
+                <!-- Active Nav -->
+                <a href="#" class="w-full aspect-square bg-brand-700/20 text-brand-400 rounded-xl flex items-center justify-center relative group">
+                    <div class="absolute left-0 top-1/2 -translate-y-1/2 w-1 h-8 bg-brand-500 rounded-r-md"></div>
+                    <svg width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect><line x1="16" y1="2" x2="16" y2="6"></line><line x1="8" y1="2" x2="8" y2="6"></line><line x1="3" y1="10" x2="21" y2="10"></line></svg>
+                </a>
+                
+                <a href="#" class="w-full aspect-square text-slate-400 hover:bg-slate-800 hover:text-slate-200 rounded-xl flex items-center justify-center transition-colors">
+                    <svg width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M23 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path></svg>
+                </a>
+                
+                <a href="#" class="w-full aspect-square text-slate-400 hover:bg-slate-800 hover:text-slate-200 rounded-xl flex items-center justify-center transition-colors relative">
+                    <!-- Notification Badge -->
+                    <span class="absolute top-2 right-2 w-2 h-2 bg-red-500 rounded-full border border-slate-900"></span>
+                    <svg width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line><polyline points="10 9 9 9 8 9"></polyline></svg>
+                </a>
+            </nav>
+            
+            <a href="#" class="w-12 h-12 text-slate-500 hover:text-slate-300 rounded-xl flex items-center justify-center transition-colors mt-auto">
+                <svg width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+            </a>
+        </aside>
+
+        <!-- Main Area (Border driven, dense) -->
+        <main class="flex-1 flex bg-surface">
+            
+            <!-- Left Col: Schedule List (Fixed Width) -->
+            <section class="w-80 bg-white border-r border-border flex flex-col">
+                <div class="p-4 border-b border-border">
+                    <h1 class="text-xl font-bold tracking-tight text-slate-900">Today</h1>
+                    <p class="text-xs text-slate-500 mt-1">Oct 7 • 8 appointments</p>
+                </div>
+                
+                <!-- Filters -->
+                <div class="px-4 py-2 bg-slate-50 border-b border-border flex gap-2 overflow-x-auto">
+                    <span class="bg-slate-200 text-slate-700 px-3 py-1 rounded-full text-xs font-semibold whitespace-nowrap cursor-pointer">All (8)</span>
+                    <span class="hover:bg-slate-200 text-slate-600 px-3 py-1 rounded-full text-xs font-semibold whitespace-nowrap cursor-pointer">In-Person (5)</span>
+                    <span class="hover:bg-slate-200 text-slate-600 px-3 py-1 rounded-full text-xs font-semibold whitespace-nowrap cursor-pointer">Telehealth (3)</span>
+                </div>
+
+                <!-- List -->
+                <div class="flex-1 overflow-y-auto divide-y divide-border">
+                    <!-- Active Item -->
+                    <div class="p-4 bg-brand-50 border-l-2 border-brand-600 cursor-pointer">
+                        <div class="flex justify-between items-center mb-1">
+                            <span class="font-mono text-xs font-bold text-brand-700">10:30 AM</span>
+                            <span class="bg-brand-200 text-brand-800 px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wide">Next</span>
+                        </div>
+                        <p class="font-semibold text-slate-900 text-sm">Sarah Jenkins</p>
+                        <p class="text-xs text-slate-500 mt-0.5">Cardiology Review</p>
+                    </div>
+                    <!-- Past Item -->
+                    <div class="p-4 opacity-50 cursor-pointer hover:opacity-75 transition-opacity">
+                        <div class="flex justify-between items-center mb-1">
+                            <span class="font-mono text-xs font-medium text-slate-500 line-through">09:00 AM</span>
+                            <span class="text-slate-400 text-[10px] font-bold uppercase tracking-wide">Completed</span>
+                        </div>
+                        <p class="font-medium text-slate-700 text-sm">Robert Diaz</p>
+                        <p class="text-xs text-slate-400 mt-0.5">Annual Checkup</p>
+                    </div>
+                    <!-- Future Item -->
+                    <div class="p-4 cursor-pointer hover:bg-slate-50 transition-colors">
+                        <div class="flex justify-between items-center mb-1">
+                            <span class="font-mono text-xs font-medium text-slate-600">11:15 AM</span>
+                        </div>
+                        <p class="font-medium text-slate-900 text-sm">Michael Chang</p>
+                        <p class="text-xs text-slate-500 mt-0.5">In-Person • 15m</p>
+                    </div>
+                    <!-- Future Item -->
+                    <div class="p-4 cursor-pointer hover:bg-slate-50 transition-colors">
+                        <div class="flex justify-between items-center mb-1">
+                            <span class="font-mono text-xs font-medium text-slate-600">11:30 AM</span>
+                        </div>
+                        <p class="font-medium text-slate-900 text-sm">Amanda Torres</p>
+                        <p class="text-xs text-slate-500 mt-0.5">Telehealth • 30m</p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Right Col: Dense Patient Chart (Fluid Width) -->
+            <section class="flex-1 flex flex-col overflow-hidden bg-surface p-4">
+                
+                <div class="bg-white rounded-lg border border-border flex flex-col h-full shadow-sm">
+                    
+                    <!-- Chart Header -->
+                    <div class="px-6 py-4 border-b border-border flex justify-between items-start bg-white rounded-t-lg">
+                        <div class="flex gap-4 items-center">
+                            <div class="w-12 h-12 bg-brand-100 text-brand-700 rounded flex items-center justify-center font-bold text-lg">SJ</div>
+                            <div>
+                                <h2 class="text-xl font-bold text-slate-900">Sarah Jenkins</h2>
+                                <div class="flex gap-3 text-xs text-slate-500 font-mono mt-1">
+                                    <span>ID: P-9942</span>
+                                    <span>DOB: 1985-04-12 (41y)</span>
+                                    <span>Sex: F</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="flex gap-2">
+                            <button class="border border-border text-slate-700 hover:bg-slate-50 font-medium text-sm px-4 py-2 rounded-md transition-colors shadow-sm flex items-center gap-2">
+                                <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                                Join Telehealth
+                            </button>
+                            <button class="bg-brand-700 hover:bg-brand-800 text-white font-medium text-sm px-4 py-2 rounded-md transition-colors shadow-sm flex items-center gap-2">
+                                <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4v16m8-8H4"></path></svg>
+                                Prescription
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Chart Tabs -->
+                    <div class="px-6 border-b border-border bg-slate-50/50 flex gap-6">
+                        <button class="py-3 text-sm font-semibold text-brand-700 border-b-2 border-brand-600">Overview</button>
+                        <button class="py-3 text-sm font-medium text-slate-500 hover:text-slate-700 transition-colors">Vitals Log</button>
+                        <button class="py-3 text-sm font-medium text-slate-500 hover:text-slate-700 transition-colors">Prescriptions</button>
+                        <button class="py-3 text-sm font-medium text-slate-500 hover:text-slate-700 transition-colors">Clinical Notes</button>
+                    </div>
+                    
+                    <!-- Chart Body (Split Panes) -->
+                    <div class="flex-1 overflow-hidden flex">
+                        
+                        <!-- Main Panel -->
+                        <div class="flex-1 overflow-y-auto p-6 border-r border-border">
+                            
+                            <!-- Safety Alert Banner (Only shown when relevant) -->
+                            <div class="mb-6 border border-red-200 rounded-md p-4 bg-red-50 flex items-start gap-3">
+                                <svg width="20" height="20" class="text-red-600 mt-0.5 shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+                                <div>
+                                    <h4 class="text-sm font-bold text-red-900 mb-0.5">Safety Alert: Critical Vital Recorded</h4>
+                                    <p class="text-sm text-red-800">Patient logged a heart rate of <span class="font-mono font-bold">145 bpm</span> 45 minutes ago. Please review before issuing new prescriptions.</p>
+                                </div>
+                            </div>
+
+                            <div class="flex justify-between items-end mb-3 mt-2">
+                                <h3 class="text-sm font-bold text-slate-800 uppercase tracking-tight">Recent Vitals Log</h3>
+                            </div>
+                            
+                            <!-- Dense Table -->
+                            <div class="border border-border rounded-md overflow-hidden shadow-sm">
+                                <table class="w-full text-left text-sm border-collapse">
+                                    <thead class="bg-slate-50 text-slate-600 border-b border-border">
+                                        <tr>
+                                            <th class="py-2 px-4 font-semibold text-xs">Timestamp (Local)</th>
+                                            <th class="py-2 px-4 font-semibold text-xs">Measurement</th>
+                                            <th class="py-2 px-4 font-semibold text-xs">Value</th>
+                                            <th class="py-2 px-4 font-semibold text-xs">Status</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody class="font-mono text-[13px] text-slate-700">
+                                        <tr class="border-b border-border hover:bg-slate-50 transition-colors">
+                                            <td class="py-2.5 px-4 text-slate-500">Today, 09:16</td>
+                                            <td class="py-2.5 px-4 font-sans font-medium text-slate-800">Heart Rate</td>
+                                            <td class="py-2.5 px-4 text-red-600 font-bold">145 bpm</td>
+                                            <td class="py-2.5 px-4"><span class="bg-red-100 text-red-700 border border-red-200 px-2 py-0.5 rounded text-[10px] uppercase font-bold tracking-wider">Critical</span></td>
+                                        </tr>
+                                        <tr class="border-b border-border hover:bg-slate-50 transition-colors">
+                                            <td class="py-2.5 px-4 text-slate-500">Today, 09:15</td>
+                                            <td class="py-2.5 px-4 font-sans font-medium text-slate-800">Blood Pressure</td>
+                                            <td class="py-2.5 px-4 font-medium">120/80 mmHg</td>
+                                            <td class="py-2.5 px-4"><span class="bg-slate-100 text-slate-600 border border-slate-200 px-2 py-0.5 rounded text-[10px] uppercase font-bold tracking-wider">Normal</span></td>
+                                        </tr>
+                                        <tr class="hover:bg-slate-50 transition-colors">
+                                            <td class="py-2.5 px-4 text-slate-500">Yesterday, 08:30</td>
+                                            <td class="py-2.5 px-4 font-sans font-medium text-slate-800">Blood Pressure</td>
+                                            <td class="py-2.5 px-4 font-medium">118/78 mmHg</td>
+                                            <td class="py-2.5 px-4"><span class="bg-slate-100 text-slate-600 border border-slate-200 px-2 py-0.5 rounded text-[10px] uppercase font-bold tracking-wider">Normal</span></td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+
+                        </div>
+                        
+                        <!-- Side Panel (Context) -->
+                        <div class="w-72 bg-slate-50 overflow-y-auto p-5">
+                            <h3 class="text-xs font-bold text-slate-500 uppercase tracking-tight mb-4">Active Prescriptions</h3>
+                            
+                            <div class="space-y-3">
+                                <!-- Rx Item -->
+                                <div class="bg-white p-3 rounded-md border border-border shadow-sm">
+                                    <h4 class="font-bold text-sm text-slate-900">Lisinopril 10mg</h4>
+                                    <p class="text-xs text-slate-500 mt-1">Take 1 tablet by mouth daily in the morning.</p>
+                                    <div class="flex justify-between items-center mt-3 pt-2 border-t border-slate-100">
+                                        <span class="text-[10px] font-mono text-slate-400">Issued: Sep 12</span>
+                                        <button class="text-xs font-medium text-brand-600 hover:text-brand-700">Refill</button>
+                                    </div>
+                                </div>
+
+                                <!-- Rx Item -->
+                                <div class="bg-white p-3 rounded-md border border-border shadow-sm">
+                                    <h4 class="font-bold text-sm text-slate-900">Atorvastatin 20mg</h4>
+                                    <p class="text-xs text-slate-500 mt-1">Take 1 tablet by mouth daily in the evening.</p>
+                                    <div class="flex justify-between items-center mt-3 pt-2 border-t border-slate-100">
+                                        <span class="text-[10px] font-mono text-slate-400">Issued: Sep 12</span>
+                                        <button class="text-xs font-medium text-brand-600 hover:text-brand-700">Refill</button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                    </div>
+                </div>
+            </section>
+
+        </main>
+    </div>
+
+</body>
+</html>
