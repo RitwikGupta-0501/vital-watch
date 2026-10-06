@@ -856,8 +856,8 @@ func TestCreateAppointment_CrossMidnightTimezone(t *testing.T) {
 	r := setupPhase4TestRouter(h)
 
 	// Booking on a future Monday at 09:00 Tokyo time.
-	// 2026-10-05 is a Monday. 09:00 Tokyo time = 2026-10-04 24:00 UTC (Sunday night).
-	tokyoMon9am := time.Date(2026, 10, 5, 9, 0, 0, 0, tokyoLoc)
+	// 2027-10-04 is a Monday. 09:00 Tokyo time.
+	tokyoMon9am := time.Date(2027, 10, 4, 9, 0, 0, 0, tokyoLoc)
 
 	payload, _ := json.Marshal(map[string]interface{}{
 		"doctor_id":  doctorID.String(),

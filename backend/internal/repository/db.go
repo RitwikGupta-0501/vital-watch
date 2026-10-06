@@ -60,6 +60,10 @@ func (r *DBRepository) SetRiverClient(riverClient *river.Client[pgx.Tx]) {
 	r.riverClient = riverClient
 }
 
+func (r *DBRepository) Queries() dbgen.Querier {
+	return r.queries
+}
+
 // Ping checks if the underlying PostgreSQL connection pool is alive and reachable.
 func (r *DBRepository) Ping(ctx context.Context) error {
 	if r.pool == nil {

@@ -176,7 +176,7 @@ func (h *Handler) DownloadPrescription(c *gin.Context) {
 		}
 
 		if role == "patient" {
-			if presc.PatientID != callerID || presc.Status != "approved" {
+			if presc.PatientID != callerID {
 				c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "Prescription not found or access denied"})
 				return
 			}
@@ -916,9 +916,12 @@ func (h *Handler) GetPrescriptionByID(c *gin.Context) {
 	role, _ := roleVal.(string)
 
 	if role == "patient" {
-		if prescription.PatientID != userID || prescription.Status != "approved" {
+		if prescription.PatientID != userID {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Prescription not found or access denied"})
 			return
+		}
+		if prescription.Status != "approved" {
+			prescription.Items = nil
 		}
 	} else if role == "doctor" {
 		if prescription.DoctorID != userID {

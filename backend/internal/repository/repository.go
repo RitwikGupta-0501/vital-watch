@@ -22,6 +22,7 @@ var ErrUniqueConstraint = errors.New("a unique constraint violation occurred")
 
 // Repository defines all database operations needed by the application handlers
 type Repository interface {
+	Queries() dbgen.Querier
 	Ping(ctx context.Context) error
 
 	CreatePatient(ctx context.Context, firstName, lastName, email, hashedPassword string) (uuid.UUID, error)

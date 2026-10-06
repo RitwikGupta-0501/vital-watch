@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RitwikGupta-0501/vital-watch/internal/repository/dbgen"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -20,6 +21,21 @@ import (
 
 func init() {
 	gin.SetMode(gin.TestMode)
+}
+
+type mockQuerier struct {
+	dbgen.Querier
+}
+
+func (m mockQuerier) GetTenantInviteByCode(ctx context.Context, code string) (dbgen.TenantInvite, error) {
+	if code == "valid-invite-code" {
+		return dbgen.TenantInvite{Role: "doctor", TenantID: uuid.New()}, nil
+	}
+	return dbgen.TenantInvite{}, sql.ErrNoRows
+}
+
+func (m mockQuerier) DeleteTenantInvite(ctx context.Context, code string) error {
+	return nil
 }
 
 func generateTestToken(secret []byte, userID uuid.UUID, role string, expired bool) string {
@@ -164,8 +180,13 @@ func TestRequireRoleMiddleware(t *testing.T) {
 }
 
 func TestDoctorRegistrationValidation(t *testing.T) {
+	mockRepo := &repository.MockRepository{
+		QueriesFunc: func() dbgen.Querier {
+			return mockQuerier{}
+		},
+	}
 	h := &Handler{
-		DoctorInviteCode: "valid-invite-code",
+		Repo: mockRepo,
 	}
 
 	r := gin.New()
@@ -199,22 +220,6 @@ func TestDoctorRegistrationValidation(t *testing.T) {
 	r.ServeHTTP(w3, req3)
 	if w3.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 for wrong doctor invite code, got %d", w3.Code)
-	}
-
-	// 4. Doctor registration when invite code is empty in config (fail-closed) -> 403 Forbidden
-	hUnset := &Handler{
-		DoctorInviteCode: "",
-	}
-	rUnset := gin.New()
-	rUnset.POST("/register", hUnset.Register)
-
-	w4 := httptest.NewRecorder()
-	body4 := strings.NewReader(`{"role":"doctor","first_name":"Dr","last_name":"Smith","email":"dr@example.com","password":"ValidPassword123!","invite_code":""}`)
-	req4, _ := http.NewRequest(http.MethodPost, "/register", body4)
-	req4.Header.Set("Content-Type", "application/json")
-	rUnset.ServeHTTP(w4, req4)
-	if w4.Code != http.StatusForbidden {
-		t.Fatalf("expected 403 fail-closed when DoctorInviteCode is empty in config, got %d", w4.Code)
 	}
 }
 

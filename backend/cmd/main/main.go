@@ -465,7 +465,7 @@ func setupRouter(h *api.Handler, storageType string, jwtSecret []byte) *gin.Engi
 
 	// Configure CORS
 	corsOrigins := os.Getenv("CORS_ALLOWED_ORIGINS")
-	allowedOrigins := []string{"http://localhost:3000", "https://d11ox9eozk6am1.cloudfront.net"}
+	allowedOrigins := []string{"http://localhost:3000", "http://localhost:5173", "https://d11ox9eozk6am1.cloudfront.net"}
 	if corsOrigins != "" {
 		originsList := strings.Split(corsOrigins, ",")
 		var cleaned []string
@@ -565,6 +565,14 @@ func setupRouter(h *api.Handler, storageType string, jwtSecret []byte) *gin.Engi
 			adminGroup.GET("/ocr-settings", h.GetOCRSettings)
 			adminGroup.POST("/ocr-settings/configs", h.CreateOCRConfig)
 			adminGroup.PUT("/ocr-settings/chain", h.UpdateOCRChain)
+		}
+
+		// Platform-only Routes (accessible by platform_admin)
+		platformGroup := authGroup.Group("/platform")
+		platformGroup.Use(api.RequireRole("platform_admin"))
+		{
+			platformGroup.POST("/tenants", h.CreateTenant)
+			platformGroup.POST("/tenants/:id/invites", h.CreateTenantInvite)
 		}
 	}
 

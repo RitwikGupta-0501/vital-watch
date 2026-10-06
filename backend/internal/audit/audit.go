@@ -40,6 +40,7 @@ const (
 	// Administration & Governance Audit Events (HIPAA § 164.312(a)(2)(i))
 	ActionViewUserDirectory = "VIEW_USER_DIRECTORY"
 	ActionToggleUserStatus  = "TOGGLE_USER_STATUS"
+	ActionPlatformAdminConfigUpdate = "PLATFORM_ADMIN_CONFIG_UPDATE"
 	// Compliance Audit Trail Access
 	ActionViewAuditLogs = "VIEW_COMPLIANCE_AUDIT_LOGS"
 )

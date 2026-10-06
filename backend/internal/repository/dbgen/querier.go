@@ -27,9 +27,12 @@ type Querier interface {
 	CreatePatientVital(ctx context.Context, arg CreatePatientVitalParams) (CreatePatientVitalRow, error)
 	CreatePrescription(ctx context.Context, arg CreatePrescriptionParams) (uuid.UUID, error)
 	CreateRefreshToken(ctx context.Context, arg CreateRefreshTokenParams) (RefreshToken, error)
+	CreateTenant(ctx context.Context, arg CreateTenantParams) (Tenant, error)
+	CreateTenantInvite(ctx context.Context, arg CreateTenantInviteParams) (TenantInvite, error)
 	DeleteDoctorScheduleByDay(ctx context.Context, arg DeleteDoctorScheduleByDayParams) error
 	DeleteOCRProviderConfig(ctx context.Context, arg DeleteOCRProviderConfigParams) error
 	DeletePrescriptionItems(ctx context.Context, arg DeletePrescriptionItemsParams) error
+	DeleteTenantInvite(ctx context.Context, inviteCode string) error
 	GetActivePrescriptionItemsForPatient(ctx context.Context, arg GetActivePrescriptionItemsForPatientParams) ([]GetActivePrescriptionItemsForPatientRow, error)
 	GetAdminByEmail(ctx context.Context, arg GetAdminByEmailParams) (GetAdminByEmailRow, error)
 	GetAdminByID(ctx context.Context, arg GetAdminByIDParams) (GetAdminByIDRow, error)
@@ -73,6 +76,7 @@ type Querier interface {
 	// Each branch independently uses its covering index; the UNION deduplicates.
 	GetPrescriptionsPendingReview(ctx context.Context, arg GetPrescriptionsPendingReviewParams) ([]GetPrescriptionsPendingReviewRow, error)
 	GetRefreshTokenByHash(ctx context.Context, tokenHash string) (RefreshToken, error)
+	GetTenantInviteByCode(ctx context.Context, inviteCode string) (TenantInvite, error)
 	GetTenantSettings(ctx context.Context, tenantID uuid.UUID) (TenantSetting, error)
 	HasDoctorPatientRelationship(ctx context.Context, arg HasDoctorPatientRelationshipParams) (pgtype.Bool, error)
 	InsertPrescriptionItem(ctx context.Context, arg InsertPrescriptionItemParams) (InsertPrescriptionItemRow, error)

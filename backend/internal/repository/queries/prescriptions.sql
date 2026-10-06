@@ -103,13 +103,12 @@ SELECT p.id, p.patient_id, p.doctor_id, p.source, p.status, p.file_name, p.notes
 FROM prescriptions p
 JOIN doctor_profiles d ON p.doctor_id = d.user_id
 WHERE p.patient_id = $1
-  AND p.status = 'approved'
   AND p.tenant_id = @tenant_id
 ORDER BY p.created_at DESC, p.id DESC
 LIMIT $2 OFFSET $3;
 
 -- name: GetPrescriptionByFilename :one
-SELECT id, status FROM prescriptions WHERE patient_id = $1 AND file_name = $2 AND status = 'approved' AND tenant_id = @tenant_id;
+SELECT id, status FROM prescriptions WHERE patient_id = $1 AND file_name = $2 AND tenant_id = @tenant_id;
 
 -- name: GetPrescriptionsForPatient :many
 SELECT

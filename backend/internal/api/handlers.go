@@ -148,46 +148,48 @@ func (h *Handler) HealthCheck(c *gin.Context) {
 
 
 func AuthMiddleware(jwtSecret []byte) gin.HandlerFunc {
-	return parseTokenMiddleware(jwtSecret, false, nil)
+	return parseTokenMiddleware(jwtSecret, nil)
 }
 
 // SSEAuthMiddleware allows JWT authentication via Authorization header or ?token= query parameter, specifically for EventSource connections
 func SSEAuthMiddleware(jwtSecret []byte) gin.HandlerFunc {
-	return parseTokenMiddleware(jwtSecret, true, nil)
+	return parseTokenMiddleware(jwtSecret, nil)
 }
 
 // AuthMiddleware on Handler enforces JWT verification and immediate user active status verification
 func (h *Handler) AuthMiddleware() gin.HandlerFunc {
-	return parseTokenMiddleware(h.JWTSecret, false, h)
+	return parseTokenMiddleware(h.JWTSecret, h)
 }
 
 // SSEAuthMiddleware on Handler enforces query/header JWT verification and immediate user active status verification
 func (h *Handler) SSEAuthMiddleware() gin.HandlerFunc {
-	return parseTokenMiddleware(h.JWTSecret, true, h)
+	return parseTokenMiddleware(h.JWTSecret, h)
 }
 
-func parseTokenMiddleware(jwtSecret []byte, allowQueryToken bool, checker userActiveChecker) gin.HandlerFunc {
+func parseTokenMiddleware(jwtSecret []byte, checker userActiveChecker) gin.HandlerFunc {
 	if len(jwtSecret) == 0 {
 		panic("api: jwtSecret cannot be empty")
 	}
 	return func(c *gin.Context) {
 		authHeader := c.GetHeader("Authorization")
 		tokenString := ""
+		
 		if authHeader != "" {
 			parts := strings.Split(authHeader, " ")
-			if len(parts) != 2 || parts[0] != "Bearer" {
-				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid token format"})
-				return
+			if len(parts) == 2 && parts[0] == "Bearer" {
+				tokenString = parts[1]
 			}
-			tokenString = parts[1]
-		} else if allowQueryToken && c.Query("token") != "" {
-			tokenString = strings.TrimSpace(c.Query("token"))
-		} else {
-			errMsg := "Authorization header missing"
-			if allowQueryToken {
-				errMsg = "Authorization header or token query parameter missing"
+		}
+		
+		if tokenString == "" {
+			cookieToken, err := c.Cookie("access_token")
+			if err == nil && cookieToken != "" {
+				tokenString = cookieToken
 			}
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": errMsg})
+		}
+
+		if tokenString == "" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Authorization token missing"})
 			return
 		}
 

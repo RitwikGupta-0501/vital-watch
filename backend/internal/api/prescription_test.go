@@ -1239,8 +1239,8 @@ func TestDownloadPrescription_ByID_Resolution(t *testing.T) {
 		req, _ := http.NewRequest(http.MethodGet, "/prescriptions/"+unapprovedID.String()+"/download-url", nil)
 		r.ServeHTTP(w, req)
 
-		if w.Code != http.StatusNotFound {
-			t.Fatalf("expected 404 Not Found for unapproved prescription, got %d: %s", w.Code, w.Body.String())
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK for unapproved prescription (patient can download raw file), got %d: %s", w.Code, w.Body.String())
 		}
 	})
 
@@ -1840,7 +1840,7 @@ func TestAuthMiddleware_QueryToken(t *testing.T) {
 		t.Fatalf("expected 401 Unauthorized for AuthMiddleware with query token, got %d", w1.Code)
 	}
 
-	// 2. SSEAuthMiddleware must ACCEPT query token specifically for EventSource streams
+	// 2. SSEAuthMiddleware must ACCEPT cookie token
 	r2 := gin.New()
 	r2.Use(SSEAuthMiddleware(secret))
 	r2.GET("/notifications/stream", func(c *gin.Context) {
@@ -1849,11 +1849,15 @@ func TestAuthMiddleware_QueryToken(t *testing.T) {
 	})
 
 	w2 := httptest.NewRecorder()
-	req2, _ := http.NewRequest(http.MethodGet, "/notifications/stream?token="+tokenStr, nil)
+	req2, _ := http.NewRequest(http.MethodGet, "/notifications/stream", nil)
+	req2.AddCookie(&http.Cookie{
+		Name:  "access_token",
+		Value: tokenStr,
+	})
 	r2.ServeHTTP(w2, req2)
 
 	if w2.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK for SSEAuthMiddleware with query token, got %d: %s", w2.Code, w2.Body.String())
+		t.Fatalf("expected 200 OK for SSEAuthMiddleware with cookie token, got %d: %s", w2.Code, w2.Body.String())
 	}
 }
 

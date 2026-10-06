@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -135,10 +136,17 @@ func (h *Handler) Register(c *gin.Context) {
 		}
 
 	case "doctor":
-		if h.DoctorInviteCode == "" || subtle.ConstantTimeCompare([]byte(req.InviteCode), []byte(h.DoctorInviteCode)) != 1 {
-			c.JSON(http.StatusForbidden, gin.H{"error": "Doctor registration is restricted or invalid invite code"})
+		invite, err := h.Repo.Queries().GetTenantInviteByCode(ctx, req.InviteCode)
+		if err != nil {
+			c.JSON(http.StatusForbidden, gin.H{"error": "Invalid invite code"})
 			return
 		}
+		if invite.Role != "doctor" || (invite.ExpiresAt.Valid && invite.ExpiresAt.Time.Before(time.Now())) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "Invalid or expired invite code"})
+			return
+		}
+		ctx = context.WithValue(ctx, "tenant_id", invite.TenantID)
+		
 		hashed, err := utils.HashPassword(req.Password)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
@@ -149,6 +157,7 @@ func (h *Handler) Register(c *gin.Context) {
 			handleRegisterDBError(c, err)
 			return
 		}
+		_ = h.Repo.Queries().DeleteTenantInvite(ctx, req.InviteCode)
 
 	case "admin", "platform_admin":
 		if h.AdminInviteCode == "" || subtle.ConstantTimeCompare([]byte(req.InviteCode), []byte(h.AdminInviteCode)) != 1 {
@@ -171,10 +180,17 @@ func (h *Handler) Register(c *gin.Context) {
 		}
 
 	case "tenant_admin":
-		if h.AdminInviteCode == "" || subtle.ConstantTimeCompare([]byte(req.InviteCode), []byte(h.AdminInviteCode)) != 1 {
-			c.JSON(http.StatusForbidden, gin.H{"error": "Tenant admin registration is restricted or invalid invite code"})
+		invite, err := h.Repo.Queries().GetTenantInviteByCode(ctx, req.InviteCode)
+		if err != nil {
+			c.JSON(http.StatusForbidden, gin.H{"error": "Invalid invite code"})
 			return
 		}
+		if invite.Role != "tenant_admin" || (invite.ExpiresAt.Valid && invite.ExpiresAt.Time.Before(time.Now())) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "Invalid or expired invite code"})
+			return
+		}
+		ctx = context.WithValue(ctx, "tenant_id", invite.TenantID)
+
 		hashed, err := utils.HashPassword(req.Password)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
@@ -189,6 +205,7 @@ func (h *Handler) Register(c *gin.Context) {
 			handleRegisterDBError(c, err)
 			return
 		}
+		_ = h.Repo.Queries().DeleteTenantInvite(ctx, req.InviteCode)
 
 	default:
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid role"})
@@ -330,6 +347,9 @@ func (h *Handler) Login(c *gin.Context) {
 			Metadata:   json.RawMessage(fmt.Sprintf(`{"role":%q}`, req.Role)),
 		})
 	}
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie("access_token", tokenString, 900, "/", "", true, true)
+	c.SetCookie("refresh_token", rawRefresh, 7*24*3600, "/api/auth", "", true, true)
 
 	c.JSON(http.StatusOK, gin.H{
 		"access_token":  tokenString,
@@ -337,6 +357,7 @@ func (h *Handler) Login(c *gin.Context) {
 		"token_type":    "Bearer",
 		"expires_in":    900,
 		"token":         tokenString,
+		"role":          req.Role,
 	})
 }
 
@@ -345,7 +366,19 @@ func (h *Handler) RefreshToken(c *gin.Context) {
 	var req struct {
 		RefreshToken string `json:"refresh_token"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.RefreshToken) == "" {
+	
+	// Try to get from cookie first
+	cookieToken, err := c.Cookie("refresh_token")
+	if err == nil && cookieToken != "" {
+		req.RefreshToken = cookieToken
+	} else {
+		// Fallback to JSON body if no cookie is present (for programmatic clients if needed)
+		if err := c.ShouldBindJSON(&req); err != nil {
+			// ignore error if body is empty, we just check the struct field next
+		}
+	}
+
+	if strings.TrimSpace(req.RefreshToken) == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "refresh_token is required"})
 		return
 	}
@@ -453,6 +486,10 @@ func (h *Handler) RefreshToken(c *gin.Context) {
 		return
 	}
 
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie("access_token", tokenString, 900, "/", "", true, true)
+	c.SetCookie("refresh_token", newRawRefresh, 7*24*3600, "/api/auth", "", true, true)
+
 	c.JSON(http.StatusOK, gin.H{
 		"access_token":  tokenString,
 		"refresh_token": newRawRefresh,
@@ -468,20 +505,29 @@ func (h *Handler) Logout(c *gin.Context) {
 		RefreshToken string `json:"refresh_token"`
 		AllDevices   bool   `json:"all_devices,omitempty"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.RefreshToken) == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "refresh_token is required"})
-		return
+
+	cookieToken, err := c.Cookie("refresh_token")
+	if err == nil && cookieToken != "" {
+		req.RefreshToken = cookieToken
+	} else {
+		_ = c.ShouldBindJSON(&req)
 	}
 
-	tokenHash := hashToken(req.RefreshToken)
-	existingToken, err := h.Repo.GetRefreshTokenByHash(c.Request.Context(), tokenHash)
-	if err == nil {
-		if req.AllDevices {
-			_ = h.Repo.RevokeAllUserRefreshTokens(c.Request.Context(), existingToken.UserID)
-		} else if existingToken.RevokedAt == nil {
-			_ = h.Repo.RevokeRefreshToken(c.Request.Context(), existingToken.ID, nil)
+	if strings.TrimSpace(req.RefreshToken) != "" {
+		tokenHash := hashToken(req.RefreshToken)
+		existingToken, err := h.Repo.GetRefreshTokenByHash(c.Request.Context(), tokenHash)
+		if err == nil {
+			if req.AllDevices {
+				_ = h.Repo.RevokeAllUserRefreshTokens(c.Request.Context(), existingToken.UserID)
+			} else if existingToken.RevokedAt == nil {
+				_ = h.Repo.RevokeRefreshToken(c.Request.Context(), existingToken.ID, nil)
+			}
 		}
 	}
+
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie("access_token", "", -1, "/", "", true, true)
+	c.SetCookie("refresh_token", "", -1, "/api/auth", "", true, true)
 
 	h.audit(c, audit.ActionUserLogout, "session", nil, nil, http.StatusOK, map[string]interface{}{
 		"all_devices": req.AllDevices,
