@@ -569,7 +569,7 @@ func setupRouter(h *api.Handler, storageType string, jwtSecret []byte) *gin.Engi
 
 		// Platform-only Routes (accessible by platform_admin)
 		platformGroup := authGroup.Group("/platform")
-		platformGroup.Use(api.RequireRole("platform_admin"))
+		platformGroup.Use(api.RequirePlatformAdmin())
 		{
 			platformGroup.POST("/tenants", h.CreateTenant)
 			platformGroup.POST("/tenants/:id/invites", h.CreateTenantInvite)

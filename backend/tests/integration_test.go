@@ -54,7 +54,7 @@ func TestLiveDB_AdminDecouplingAndQueries(t *testing.T) {
 
 	// 1. Create Admin
 	adminEmail := fmt.Sprintf("admin-%s@vitalwatch.org", uuid.New().String()[:8])
-	adminID, err := repo.CreateAdmin(ctx, "Alice", "Admin", adminEmail, hashedPassword, "Compliance")
+	adminID, err := repo.CreateAdmin(ctx, "Alice", "Admin", adminEmail, hashedPassword, "Compliance", "tenant_admin")
 	if err != nil {
 		t.Fatalf("failed to create admin: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestLiveDB_AdminDecouplingAndQueries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to get admin by email: %v", err)
 	}
-	if admin.ID != adminID || admin.Department != "Compliance" || admin.Role != "admin" {
+	if admin.ID != adminID || admin.Department != "Compliance" || admin.Role != "tenant_admin" {
 		t.Errorf("unexpected admin fields: %+v", admin)
 	}
 

@@ -41,7 +41,7 @@ func setupAdminTestRouter(h *Handler, jwtSecret []byte) *gin.Engine {
 		}
 
 		adminGroup := authGroup.Group("/admin")
-		adminGroup.Use(RequireRole("admin"))
+		adminGroup.Use(RequireRole("admin", "tenant_admin", "platform_admin"))
 		{
 			adminGroup.GET("/users", h.ListUsers)
 			adminGroup.PATCH("/users/:id/status", h.ToggleUserStatus)
@@ -56,7 +56,7 @@ func TestAdminRegister_ValidInviteCode(t *testing.T) {
 	adminID := uuid.New()
 
 	mockRepo := &repository.MockRepository{
-		CreateAdminFunc: func(ctx context.Context, firstName, lastName, email, hashedPassword, department string) (uuid.UUID, error) {
+		CreateAdminFunc: func(ctx context.Context, firstName, lastName, email, hashedPassword, department, role string) (uuid.UUID, error) {
 			if firstName != "Sarah" || lastName != "Connor" {
 				t.Errorf("unexpected name: %s %s", firstName, lastName)
 			}
@@ -772,5 +772,109 @@ func TestMultiTenancy_PlatformAndTenantAdminRoles(t *testing.T) {
 	r.ServeHTTP(wTenPlat, reqTenPlat)
 	if wTenPlat.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 Forbidden for tenant_admin accessing /platform-only, got %d", wTenPlat.Code)
+	}
+}
+
+func TestTenantAdmin_Lifecycle_Profile_And_Guards(t *testing.T) {
+	jwtSecret := []byte("test-jwt-secret-key-32bytes-long!")
+	tenantID := uuid.New()
+	adminID := uuid.New()
+	hashed, _ := utils.HashPassword("StrongP@ssw0rd123!")
+
+	mockRepo := &repository.MockRepository{
+		GetAdminByEmailFunc: func(ctx context.Context, email string) (models.Admin, error) {
+			return models.Admin{
+				ID:             adminID,
+				Email:          email,
+				FirstName:      "Clinic",
+				LastName:       "Admin",
+				Department:     "Management",
+				HashedPassword: hashed,
+				Role:           "tenant_admin",
+				TenantID:       tenantID,
+			}, nil
+		},
+		GetAdminByIDFunc: func(ctx context.Context, id uuid.UUID) (models.Admin, error) {
+			return models.Admin{
+				ID:             id,
+				Email:          "clinic-admin@vitalwatch.local",
+				FirstName:      "Clinic",
+				LastName:       "Admin",
+				Department:     "Management",
+				HashedPassword: hashed,
+				Role:           "tenant_admin",
+				TenantID:       tenantID,
+			}, nil
+		},
+	}
+
+	h := &Handler{
+		Repo:      mockRepo,
+		JWTSecret: jwtSecret,
+	}
+
+	r := gin.New()
+	r.POST("/api/login", h.Login)
+
+	authGroup := r.Group("/api")
+	authGroup.Use(h.AuthMiddleware()) // Enforces IsUserActive
+	{
+		authGroup.GET("/profile", h.GetUserProfile)
+		adminGroup := authGroup.Group("/admin")
+		adminGroup.Use(RequireTenantAdmin())
+		{
+			adminGroup.GET("/dashboard", func(c *gin.Context) {
+				c.JSON(http.StatusOK, gin.H{"status": "ok"})
+			})
+		}
+	}
+
+	// 1. Login as tenant_admin
+	loginBody, _ := json.Marshal(map[string]string{
+		"role":     "tenant_admin",
+		"email":    "clinic-admin@vitalwatch.local",
+		"password": "StrongP@ssw0rd123!",
+	})
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/login", bytes.NewReader(loginBody))
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for tenant_admin login, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var loginResp struct {
+		AccessToken string `json:"access_token"`
+		Role        string `json:"role"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &loginResp)
+	if loginResp.Role != "tenant_admin" {
+		t.Fatalf("expected role tenant_admin in login response, got %s", loginResp.Role)
+	}
+
+	// 2. Fetch Profile via h.AuthMiddleware() -> must pass IsUserActive and return tenant_admin
+	wProf := httptest.NewRecorder()
+	reqProf, _ := http.NewRequest(http.MethodGet, "/api/profile", nil)
+	reqProf.Header.Set("Authorization", "Bearer "+loginResp.AccessToken)
+	r.ServeHTTP(wProf, reqProf)
+	if wProf.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for tenant_admin /api/profile, got %d: %s", wProf.Code, wProf.Body.String())
+	}
+
+	var prof models.Admin
+	json.Unmarshal(wProf.Body.Bytes(), &prof)
+	if prof.Role != "tenant_admin" {
+		t.Fatalf("expected prof.Role tenant_admin, got %s", prof.Role)
+	}
+	if prof.TenantID != tenantID {
+		t.Fatalf("expected prof.TenantID %s, got %s", tenantID, prof.TenantID)
+	}
+
+	// 3. Access /admin/dashboard protected by RequireTenantAdmin() -> must return 200
+	wDash := httptest.NewRecorder()
+	reqDash, _ := http.NewRequest(http.MethodGet, "/api/admin/dashboard", nil)
+	reqDash.Header.Set("Authorization", "Bearer "+loginResp.AccessToken)
+	r.ServeHTTP(wDash, reqDash)
+	if wDash.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /api/admin/dashboard, got %d: %s", wDash.Code, wDash.Body.String())
 	}
 }

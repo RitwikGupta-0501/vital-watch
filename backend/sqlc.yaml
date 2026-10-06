@@ -14,6 +14,7 @@ sql:
       - "migrations/000011_production_hardening.up.sql"
       - "migrations/000012_ocr_configurations.up.sql"
       - "migrations/000013_multi_tenancy.up.sql"
+      - "migrations/000014_align_admin_role_vocabulary.up.sql"
     queries: "internal/repository/queries"
     gen:
       go:

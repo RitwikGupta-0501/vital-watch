@@ -183,7 +183,7 @@ func (r *DBRepository) GetPatientsByDoctorID(ctx context.Context, doctorID uuid.
 }
 
 // Admin Related Methods
-func (r *DBRepository) CreateAdmin(ctx context.Context, firstName, lastName, email, hashedPassword, department string) (uuid.UUID, error) {
+func (r *DBRepository) CreateAdmin(ctx context.Context, firstName, lastName, email, hashedPassword, department, role string) (uuid.UUID, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return uuid.Nil, err
@@ -191,10 +191,16 @@ func (r *DBRepository) CreateAdmin(ctx context.Context, firstName, lastName, ema
 	defer tx.Rollback(ctx)
 
 	qtx := r.queries.WithTx(tx)
+	tenantID := getTenantID(ctx)
+	if role == "" {
+		role = "tenant_admin"
+	}
 
 	newID, err := qtx.CreateAdminUser(ctx, dbgen.CreateAdminUserParams{
 		Email:          email,
 		HashedPassword: hashedPassword,
+		Role:           role,
+		TenantID:       tenantID,
 	})
 	if err != nil {
 		return uuid.Nil, err
@@ -209,6 +215,7 @@ func (r *DBRepository) CreateAdmin(ctx context.Context, firstName, lastName, ema
 		FirstName:  firstName,
 		LastName:   lastName,
 		Department: pgtype.Text{String: department, Valid: department != ""},
+		TenantID:   tenantID,
 	})
 	if err != nil {
 		return uuid.Nil, err
@@ -237,6 +244,7 @@ func (r *DBRepository) GetAdminByEmail(ctx context.Context, email string) (model
 		Department:     row.Department.String,
 		HashedPassword: row.HashedPassword,
 		Role:           row.Role,
+		TenantID:       row.TenantID,
 		CreatedAt:      row.CreatedAt.Time,
 	}, nil
 }
@@ -256,6 +264,7 @@ func (r *DBRepository) GetAdminByID(ctx context.Context, id uuid.UUID) (models.A
 		LastName:   row.LastName,
 		Department: row.Department.String,
 		Role:       row.Role,
+		TenantID:   row.TenantID,
 		CreatedAt:  row.CreatedAt.Time,
 	}, nil
 }

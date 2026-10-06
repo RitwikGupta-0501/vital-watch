@@ -173,7 +173,7 @@ func (h *Handler) Register(c *gin.Context) {
 		if dept == "" {
 			dept = "Operations"
 		}
-		newID, err = h.Repo.CreateAdmin(ctx, req.FirstName, req.LastName, req.Email, hashed, dept)
+		newID, err = h.Repo.CreateAdmin(ctx, req.FirstName, req.LastName, req.Email, hashed, dept, "platform_admin")
 		if err != nil {
 			handleRegisterDBError(c, err)
 			return
@@ -200,7 +200,7 @@ func (h *Handler) Register(c *gin.Context) {
 		if dept == "" {
 			dept = "Operations"
 		}
-		newID, err = h.Repo.CreateAdmin(ctx, req.FirstName, req.LastName, req.Email, hashed, dept)
+		newID, err = h.Repo.CreateAdmin(ctx, req.FirstName, req.LastName, req.Email, hashed, dept, "tenant_admin")
 		if err != nil {
 			handleRegisterDBError(c, err)
 			return
@@ -284,7 +284,9 @@ func (h *Handler) Login(c *gin.Context) {
 		return
 	}
 
-	if !utils.CheckPasswordHash(req.Password, user.GetHashedPassword()) || (user.GetRole() != "" && user.GetRole() != req.Role) {
+	userRole := user.GetRole()
+	roleMatches := userRole == req.Role || (req.Role == "admin" && (userRole == "tenant_admin" || userRole == "platform_admin"))
+	if !utils.CheckPasswordHash(req.Password, user.GetHashedPassword()) || (userRole != "" && !roleMatches) {
 		// Audit failed login attempt (HIPAA § 164.312(b))
 		userID := user.GetID()
 		if h.Auditor != nil {
@@ -301,10 +303,15 @@ func (h *Handler) Login(c *gin.Context) {
 		return
 	}
 
+	issuedRole := userRole
+	if issuedRole == "" {
+		issuedRole = req.Role
+	}
+
 	// Access token lifetime: 15 minutes (SEC-09)
 	claims := jwt.MapClaims{
 		"sub":       user.GetID().String(),
-		"role":      req.Role,
+		"role":      issuedRole,
 		"tenant_id": user.GetTenantID().String(),
 		"iat":       time.Now().Unix(),
 		"exp":       time.Now().Add(15 * time.Minute).Unix(),
@@ -357,7 +364,7 @@ func (h *Handler) Login(c *gin.Context) {
 		"token_type":    "Bearer",
 		"expires_in":    900,
 		"token":         tokenString,
-		"role":          req.Role,
+		"role":          issuedRole,
 	})
 }
 
@@ -579,7 +586,7 @@ func (h *Handler) GetUserProfile(c *gin.Context) {
 		h.audit(c, audit.ActionViewDoctorProfile, "doctor", &userID, nil, http.StatusOK, nil)
 		c.JSON(http.StatusOK, doctor)
 
-	case "admin":
+	case "admin", "tenant_admin", "platform_admin":
 		admin, err := h.Repo.GetAdminByID(ctx, userID)
 		if err != nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Admin profile not found"})
