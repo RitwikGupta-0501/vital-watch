@@ -79,7 +79,7 @@ func (h *Handler) IsUserActive(ctx context.Context, userID uuid.UUID, role strin
 	case "doctor":
 		_, err := h.Repo.GetDoctorByID(ctx, userID)
 		active = (err == nil)
-	case "admin":
+	case "admin", "tenant_admin", "platform_admin":
 		_, err := h.Repo.GetAdminByID(ctx, userID)
 		active = (err == nil)
 	default:

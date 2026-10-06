@@ -184,7 +184,7 @@ func (a Admin) GetRole() string {
 	if a.Role != "" {
 		return a.Role
 	}
-	return "admin"
+	return "tenant_admin"
 }
 
 type Appointment struct {

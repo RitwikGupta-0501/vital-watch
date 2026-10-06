@@ -17,6 +17,7 @@ type AdminProfile struct {
 	Department pgtype.Text        `json:"department"`
 	CreatedAt  pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt  pgtype.Timestamptz `json:"updated_at"`
+	TenantID   uuid.UUID          `json:"tenant_id"`
 }
 
 type Appointment struct {

@@ -95,7 +95,7 @@ type Repository interface {
 	GetAuditLogs(ctx context.Context, limit, offset int) ([]models.PhiAuditLog, error)
 
 	// Administration & System Governance
-	CreateAdmin(ctx context.Context, firstName, lastName, email, hashedPassword, department string) (uuid.UUID, error)
+	CreateAdmin(ctx context.Context, firstName, lastName, email, hashedPassword, department, role string) (uuid.UUID, error)
 	GetAdminByEmail(ctx context.Context, email string) (models.Admin, error)
 	GetAdminByID(ctx context.Context, id uuid.UUID) (models.Admin, error)
 	GetAllUsers(ctx context.Context, limit, offset int) ([]models.User, error)

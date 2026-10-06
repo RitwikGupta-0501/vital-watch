@@ -13,8 +13,8 @@ import (
 )
 
 const createAdminProfile = `-- name: CreateAdminProfile :exec
-INSERT INTO admin_profiles (user_id, first_name, last_name, department)
-VALUES ($1, $2, $3, $4)
+INSERT INTO admin_profiles (user_id, first_name, last_name, department, tenant_id)
+VALUES ($1, $2, $3, $4, $5)
 `
 
 type CreateAdminProfileParams struct {
@@ -22,6 +22,7 @@ type CreateAdminProfileParams struct {
 	FirstName  string      `json:"first_name"`
 	LastName   string      `json:"last_name"`
 	Department pgtype.Text `json:"department"`
+	TenantID   uuid.UUID   `json:"tenant_id"`
 }
 
 func (q *Queries) CreateAdminProfile(ctx context.Context, arg CreateAdminProfileParams) error {
@@ -30,34 +31,41 @@ func (q *Queries) CreateAdminProfile(ctx context.Context, arg CreateAdminProfile
 		arg.FirstName,
 		arg.LastName,
 		arg.Department,
+		arg.TenantID,
 	)
 	return err
 }
 
 const createAdminUser = `-- name: CreateAdminUser :one
 INSERT INTO users (email, hashed_password, role, tenant_id)
-VALUES ($1, $2, 'admin', $3)
+VALUES ($1, $2, $3, $4)
 RETURNING id
 `
 
 type CreateAdminUserParams struct {
 	Email          string    `json:"email"`
 	HashedPassword string    `json:"hashed_password"`
+	Role           string    `json:"role"`
 	TenantID       uuid.UUID `json:"tenant_id"`
 }
 
 func (q *Queries) CreateAdminUser(ctx context.Context, arg CreateAdminUserParams) (uuid.UUID, error) {
-	row := q.db.QueryRow(ctx, createAdminUser, arg.Email, arg.HashedPassword, arg.TenantID)
+	row := q.db.QueryRow(ctx, createAdminUser,
+		arg.Email,
+		arg.HashedPassword,
+		arg.Role,
+		arg.TenantID,
+	)
 	var id uuid.UUID
 	err := row.Scan(&id)
 	return id, err
 }
 
 const getAdminByEmail = `-- name: GetAdminByEmail :one
-SELECT u.id, u.email, a.first_name, a.last_name, a.department, u.hashed_password, u.role, u.created_at
+SELECT u.id, u.email, a.first_name, a.last_name, a.department, u.hashed_password, u.role, u.tenant_id, u.created_at
 FROM users u
 JOIN admin_profiles a ON u.id = a.user_id
-WHERE u.email = $1 AND u.role = 'admin' AND u.is_active = true AND u.tenant_id = $2
+WHERE u.email = $1 AND u.role IN ('tenant_admin', 'platform_admin') AND u.is_active = true AND u.tenant_id = $2
 `
 
 type GetAdminByEmailParams struct {
@@ -73,6 +81,7 @@ type GetAdminByEmailRow struct {
 	Department     pgtype.Text        `json:"department"`
 	HashedPassword string             `json:"hashed_password"`
 	Role           string             `json:"role"`
+	TenantID       uuid.UUID          `json:"tenant_id"`
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 }
 
@@ -87,16 +96,17 @@ func (q *Queries) GetAdminByEmail(ctx context.Context, arg GetAdminByEmailParams
 		&i.Department,
 		&i.HashedPassword,
 		&i.Role,
+		&i.TenantID,
 		&i.CreatedAt,
 	)
 	return i, err
 }
 
 const getAdminByID = `-- name: GetAdminByID :one
-SELECT u.id, u.email, a.first_name, a.last_name, a.department, u.role, u.created_at
+SELECT u.id, u.email, a.first_name, a.last_name, a.department, u.role, u.tenant_id, u.created_at
 FROM users u
 JOIN admin_profiles a ON u.id = a.user_id
-WHERE u.id = $1 AND u.role = 'admin' AND u.is_active = true AND u.tenant_id = $2
+WHERE u.id = $1 AND u.role IN ('tenant_admin', 'platform_admin') AND u.is_active = true AND u.tenant_id = $2
 `
 
 type GetAdminByIDParams struct {
@@ -111,6 +121,7 @@ type GetAdminByIDRow struct {
 	LastName   string             `json:"last_name"`
 	Department pgtype.Text        `json:"department"`
 	Role       string             `json:"role"`
+	TenantID   uuid.UUID          `json:"tenant_id"`
 	CreatedAt  pgtype.Timestamptz `json:"created_at"`
 }
 
@@ -124,6 +135,7 @@ func (q *Queries) GetAdminByID(ctx context.Context, arg GetAdminByIDParams) (Get
 		&i.LastName,
 		&i.Department,
 		&i.Role,
+		&i.TenantID,
 		&i.CreatedAt,
 	)
 	return i, err

@@ -70,7 +70,7 @@ type MockRepository struct {
 	CreateAuditLogFunc             func(ctx context.Context, log models.PhiAuditLog) (uuid.UUID, error)
 	GetAuditLogsByPatientIDFunc    func(ctx context.Context, patientID uuid.UUID, limit, offset int) ([]models.PhiAuditLog, error)
 	GetAuditLogsFunc               func(ctx context.Context, limit, offset int) ([]models.PhiAuditLog, error)
-	CreateAdminFunc                func(ctx context.Context, firstName, lastName, email, hashedPassword, department string) (uuid.UUID, error)
+	CreateAdminFunc                func(ctx context.Context, firstName, lastName, email, hashedPassword, department, role string) (uuid.UUID, error)
 	GetAdminByEmailFunc            func(ctx context.Context, email string) (models.Admin, error)
 	GetAdminByIDFunc               func(ctx context.Context, id uuid.UUID) (models.Admin, error)
 	GetAllUsersFunc                func(ctx context.Context, limit, offset int) ([]models.User, error)
@@ -501,9 +501,9 @@ func (m *MockRepository) GetAuditLogs(ctx context.Context, limit, offset int) ([
 	return []models.PhiAuditLog{}, nil
 }
 
-func (m *MockRepository) CreateAdmin(ctx context.Context, firstName, lastName, email, hashedPassword, department string) (uuid.UUID, error) {
+func (m *MockRepository) CreateAdmin(ctx context.Context, firstName, lastName, email, hashedPassword, department, role string) (uuid.UUID, error) {
 	if m.CreateAdminFunc != nil {
-		return m.CreateAdminFunc(ctx, firstName, lastName, email, hashedPassword, department)
+		return m.CreateAdminFunc(ctx, firstName, lastName, email, hashedPassword, department, role)
 	}
 	return uuid.New(), nil
 }
