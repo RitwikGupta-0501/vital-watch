@@ -124,6 +124,7 @@ func (h *Handler) Register(c *gin.Context) {
 	var newID uuid.UUID
 	switch req.Role {
 	case "patient":
+		ctx = context.WithValue(ctx, "role", "patient")
 		hashed, err := utils.HashPassword(req.Password)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
@@ -146,6 +147,7 @@ func (h *Handler) Register(c *gin.Context) {
 			return
 		}
 		ctx = context.WithValue(ctx, "tenant_id", invite.TenantID)
+		ctx = context.WithValue(ctx, "role", "doctor")
 		
 		hashed, err := utils.HashPassword(req.Password)
 		if err != nil {
@@ -164,6 +166,7 @@ func (h *Handler) Register(c *gin.Context) {
 			c.JSON(http.StatusForbidden, gin.H{"error": "Admin registration is restricted or invalid invite code"})
 			return
 		}
+		ctx = context.WithValue(ctx, "role", "platform_admin")
 		hashed, err := utils.HashPassword(req.Password)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
@@ -190,6 +193,7 @@ func (h *Handler) Register(c *gin.Context) {
 			return
 		}
 		ctx = context.WithValue(ctx, "tenant_id", invite.TenantID)
+		ctx = context.WithValue(ctx, "role", "tenant_admin")
 
 		hashed, err := utils.HashPassword(req.Password)
 		if err != nil {
