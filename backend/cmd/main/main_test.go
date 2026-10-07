@@ -91,3 +91,32 @@ func TestSetupRouter_CORSTracingHeaders(t *testing.T) {
 		t.Errorf("expected Access-Control-Expose-Headers to contain x-request-id, got: %s", exposeHeaders)
 	}
 }
+
+func TestSetupRouter_MetricsProtection(t *testing.T) {
+	t.Setenv("METRICS_SCRAPE_TOKEN", "ci-metrics-token-abc")
+	jwtSecret := []byte("secret-for-main-test-longer-than-32-bytes!!")
+	h := &api.Handler{
+		Storage:   storage.NewMockProvider(),
+		JWTSecret: jwtSecret,
+	}
+
+	r := setupRouter(h, "local", jwtSecret)
+
+	// 1. Unauthenticated request to /metrics is rejected with 401
+	reqUnauth, _ := http.NewRequest(http.MethodGet, "/metrics", nil)
+	wUnauth := httptest.NewRecorder()
+	r.ServeHTTP(wUnauth, reqUnauth)
+	if wUnauth.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for unauthenticated /metrics, got %d", wUnauth.Code)
+	}
+
+	// 2. Request with scrape token succeeds with 200
+	reqToken, _ := http.NewRequest(http.MethodGet, "/metrics", nil)
+	reqToken.Header.Set("Authorization", "Bearer ci-metrics-token-abc")
+	wToken := httptest.NewRecorder()
+	r.ServeHTTP(wToken, reqToken)
+	if wToken.Code != http.StatusOK {
+		t.Errorf("expected 200 for /metrics with scrape token, got %d", wToken.Code)
+	}
+}
+

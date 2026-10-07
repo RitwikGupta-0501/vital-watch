@@ -4,6 +4,7 @@ global:
 scrape_configs:
   - job_name: 'vital-watch-api'
     scrape_interval: 15s
+    bearer_token: 'vital-watch-prometheus-scrape-token'
     static_configs:
       - targets: ['api:8080']
   - job_name: 'postgres-exporter'
