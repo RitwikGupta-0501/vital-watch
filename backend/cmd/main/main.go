@@ -491,7 +491,8 @@ func setupRouter(h *api.Handler, storageType string, jwtSecret []byte) *gin.Engi
 	// -----------------------
 	// -       Routes        -
 	// -----------------------
-	r.GET("/metrics", gin.WrapH(promhttp.Handler())) // Prometheus metrics endpoint
+	scrapeToken := os.Getenv("METRICS_SCRAPE_TOKEN")
+	r.GET("/metrics", api.MetricsProtectionMiddleware(jwtSecret, scrapeToken), gin.WrapH(promhttp.Handler())) // Prometheus metrics endpoint
 	r.GET("/healthz", h.HealthCheck)
 	r.GET("/api/healthz", h.HealthCheck)
 	r.GET("/api/ping", h.Ping)

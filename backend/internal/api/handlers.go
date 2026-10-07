@@ -368,3 +368,60 @@ func RequireTenantAdmin() gin.HandlerFunc {
 		c.Next()
 	}
 }
+
+// MetricsProtectionMiddleware secures the Prometheus /metrics endpoint against unauthorized scraping (SEC-14).
+// If scrapeToken is non-empty, requests with a matching 'Bearer <scrapeToken>' header or
+// 'Authorization: <scrapeToken>' header are permitted immediately.
+// Otherwise, requests must be authenticated via a valid JWT token with platform_admin privileges.
+func MetricsProtectionMiddleware(jwtSecret []byte, scrapeToken string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// 1. Check dedicated scrape token (for Prometheus/Grafana scrape agents)
+		if scrapeToken != "" {
+			authHeader := c.GetHeader("Authorization")
+			if authHeader != "" {
+				tokenStr := authHeader
+				if strings.HasPrefix(authHeader, "Bearer ") {
+					tokenStr = strings.TrimPrefix(authHeader, "Bearer ")
+				}
+				if tokenStr == scrapeToken {
+					c.Next()
+					return
+				}
+			}
+		}
+
+		// 2. Fallback to platform_admin JWT authentication
+		if len(jwtSecret) > 0 {
+			authHeader := c.GetHeader("Authorization")
+			var tokenString string
+			if strings.HasPrefix(authHeader, "Bearer ") {
+				tokenString = strings.TrimPrefix(authHeader, "Bearer ")
+			}
+			if tokenString == "" {
+				if cookieToken, err := c.Cookie("access_token"); err == nil && cookieToken != "" {
+					tokenString = cookieToken
+				}
+			}
+
+			if tokenString != "" {
+				token, err := jwt.Parse(tokenString, func(t *jwt.Token) (interface{}, error) {
+					if t.Method.Alg() != jwt.SigningMethodHS256.Alg() {
+						return nil, jwt.ErrSignatureInvalid
+					}
+					return jwtSecret, nil
+				})
+				if err == nil && token.Valid {
+					if claims, ok := token.Claims.(jwt.MapClaims); ok {
+						if role, ok := claims["role"].(string); ok && role == "platform_admin" {
+							c.Next()
+							return
+						}
+					}
+				}
+			}
+		}
+
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized: metrics access requires valid scrape token or platform_admin credentials"})
+	}
+}
+
