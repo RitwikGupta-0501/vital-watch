@@ -45,6 +45,39 @@ func getTenantID(ctx context.Context) uuid.UUID {
 	return uuid.Nil
 }
 
+func (r *DBRepository) beginTxWithRLS(ctx context.Context) (pgx.Tx, *dbgen.Queries, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	tenantID := getTenantID(ctx)
+	if tenantID != uuid.Nil {
+		if _, err := tx.Exec(ctx, "SELECT set_config('app.current_tenant', $1, true)", tenantID.String()); err != nil {
+			_ = tx.Rollback(ctx)
+			return nil, nil, fmt.Errorf("failed to set app.current_tenant for RLS: %w", err)
+		}
+	}
+
+	isPlatformAdmin := false
+	if rVal := ctx.Value("role"); rVal != nil {
+		if rStr, ok := rVal.(string); ok && rStr == "platform_admin" {
+			isPlatformAdmin = true
+		}
+	}
+
+	adminFlag := "false"
+	if isPlatformAdmin {
+		adminFlag = "true"
+	}
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.is_platform_admin', $1, true)", adminFlag); err != nil {
+		_ = tx.Rollback(ctx)
+		return nil, nil, fmt.Errorf("failed to set app.is_platform_admin for RLS: %w", err)
+	}
+
+	return tx, r.queries.WithTx(tx), nil
+}
+
 
 // New creates a new DBRepository instance
 func New(pool *pgxpool.Pool, riverClient *river.Client[pgx.Tx]) *DBRepository {
@@ -86,13 +119,11 @@ func clampPagination(limit, offset int) (int, int) {
 
 // Patient Related Methods
 func (r *DBRepository) CreatePatient(ctx context.Context, firstName, lastName, email, hashedPassword string) (uuid.UUID, error) {
-	tx, err := r.pool.Begin(ctx)
+	tx, qtx, err := r.beginTxWithRLS(ctx)
 	if err != nil {
 		return uuid.Nil, err
 	}
 	defer tx.Rollback(ctx)
-
-	qtx := r.queries.WithTx(tx)
 
 	newID, err := qtx.CreatePatientUser(ctx, dbgen.CreatePatientUserParams{
 		TenantID: getTenantID(ctx),
@@ -187,13 +218,12 @@ func (r *DBRepository) GetPatientsByDoctorID(ctx context.Context, doctorID uuid.
 
 // Admin Related Methods
 func (r *DBRepository) CreateAdmin(ctx context.Context, firstName, lastName, email, hashedPassword, department, role string) (uuid.UUID, error) {
-	tx, err := r.pool.Begin(ctx)
+	tx, qtx, err := r.beginTxWithRLS(ctx)
 	if err != nil {
 		return uuid.Nil, err
 	}
 	defer tx.Rollback(ctx)
 
-	qtx := r.queries.WithTx(tx)
 	tenantID := getTenantID(ctx)
 	if role == "" {
 		role = "tenant_admin"
@@ -313,13 +343,11 @@ func (r *DBRepository) UpdateUserActiveStatus(ctx context.Context, id uuid.UUID,
 
 // Doctor Related Methods
 func (r *DBRepository) CreateDoctor(ctx context.Context, firstName, lastName, email, hashedPassword, specialty string, experience int) (uuid.UUID, error) {
-	tx, err := r.pool.Begin(ctx)
+	tx, qtx, err := r.beginTxWithRLS(ctx)
 	if err != nil {
 		return uuid.Nil, err
 	}
 	defer tx.Rollback(ctx)
-
-	qtx := r.queries.WithTx(tx)
 
 	newID, err := qtx.CreateDoctorUser(ctx, dbgen.CreateDoctorUserParams{
 		TenantID: getTenantID(ctx),
@@ -693,13 +721,11 @@ func (r *DBRepository) CancelAppointmentByParticipant(ctx context.Context, appoi
 // Prescription Methods: Dual-Mode, Atomic Enqueue, and Review
 
 func (r *DBRepository) CreateUploadedPrescriptionWithJob(ctx context.Context, patientID, doctorID uuid.UUID, fileName, notes string, ocrEnabled bool) (uuid.UUID, string, error) {
-	tx, err := r.pool.Begin(ctx)
+	tx, qtx, err := r.beginTxWithRLS(ctx)
 	if err != nil {
 		return uuid.Nil, "", err
 	}
 	defer tx.Rollback(ctx)
-
-	qtx := r.queries.WithTx(tx)
 
 	status := "pending_ocr"
 	if !ocrEnabled || r.riverClient == nil {
@@ -805,7 +831,7 @@ func calculatePrescriptionExpiry(items []models.PrescriptionItem) time.Time {
 }
 
 func (r *DBRepository) CreateDigitalPrescription(ctx context.Context, patientID, doctorID uuid.UUID, notes string, items []models.PrescriptionItem) (uuid.UUID, error) {
-	tx, err := r.pool.Begin(ctx)
+	tx, qtx, err := r.beginTxWithRLS(ctx)
 	if err != nil {
 		return uuid.Nil, err
 	}
@@ -817,7 +843,6 @@ func (r *DBRepository) CreateDigitalPrescription(ctx context.Context, patientID,
 		exp = pgtype.Timestamptz{Time: expTime, Valid: !expTime.IsZero()}
 	}
 
-	qtx := r.queries.WithTx(tx)
 	newID, err := qtx.CreateDigitalPrescription(ctx, dbgen.CreateDigitalPrescriptionParams{
 		TenantID: getTenantID(ctx),
 		PatientID: patientID,
@@ -853,13 +878,11 @@ func (r *DBRepository) CreateDigitalPrescription(ctx context.Context, patientID,
 }
 
 func (r *DBRepository) UpdatePrescriptionOCRResults(ctx context.Context, prescriptionID uuid.UUID, status, notes, ocrProvider string, items []models.PrescriptionItem) error {
-	tx, err := r.pool.Begin(ctx)
+	tx, qtx, err := r.beginTxWithRLS(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
-
-	qtx := r.queries.WithTx(tx)
 
 	rowsAffected, err := qtx.UpdatePrescriptionOCRStatus(ctx, dbgen.UpdatePrescriptionOCRStatusParams{
 		TenantID: getTenantID(ctx),
@@ -904,13 +927,11 @@ func (r *DBRepository) UpdatePrescriptionOCRResults(ctx context.Context, prescri
 }
 
 func (r *DBRepository) VerifyPrescription(ctx context.Context, prescriptionID, doctorID uuid.UUID, status, notes string, items []models.PrescriptionItem) (bool, error) {
-	tx, err := r.pool.Begin(ctx)
+	tx, qtx, err := r.beginTxWithRLS(ctx)
 	if err != nil {
 		return false, err
 	}
 	defer tx.Rollback(ctx)
-
-	qtx := r.queries.WithTx(tx)
 
 	rowsAffected, err := qtx.VerifyPrescription(ctx, dbgen.VerifyPrescriptionParams{
 		TenantID: getTenantID(ctx),
@@ -1396,13 +1417,12 @@ func (r *DBRepository) GetDoctorScheduleByDay(ctx context.Context, doctorID uuid
 }
 
 func (r *DBRepository) UpsertDoctorSchedulesTx(ctx context.Context, doctorID uuid.UUID, schedules []models.DoctorSchedule) ([]models.DoctorSchedule, error) {
-	tx, err := r.pool.Begin(ctx)
+	tx, qtx, err := r.beginTxWithRLS(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to begin schedule transaction: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
-	qtx := r.queries.WithTx(tx)
 	saved := make([]models.DoctorSchedule, 0, len(schedules))
 
 	for _, schedule := range schedules {
@@ -1835,14 +1855,11 @@ func (r *DBRepository) RevokeAllUserRefreshTokens(ctx context.Context, userID uu
 //     can recover without being permanently locked out.
 //  3. Otherwise, creates the new token and revokes the old one in the same transaction.
 func (r *DBRepository) RotateRefreshToken(ctx context.Context, oldTokenID, userID uuid.UUID, newHash string, expiresAt time.Time) (models.RefreshToken, error) {
-	tx, err := r.pool.Begin(ctx)
+	tx, qtx, err := r.beginTxWithRLS(ctx)
 	if err != nil {
 		return models.RefreshToken{}, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
-
-	// Lock the old token row to serialise concurrent refresh attempts.
-	qtx := r.queries.WithTx(tx)
 
 	// Lock the old token row to serialise concurrent refresh attempts, scoped strictly to the authenticated user.
 	oldToken, err := qtx.LockRefreshTokenForRotation(ctx, dbgen.LockRefreshTokenForRotationParams{

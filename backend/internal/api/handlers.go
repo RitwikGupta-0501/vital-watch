@@ -247,6 +247,7 @@ func parseTokenMiddleware(jwtSecret []byte, checker userActiveChecker) gin.Handl
 
 			c.Set("userID", userID)
 			c.Set("role", role)
+			c.Request = c.Request.WithContext(context.WithValue(c.Request.Context(), "role", role))
 		}
 
 		c.Next()

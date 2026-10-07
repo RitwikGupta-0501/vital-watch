@@ -52,3 +52,30 @@ func TestClampPagination(t *testing.T) {
 		}
 	}
 }
+
+func TestGetTenantID(t *testing.T) {
+	// 1. Nil context value
+	if id := getTenantID(context.Background()); id != uuid.Nil {
+		t.Fatalf("expected uuid.Nil for empty context, got: %v", id)
+	}
+
+	// 2. uuid.UUID in context
+	expected := uuid.New()
+	ctxUUID := context.WithValue(context.Background(), "tenant_id", expected)
+	if id := getTenantID(ctxUUID); id != expected {
+		t.Fatalf("expected %v, got %v", expected, id)
+	}
+
+	// 3. String in context
+	ctxStr := context.WithValue(context.Background(), "tenant_id", expected.String())
+	if id := getTenantID(ctxStr); id != expected {
+		t.Fatalf("expected %v, got %v", expected, id)
+	}
+
+	// 4. Invalid string
+	ctxInvalid := context.WithValue(context.Background(), "tenant_id", "invalid-uuid")
+	if id := getTenantID(ctxInvalid); id != uuid.Nil {
+		t.Fatalf("expected uuid.Nil for invalid string, got %v", id)
+	}
+}
+

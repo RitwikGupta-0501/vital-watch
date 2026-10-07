@@ -678,3 +678,97 @@ func TestLiveDB_TelehealthDecoupledConcurrency(t *testing.T) {
 
 	<-doneGen
 }
+
+func TestLiveDB_RowLevelSecurityIsolation(t *testing.T) {
+	pool, _, teardown := SetupTestDB(t)
+	if pool == nil {
+		return
+	}
+	defer teardown()
+
+	ctx := context.Background()
+
+	// 1. Create two test tenants
+	tenantA := uuid.New()
+	tenantB := uuid.New()
+
+	_, err := pool.Exec(ctx, "INSERT INTO tenants (id, name, domain) VALUES ($1, $2, $3), ($4, $5, $6) ON CONFLICT (id) DO NOTHING",
+		tenantA, "Clinic A", "clinica.local",
+		tenantB, "Clinic B", "clinicb.local",
+	)
+	if err != nil {
+		t.Fatalf("failed to insert test tenants: %v", err)
+	}
+
+	// 2. Insert a patient user belonging to Tenant A using a direct transaction with Tenant A RLS
+	userA := uuid.New()
+	txA, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("failed to begin txA: %v", err)
+	}
+	defer txA.Rollback(ctx)
+
+	if _, err := txA.Exec(ctx, "SELECT set_config('app.current_tenant', $1, true)", tenantA.String()); err != nil {
+		t.Fatalf("failed to set tenantA: %v", err)
+	}
+	if _, err := txA.Exec(ctx, "SELECT set_config('app.is_platform_admin', 'false', true)"); err != nil {
+		t.Fatalf("failed to set is_platform_admin false: %v", err)
+	}
+
+	_, err = txA.Exec(ctx, `
+		INSERT INTO users (id, email, hashed_password, role, tenant_id)
+		VALUES ($1, $2, $3, 'patient', $4)`,
+		userA, fmt.Sprintf("pat-%s@clinica.local", userA.String()[:8]), "hashedpwd", tenantA,
+	)
+	if err != nil {
+		t.Fatalf("failed to insert user in tenantA: %v", err)
+	}
+	if err := txA.Commit(ctx); err != nil {
+		t.Fatalf("failed to commit user in tenantA: %v", err)
+	}
+
+	// 3. Query from Tenant B context: row MUST NOT be visible due to RLS
+	txB, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("failed to begin txB: %v", err)
+	}
+	defer txB.Rollback(ctx)
+
+	if _, err := txB.Exec(ctx, "SELECT set_config('app.current_tenant', $1, true)", tenantB.String()); err != nil {
+		t.Fatalf("failed to set tenantB: %v", err)
+	}
+	if _, err := txB.Exec(ctx, "SELECT set_config('app.is_platform_admin', 'false', true)"); err != nil {
+		t.Fatalf("failed to set is_platform_admin false: %v", err)
+	}
+
+	var visibleCount int
+	err = txB.QueryRow(ctx, "SELECT count(*) FROM users WHERE id = $1", userA).Scan(&visibleCount)
+	if err != nil {
+		t.Fatalf("failed to query users under tenantB: %v", err)
+	}
+	if visibleCount != 0 {
+		t.Errorf("expected user %s to be invisible to tenant %s under RLS, but got count %d", userA, tenantB, visibleCount)
+	}
+
+	// 4. Query from Platform Admin context: row MUST be visible via RLS bypass
+	txAdmin, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("failed to begin txAdmin: %v", err)
+	}
+	defer txAdmin.Rollback(ctx)
+
+	// Even with no tenant or default tenant set, platform admin flag grants visibility
+	if _, err := txAdmin.Exec(ctx, "SELECT set_config('app.is_platform_admin', 'true', true)"); err != nil {
+		t.Fatalf("failed to set is_platform_admin true: %v", err)
+	}
+
+	var adminVisibleCount int
+	err = txAdmin.QueryRow(ctx, "SELECT count(*) FROM users WHERE id = $1", userA).Scan(&adminVisibleCount)
+	if err != nil {
+		t.Fatalf("failed to query users under platform_admin: %v", err)
+	}
+	if adminVisibleCount != 1 {
+		t.Errorf("expected user %s to be visible to platform admin under RLS bypass, got count %d", userA, adminVisibleCount)
+	}
+}
+
