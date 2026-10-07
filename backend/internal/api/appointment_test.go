@@ -545,6 +545,9 @@ func TestCreateAppointment_23P01ConflictMapping(t *testing.T) {
 	patientID := uuid.New()
 	doctorID := uuid.New()
 
+	slotStart := time.Now().UTC().Add(2 * time.Hour).Truncate(time.Hour)
+	slotEnd := slotStart.Add(30 * time.Minute)
+
 	var simulateConstraint string
 	mockRepo := &repository.MockRepository{
 		GetDoctorByIDFunc: func(ctx context.Context, id uuid.UUID) (models.Doctor, error) {
@@ -554,7 +557,7 @@ func TestCreateAppointment_23P01ConflictMapping(t *testing.T) {
 			return []models.DoctorSchedule{
 				{
 					DoctorID:     doctorID,
-					DayOfWeek:    int(time.Now().Weekday()),
+					DayOfWeek:    int(slotStart.Weekday()),
 					StartTime:    "00:00",
 					EndTime:      "23:59",
 					SlotDuration: 15,
@@ -579,11 +582,10 @@ func TestCreateAppointment_23P01ConflictMapping(t *testing.T) {
 		h.CreateAppointment(c)
 	})
 
-	now := time.Now().Truncate(time.Hour)
 	bodyBytes, _ := json.Marshal(map[string]interface{}{
 		"doctor_id":  doctorID.String(),
-		"start_time": now.Add(2 * time.Hour).Format(time.RFC3339),
-		"end_time":   now.Add(2*time.Hour + 30*time.Minute).Format(time.RFC3339),
+		"start_time": slotStart.Format(time.RFC3339),
+		"end_time":   slotEnd.Format(time.RFC3339),
 	})
 
 	// Doctor double-booking

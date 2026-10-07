@@ -254,6 +254,7 @@ func TestRefreshToken_TheftDetection(t *testing.T) {
 }
 
 func TestLogout_RevokesToken(t *testing.T) {
+	userID := uuid.New()
 	tokenID := uuid.New()
 	rawRefreshToken := "valid-token-to-logout"
 	expectedHash := hashToken(rawRefreshToken)
@@ -265,6 +266,7 @@ func TestLogout_RevokesToken(t *testing.T) {
 			if tokenHash == expectedHash {
 				return models.RefreshToken{
 					ID:        tokenID,
+					UserID:    userID,
 					TokenHash: tokenHash,
 					ExpiresAt: time.Now().Add(24 * time.Hour),
 					RevokedAt: nil,
@@ -289,6 +291,7 @@ func TestLogout_RevokesToken(t *testing.T) {
 	})
 	req := httptest.NewRequest(http.MethodPost, "/api/auth/logout", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-User-ID", userID.String())
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
