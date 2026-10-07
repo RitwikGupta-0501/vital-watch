@@ -431,18 +431,14 @@ func (h *Handler) RefreshToken(c *gin.Context) {
 		return
 	}
 
-	// Look up user role (Patient, Doctor, or Admin). Active status is asserted by Get*ByID queries.
-	var role string
-	if p, pErr := h.Repo.GetPatientByID(c.Request.Context(), existingToken.UserID); pErr == nil {
-		role = p.Role
-	} else if d, dErr := h.Repo.GetDoctorByID(c.Request.Context(), existingToken.UserID); dErr == nil {
-		role = d.Role
-	} else if a, aErr := h.Repo.GetAdminByID(c.Request.Context(), existingToken.UserID); aErr == nil {
-		role = a.Role
-	} else {
+	// Look up user role, tenant, and active status globally across tenants
+	userRecord, uErr := h.Repo.GetUserByIDGlobal(c.Request.Context(), existingToken.UserID)
+	if uErr != nil || !userRecord.IsActive {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "User account no longer active"})
 		return
 	}
+	role := userRecord.Role
+	tenantID := userRecord.TenantID
 
 	// Generate replacement refresh token
 	newRawRefresh, newRefreshHash, err := generateSecureRandomToken()
@@ -480,11 +476,12 @@ func (h *Handler) RefreshToken(c *gin.Context) {
 
 	// Issue new 15-minute access token
 	claims := jwt.MapClaims{
-		"sub":  existingToken.UserID.String(),
-		"role": role,
-		"iat":  time.Now().Unix(),
-		"exp":  time.Now().Add(15 * time.Minute).Unix(),
-		"iss":  "vital-watch",
+		"sub":       existingToken.UserID.String(),
+		"role":      role,
+		"tenant_id": tenantID.String(),
+		"iat":       time.Now().Unix(),
+		"exp":       time.Now().Add(15 * time.Minute).Unix(),
+		"iss":       "vital-watch",
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	tokenString, err := token.SignedString(h.JWTSecret)

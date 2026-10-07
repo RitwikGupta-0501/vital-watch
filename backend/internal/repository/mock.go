@@ -74,6 +74,7 @@ type MockRepository struct {
 	GetAdminByEmailFunc            func(ctx context.Context, email string) (models.Admin, error)
 	GetAdminByIDFunc               func(ctx context.Context, id uuid.UUID) (models.Admin, error)
 	GetAllUsersFunc                func(ctx context.Context, limit, offset int) ([]models.User, error)
+	GetUserByIDGlobalFunc          func(ctx context.Context, id uuid.UUID) (dbgen.GetUserByIDGlobalRow, error)
 	UpdateUserActiveStatusFunc     func(ctx context.Context, id uuid.UUID, isActive bool) error
 }
 
@@ -527,6 +528,28 @@ func (m *MockRepository) GetAllUsers(ctx context.Context, limit, offset int) ([]
 		return m.GetAllUsersFunc(ctx, limit, offset)
 	}
 	return []models.User{}, nil
+}
+
+func (m *MockRepository) GetUserByIDGlobal(ctx context.Context, id uuid.UUID) (dbgen.GetUserByIDGlobalRow, error) {
+	if m.GetUserByIDGlobalFunc != nil {
+		return m.GetUserByIDGlobalFunc(ctx, id)
+	}
+	if m.GetPatientByIDFunc != nil {
+		if p, err := m.GetPatientByIDFunc(ctx, id); err == nil {
+			return dbgen.GetUserByIDGlobalRow{ID: id, Email: p.Email, Role: p.Role, TenantID: p.TenantID, IsActive: true}, nil
+		}
+	}
+	if m.GetDoctorByIDFunc != nil {
+		if d, err := m.GetDoctorByIDFunc(ctx, id); err == nil {
+			return dbgen.GetUserByIDGlobalRow{ID: id, Email: d.Email, Role: d.Role, TenantID: d.TenantID, IsActive: true}, nil
+		}
+	}
+	if m.GetAdminByIDFunc != nil {
+		if a, err := m.GetAdminByIDFunc(ctx, id); err == nil {
+			return dbgen.GetUserByIDGlobalRow{ID: id, Email: a.Email, Role: a.Role, TenantID: a.TenantID, IsActive: true}, nil
+		}
+	}
+	return dbgen.GetUserByIDGlobalRow{ID: id, Role: "patient", TenantID: models.SystemDefaultTenantID, IsActive: true}, nil
 }
 
 func (m *MockRepository) UpdateUserActiveStatus(ctx context.Context, id uuid.UUID, isActive bool) error {

@@ -134,6 +134,7 @@ func (r *DBRepository) GetPatientByEmail(ctx context.Context, email string) (mod
 		LastName:       row.LastName,
 		HashedPassword: row.HashedPassword,
 		Role:           "patient",
+		TenantID:       row.TenantID,
 		CreatedAt:      row.CreatedAt.Time,
 	}, nil
 }
@@ -152,6 +153,7 @@ func (r *DBRepository) GetPatientByID(ctx context.Context, id uuid.UUID) (models
 		FirstName: row.FirstName,
 		LastName:  row.LastName,
 		Role:      "patient",
+		TenantID:  row.TenantID,
 		CreatedAt: row.CreatedAt.Time,
 	}, nil
 }
@@ -176,6 +178,7 @@ func (r *DBRepository) GetPatientsByDoctorID(ctx context.Context, doctorID uuid.
 			FirstName: row.FirstName,
 			LastName:  row.LastName,
 			Role:      "patient",
+			TenantID:  row.TenantID,
 			CreatedAt: row.CreatedAt.Time,
 		})
 	}
@@ -363,6 +366,7 @@ func (r *DBRepository) GetDoctorByEmail(ctx context.Context, email string) (mode
 		Available:      row.Available.Bool,
 		HashedPassword: row.HashedPassword,
 		Role:           row.Role,
+		TenantID:       row.TenantID,
 		CreatedAt:      row.CreatedAt.Time,
 	}, nil
 }
@@ -383,7 +387,8 @@ func (r *DBRepository) GetDoctorByID(ctx context.Context, id uuid.UUID) (models.
 		Specialty:  row.Specialty.String,
 		Experience: int(row.ExperienceYears.Int32),
 		Available:  row.Available.Bool,
-		Role:       "doctor",
+		Role:       row.Role,
+		TenantID:   row.TenantID,
 		CreatedAt:  row.CreatedAt.Time,
 	}, nil
 }
@@ -409,7 +414,8 @@ func (r *DBRepository) GetDoctors(ctx context.Context, limit, offset int) ([]mod
 			Specialty:  row.Specialty.String,
 			Experience: int(row.ExperienceYears.Int32),
 			Available:  row.Available.Bool,
-			Role:       "doctor",
+			Role:       row.Role,
+			TenantID:   row.TenantID,
 			CreatedAt:  row.CreatedAt.Time,
 		})
 	}
@@ -2125,4 +2131,8 @@ func (r *DBRepository) GetTenantSettings(ctx context.Context, tenantID uuid.UUID
 }
 func (r *DBRepository) GetOCRProviderConfigsByIDs(ctx context.Context, arg dbgen.GetOCRProviderConfigsByIDsParams) ([]dbgen.OcrProviderConfig, error) {
 	return r.queries.GetOCRProviderConfigsByIDs(ctx, arg)
+}
+
+func (r *DBRepository) GetUserByIDGlobal(ctx context.Context, id uuid.UUID) (dbgen.GetUserByIDGlobalRow, error) {
+	return r.queries.GetUserByIDGlobal(ctx, id)
 }

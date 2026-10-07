@@ -1,8 +1,10 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"github.com/RitwikGupta-0501/vital-watch/internal/models"
 	"github.com/RitwikGupta-0501/vital-watch/internal/repository"
@@ -610,5 +612,129 @@ func TestAuthMiddleware_DeactivatedUserRejected(t *testing.T) {
 	}
 	if !strings.Contains(w2.Body.String(), "inactive or deactivated") {
 		t.Errorf("expected error message to mention deactivated account, got %s", w2.Body.String())
+	}
+}
+
+func TestTenantContinuity_LoginAndRefresh(t *testing.T) {
+	jwtSecret := []byte("test-jwt-secret-key-32bytes-long!")
+	customTenantID := uuid.MustParse("11111111-2222-3333-4444-555555555555")
+	userID := uuid.New()
+	hashed, _ := utils.HashPassword("SecurePassword123!")
+
+	currentRefreshHash := ""
+	mockRepo := &repository.MockRepository{
+		GetPatientByEmailFunc: func(ctx context.Context, email string) (models.Patient, error) {
+			return models.Patient{
+				ID:             userID,
+				Email:          email,
+				FirstName:      "John",
+				LastName:       "Tenant",
+				HashedPassword: hashed,
+				Role:           "patient",
+				TenantID:       customTenantID,
+			}, nil
+		},
+		CreateRefreshTokenFunc: func(ctx context.Context, uID uuid.UUID, tokenHash string, expiresAt time.Time) (models.RefreshToken, error) {
+			currentRefreshHash = tokenHash
+			return models.RefreshToken{
+				ID:        uuid.New(),
+				UserID:    uID,
+				TokenHash: tokenHash,
+				ExpiresAt: expiresAt,
+			}, nil
+		},
+		GetRefreshTokenByHashFunc: func(ctx context.Context, tokenHash string) (models.RefreshToken, error) {
+			if tokenHash == currentRefreshHash {
+				return models.RefreshToken{
+					ID:        uuid.New(),
+					UserID:    userID,
+					TokenHash: tokenHash,
+					ExpiresAt: time.Now().Add(time.Hour),
+				}, nil
+			}
+			return models.RefreshToken{}, sql.ErrNoRows
+		},
+		GetUserByIDGlobalFunc: func(ctx context.Context, id uuid.UUID) (dbgen.GetUserByIDGlobalRow, error) {
+			return dbgen.GetUserByIDGlobalRow{
+				ID:       userID,
+				Email:    "john@hospital.org",
+				Role:     "patient",
+				TenantID: customTenantID,
+				IsActive: true,
+			}, nil
+		},
+		RotateRefreshTokenFunc: func(ctx context.Context, oldTokenID, uID uuid.UUID, newHash string, expiresAt time.Time) (models.RefreshToken, error) {
+			currentRefreshHash = newHash
+			return models.RefreshToken{
+				ID:        uuid.New(),
+				UserID:    uID,
+				TokenHash: newHash,
+				ExpiresAt: expiresAt,
+			}, nil
+		},
+	}
+
+	h := &Handler{
+		Repo:      mockRepo,
+		JWTSecret: jwtSecret,
+	}
+
+	r := gin.New()
+	r.POST("/api/login", h.Login)
+	r.POST("/api/auth/refresh", h.RefreshToken)
+
+	// 1. Login as patient in custom tenant
+	loginBody, _ := json.Marshal(map[string]string{
+		"role":     "patient",
+		"email":    "john@hospital.org",
+		"password": "SecurePassword123!",
+	})
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/login", bytes.NewReader(loginBody))
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on login, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var loginResp struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &loginResp)
+
+	// Verify login JWT carries customTenantID
+	parsedToken, _ := jwt.Parse(loginResp.AccessToken, func(token *jwt.Token) (interface{}, error) {
+		return jwtSecret, nil
+	})
+	claims := parsedToken.Claims.(jwt.MapClaims)
+	if claims["tenant_id"] != customTenantID.String() {
+		t.Fatalf("expected tenant_id %s on login token, got %v", customTenantID.String(), claims["tenant_id"])
+	}
+
+	// 2. Refresh token -> rotated access token MUST also carry customTenantID
+	refreshBody, _ := json.Marshal(map[string]string{
+		"refresh_token": loginResp.RefreshToken,
+	})
+	wRef := httptest.NewRecorder()
+	reqRef, _ := http.NewRequest(http.MethodPost, "/api/auth/refresh", bytes.NewReader(refreshBody))
+	r.ServeHTTP(wRef, reqRef)
+	if wRef.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on refresh, got %d: %s", wRef.Code, wRef.Body.String())
+	}
+
+	var refreshResp struct {
+		AccessToken string `json:"access_token"`
+	}
+	json.Unmarshal(wRef.Body.Bytes(), &refreshResp)
+
+	parsedRefToken, _ := jwt.Parse(refreshResp.AccessToken, func(token *jwt.Token) (interface{}, error) {
+		return jwtSecret, nil
+	})
+	refClaims := parsedRefToken.Claims.(jwt.MapClaims)
+	if refClaims["tenant_id"] != customTenantID.String() {
+		t.Fatalf("expected tenant_id %s on refreshed token, got %v", customTenantID.String(), refClaims["tenant_id"])
+	}
+	if refClaims["role"] != "patient" {
+		t.Fatalf("expected role patient on refreshed token, got %v", refClaims["role"])
 	}
 }

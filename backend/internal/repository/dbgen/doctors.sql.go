@@ -58,7 +58,7 @@ func (q *Queries) CreateDoctorUser(ctx context.Context, arg CreateDoctorUserPara
 }
 
 const getDoctorByEmail = `-- name: GetDoctorByEmail :one
-SELECT u.id, u.email, d.first_name, d.last_name, d.specialty, d.experience_years, d.available, u.hashed_password, u.role, u.created_at
+SELECT u.id, u.email, d.first_name, d.last_name, d.specialty, d.experience_years, d.available, u.hashed_password, u.role, u.tenant_id, u.created_at
 FROM users u
 JOIN doctor_profiles d ON u.id = d.user_id
 WHERE u.email = $1 AND u.role = 'doctor' AND u.is_active = true AND u.tenant_id = $2
@@ -79,6 +79,7 @@ type GetDoctorByEmailRow struct {
 	Available       pgtype.Bool        `json:"available"`
 	HashedPassword  string             `json:"hashed_password"`
 	Role            string             `json:"role"`
+	TenantID        uuid.UUID          `json:"tenant_id"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 }
 
@@ -95,13 +96,14 @@ func (q *Queries) GetDoctorByEmail(ctx context.Context, arg GetDoctorByEmailPara
 		&i.Available,
 		&i.HashedPassword,
 		&i.Role,
+		&i.TenantID,
 		&i.CreatedAt,
 	)
 	return i, err
 }
 
 const getDoctorByID = `-- name: GetDoctorByID :one
-SELECT u.id, u.email, d.first_name, d.last_name, d.specialty, d.experience_years, d.available, u.created_at
+SELECT u.id, u.email, d.first_name, d.last_name, d.specialty, d.experience_years, d.available, u.role, u.tenant_id, u.created_at
 FROM users u
 JOIN doctor_profiles d ON u.id = d.user_id
 WHERE u.id = $1 AND u.role = 'doctor' AND u.is_active = true AND u.tenant_id = $2
@@ -120,6 +122,8 @@ type GetDoctorByIDRow struct {
 	Specialty       pgtype.Text        `json:"specialty"`
 	ExperienceYears pgtype.Int4        `json:"experience_years"`
 	Available       pgtype.Bool        `json:"available"`
+	Role            string             `json:"role"`
+	TenantID        uuid.UUID          `json:"tenant_id"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 }
 
@@ -134,13 +138,15 @@ func (q *Queries) GetDoctorByID(ctx context.Context, arg GetDoctorByIDParams) (G
 		&i.Specialty,
 		&i.ExperienceYears,
 		&i.Available,
+		&i.Role,
+		&i.TenantID,
 		&i.CreatedAt,
 	)
 	return i, err
 }
 
 const getDoctors = `-- name: GetDoctors :many
-SELECT u.id, u.email, d.first_name, d.last_name, d.specialty, d.experience_years, d.available, u.created_at
+SELECT u.id, u.email, d.first_name, d.last_name, d.specialty, d.experience_years, d.available, u.role, u.tenant_id, u.created_at
 FROM users u
 JOIN doctor_profiles d ON u.id = d.user_id
 WHERE u.role = 'doctor' AND u.is_active = true AND u.tenant_id = $3
@@ -162,6 +168,8 @@ type GetDoctorsRow struct {
 	Specialty       pgtype.Text        `json:"specialty"`
 	ExperienceYears pgtype.Int4        `json:"experience_years"`
 	Available       pgtype.Bool        `json:"available"`
+	Role            string             `json:"role"`
+	TenantID        uuid.UUID          `json:"tenant_id"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 }
 
@@ -182,6 +190,8 @@ func (q *Queries) GetDoctors(ctx context.Context, arg GetDoctorsParams) ([]GetDo
 			&i.Specialty,
 			&i.ExperienceYears,
 			&i.Available,
+			&i.Role,
+			&i.TenantID,
 			&i.CreatedAt,
 		); err != nil {
 			return nil, err

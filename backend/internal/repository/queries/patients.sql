@@ -8,13 +8,13 @@ INSERT INTO patient_profiles (user_id, first_name, last_name, tenant_id)
 VALUES ($1, $2, $3, @tenant_id);
 
 -- name: GetPatientByEmail :one
-SELECT u.id, u.email, p.first_name, p.last_name, u.hashed_password, u.created_at
+SELECT u.id, u.email, p.first_name, p.last_name, u.hashed_password, u.tenant_id, u.created_at
 FROM users u
 JOIN patient_profiles p ON u.id = p.user_id
 WHERE u.email = $1 AND u.role = 'patient' AND u.is_active = true AND u.tenant_id = @tenant_id;
 
 -- name: GetPatientByID :one
-SELECT u.id, u.email, p.first_name, p.last_name, u.created_at
+SELECT u.id, u.email, p.first_name, p.last_name, u.tenant_id, u.created_at
 FROM users u
 JOIN patient_profiles p ON u.id = p.user_id
 WHERE u.id = $1 AND u.role = 'patient' AND u.is_active = true AND u.tenant_id = @tenant_id;
@@ -24,7 +24,7 @@ WHERE u.id = $1 AND u.role = 'patient' AND u.is_active = true AND u.tenant_id = 
 -- hash-aggregate/deduplication pass over all appointment rows.
 -- The EXISTS subquery short-circuits at the first matching appointment
 -- per patient, allowing PostgreSQL to use an index scan with pagination.
-SELECT u.id, u.email, p.first_name, p.last_name, u.created_at
+SELECT u.id, u.email, p.first_name, p.last_name, u.tenant_id, u.created_at
 FROM users u
 JOIN patient_profiles p ON u.id = p.user_id
 WHERE u.role = 'patient'

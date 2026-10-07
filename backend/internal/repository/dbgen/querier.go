@@ -78,6 +78,7 @@ type Querier interface {
 	GetRefreshTokenByHash(ctx context.Context, tokenHash string) (RefreshToken, error)
 	GetTenantInviteByCode(ctx context.Context, inviteCode string) (TenantInvite, error)
 	GetTenantSettings(ctx context.Context, tenantID uuid.UUID) (TenantSetting, error)
+	GetUserByIDGlobal(ctx context.Context, id uuid.UUID) (GetUserByIDGlobalRow, error)
 	HasDoctorPatientRelationship(ctx context.Context, arg HasDoctorPatientRelationshipParams) (pgtype.Bool, error)
 	InsertPrescriptionItem(ctx context.Context, arg InsertPrescriptionItemParams) (InsertPrescriptionItemRow, error)
 	LockRefreshTokenForRotation(ctx context.Context, arg LockRefreshTokenForRotationParams) (RefreshToken, error)
