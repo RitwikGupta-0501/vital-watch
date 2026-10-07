@@ -498,7 +498,7 @@ func setupRouter(h *api.Handler, storageType string, jwtSecret []byte) *gin.Engi
 	r.POST("/api/register", authLimiter.Middleware(), h.Register)
 	r.POST("/api/login", authLimiter.Middleware(), h.Login)
 	r.POST("/api/auth/refresh", authLimiter.Middleware(), h.RefreshToken)
-	r.POST("/api/auth/logout", h.Logout)
+	r.POST("/api/auth/logout", authLimiter.Middleware(), h.AuthMiddleware(), h.Logout)
 
 	// Real-Time Notification SSE Stream (Supports EventSource query token and Bearer header)
 	r.GET("/api/notifications/stream", h.SSEAuthMiddleware(), h.StreamNotifications)

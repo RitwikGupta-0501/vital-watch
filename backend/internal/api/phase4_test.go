@@ -87,10 +87,11 @@ func TestTelehealthVirtualAppointmentFlow(t *testing.T) {
 			return models.Doctor{ID: id, Available: true}, nil
 		},
 		GetDoctorSchedulesFunc: func(ctx context.Context, dID uuid.UUID) ([]models.DoctorSchedule, error) {
+			slotStart := time.Now().UTC().Add(2 * time.Hour).Truncate(time.Hour)
 			return []models.DoctorSchedule{
 				{
 					DoctorID:     doctorID,
-					DayOfWeek:    int(time.Now().Weekday()),
+					DayOfWeek:    int(slotStart.Weekday()),
 					StartTime:    "00:00",
 					EndTime:      "23:59",
 					SlotDuration: 15,
@@ -110,11 +111,11 @@ func TestTelehealthVirtualAppointmentFlow(t *testing.T) {
 	r := setupPhase4TestRouter(h)
 
 	// 1. Book Virtual Appointment
-	nowSlot := time.Now().Truncate(time.Hour)
+	slotStart := time.Now().UTC().Add(2 * time.Hour).Truncate(time.Hour)
 	reqBody := map[string]interface{}{
 		"doctor_id":  doctorID.String(),
-		"start_time": nowSlot.Add(2 * time.Hour).Format(time.RFC3339),
-		"end_time":   nowSlot.Add(2*time.Hour + 30*time.Minute).Format(time.RFC3339),
+		"start_time": slotStart.Format(time.RFC3339),
+		"end_time":   slotStart.Add(30 * time.Minute).Format(time.RFC3339),
 		"type":       "virtual",
 	}
 	bodyBytes, _ := json.Marshal(reqBody)

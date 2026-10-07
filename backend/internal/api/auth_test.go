@@ -394,6 +394,10 @@ func TestLogoutAllDevices(t *testing.T) {
 	}
 
 	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		c.Set("userID", userID)
+		c.Next()
+	})
 	r.POST("/logout", h.Logout)
 
 	// 1. Single device logout (default)
@@ -424,6 +428,81 @@ func TestLogoutAllDevices(t *testing.T) {
 	}
 	if !revokeAllCalled {
 		t.Fatalf("expected RevokeAllUserRefreshTokens to be called when all_devices is true")
+	}
+}
+
+func TestLogout_SecurityHardening(t *testing.T) {
+	aliceID := uuid.New()
+	bobID := uuid.New()
+	bobTokenID := uuid.New()
+	bobRawRefresh := "bobs-secret-refresh-token"
+	bobTokenHash := hashToken(bobRawRefresh)
+
+	bobTokenRevoked := false
+
+	mockRepo := &repository.MockRepository{
+		GetRefreshTokenByHashFunc: func(ctx context.Context, hash string) (models.RefreshToken, error) {
+			if hash == bobTokenHash {
+				return models.RefreshToken{
+					ID:        bobTokenID,
+					UserID:    bobID, // owned by Bob
+					TokenHash: hash,
+					ExpiresAt: time.Now().Add(time.Hour),
+				}, nil
+			}
+			return models.RefreshToken{}, sql.ErrNoRows
+		},
+		RevokeRefreshTokenFunc: func(ctx context.Context, id uuid.UUID, replacedBy *uuid.UUID) error {
+			if id == bobTokenID {
+				bobTokenRevoked = true
+			}
+			return nil
+		},
+	}
+
+	h := &Handler{
+		Repo: mockRepo,
+	}
+
+	r := gin.New()
+	r.POST("/api/auth/logout", h.Logout)
+
+	// 1. Unauthenticated request -> 401 Unauthorized
+	w1 := httptest.NewRecorder()
+	body1 := strings.NewReader(`{"refresh_token":"any-token"}`)
+	req1, _ := http.NewRequest(http.MethodPost, "/api/auth/logout", body1)
+	r.ServeHTTP(w1, req1)
+	if w1.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized for unauthenticated logout, got %d", w1.Code)
+	}
+
+	// 2. Refresh token exceeding 512 bytes -> 400 Bad Request
+	rAuthed := gin.New()
+	rAuthed.Use(func(c *gin.Context) {
+		c.Set("userID", aliceID)
+		c.Next()
+	})
+	rAuthed.POST("/api/auth/logout", h.Logout)
+
+	largeToken := strings.Repeat("a", 513)
+	w2 := httptest.NewRecorder()
+	body2 := strings.NewReader(`{"refresh_token":"` + largeToken + `"}`)
+	req2, _ := http.NewRequest(http.MethodPost, "/api/auth/logout", body2)
+	rAuthed.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for oversized refresh token, got %d", w2.Code)
+	}
+
+	// 3. Alice attempts to revoke Bob's refresh token -> 403 Forbidden
+	w3 := httptest.NewRecorder()
+	body3 := strings.NewReader(`{"refresh_token":"` + bobRawRefresh + `"}`)
+	req3, _ := http.NewRequest(http.MethodPost, "/api/auth/logout", body3)
+	rAuthed.ServeHTTP(w3, req3)
+	if w3.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden when Alice tries to revoke Bob's token, got %d: %s", w3.Code, w3.Body.String())
+	}
+	if bobTokenRevoked {
+		t.Fatalf("Bob's token was revoked by Alice! Vulnerability exists.")
 	}
 }
 

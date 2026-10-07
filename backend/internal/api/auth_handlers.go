@@ -505,6 +505,17 @@ func (h *Handler) RefreshToken(c *gin.Context) {
 
 // Logout revokes the caller's active refresh token or all user refresh tokens if requested.
 func (h *Handler) Logout(c *gin.Context) {
+	userIDVal, ok := c.Get("userID")
+	if !ok {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Authentication required"})
+		return
+	}
+	userID, ok := userIDVal.(uuid.UUID)
+	if !ok || userID == uuid.Nil {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid user context"})
+		return
+	}
+
 	var req struct {
 		RefreshToken string `json:"refresh_token"`
 		AllDevices   bool   `json:"all_devices,omitempty"`
@@ -517,13 +528,22 @@ func (h *Handler) Logout(c *gin.Context) {
 		_ = c.ShouldBindJSON(&req)
 	}
 
-	if strings.TrimSpace(req.RefreshToken) != "" {
+	if len(req.RefreshToken) > 512 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Refresh token exceeds maximum allowed length"})
+		return
+	}
+
+	if req.AllDevices {
+		_ = h.Repo.RevokeAllUserRefreshTokens(c.Request.Context(), userID)
+	} else if strings.TrimSpace(req.RefreshToken) != "" {
 		tokenHash := hashToken(req.RefreshToken)
 		existingToken, err := h.Repo.GetRefreshTokenByHash(c.Request.Context(), tokenHash)
 		if err == nil {
-			if req.AllDevices {
-				_ = h.Repo.RevokeAllUserRefreshTokens(c.Request.Context(), existingToken.UserID)
-			} else if existingToken.RevokedAt == nil {
+			if existingToken.UserID != userID {
+				c.JSON(http.StatusForbidden, gin.H{"error": "Cannot revoke another user's session"})
+				return
+			}
+			if existingToken.RevokedAt == nil {
 				_ = h.Repo.RevokeRefreshToken(c.Request.Context(), existingToken.ID, nil)
 			}
 		}
@@ -533,7 +553,7 @@ func (h *Handler) Logout(c *gin.Context) {
 	c.SetCookie("access_token", "", -1, "/", "", true, true)
 	c.SetCookie("refresh_token", "", -1, "/api/auth", "", true, true)
 
-	h.audit(c, audit.ActionUserLogout, "session", nil, nil, http.StatusOK, map[string]interface{}{
+	h.audit(c, audit.ActionUserLogout, "session", &userID, nil, http.StatusOK, map[string]interface{}{
 		"all_devices": req.AllDevices,
 	})
 	c.JSON(http.StatusOK, gin.H{"message": "Successfully logged out"})
