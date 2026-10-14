@@ -1,17 +1,51 @@
-import { Outlet, Link, useNavigate } from 'react-router-dom';
+import { Outlet, Link, useNavigate, useLocation } from 'react-router-dom';
 import { useAuth } from '../../context/useAuth';
 import type { DoctorProfile } from '../../lib/api/types';
-import { LayoutDashboard, LogOut } from 'lucide-react';
+import { Calendar, CalendarDays, Users, FileText, Clock, LogOut } from 'lucide-react';
 
 export function DoctorLayout() {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
   const doctor = user as DoctorProfile | null;
 
   const handleSignOut = async () => {
     await logout();
     navigate('/login?role=doctor');
   };
+
+  const navItems = [
+    {
+      to: '/doctor/today',
+      title: "Today's Agenda",
+      icon: Calendar,
+      isActive: location.pathname === '/doctor/today' || location.pathname === '/doctor/dashboard' || location.pathname === '/doctor',
+    },
+    {
+      to: '/doctor/appointments',
+      title: 'Appointments Ledger',
+      icon: CalendarDays,
+      isActive: location.pathname === '/doctor/appointments',
+    },
+    {
+      to: '/doctor/patients',
+      title: 'Patient Roster',
+      icon: Users,
+      isActive: location.pathname.startsWith('/doctor/patients'),
+    },
+    {
+      to: '/doctor/prescriptions',
+      title: 'Prescriptions Directory',
+      icon: FileText,
+      isActive: location.pathname === '/doctor/prescriptions',
+    },
+    {
+      to: '/doctor/settings/schedule',
+      title: 'Office Hours & Schedule',
+      icon: Clock,
+      isActive: location.pathname === '/doctor/settings/schedule',
+    },
+  ];
 
   return (
     <div className="flex min-h-screen bg-slate-950 text-slate-100 w-full font-sans">
@@ -27,13 +61,23 @@ export function DoctorLayout() {
           </Link>
 
           <nav className="flex flex-col items-center gap-2 w-full">
-            <Link
-              to="/doctor/dashboard"
-              title="Clinician Dashboard"
-              className="w-10 h-10 rounded-lg flex items-center justify-center bg-brand-500/10 text-brand-400 border border-brand-500/30 transition-all hover:bg-brand-500/20"
-            >
-              <LayoutDashboard className="w-5 h-5" />
-            </Link>
+            {navItems.map((item) => {
+              const Icon = item.icon;
+              return (
+                <Link
+                  key={item.to}
+                  to={item.to}
+                  title={item.title}
+                  className={`w-10 h-10 rounded-lg flex items-center justify-center transition-all ${
+                    item.isActive
+                      ? 'bg-brand-500/10 text-brand-400 border border-brand-500/30'
+                      : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
+                  }`}
+                >
+                  <Icon className="w-5 h-5" />
+                </Link>
+              );
+            })}
           </nav>
         </div>
 

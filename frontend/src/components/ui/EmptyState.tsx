@@ -3,7 +3,7 @@ import { clsx } from 'clsx';
 import { FileQuestion, CalendarX2, ShieldAlert, AlertTriangle } from 'lucide-react';
 import { Button } from './Button';
 
-export type EmptyStateVariant = 'no-records' | 'not-configured' | 'rate-limited' | 'error';
+export type EmptyStateVariant = 'no-records' | 'not-configured' | 'rate-limited' | 'error' | 'calendar';
 
 interface EmptyStateProps {
   variant?: EmptyStateVariant;
@@ -27,6 +27,11 @@ const DEFAULT_CONFIG: Record<
   'not-configured': {
     title: 'Schedule not available',
     description: 'The clinician has not yet configured available booking hours.',
+    icon: CalendarX2,
+  },
+  calendar: {
+    title: 'No events scheduled',
+    description: 'There are no appointments or consultations scheduled for this date range.',
     icon: CalendarX2,
   },
   'rate-limited': {

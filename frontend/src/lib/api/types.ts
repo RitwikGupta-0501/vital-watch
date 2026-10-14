@@ -230,3 +230,108 @@ export interface PublicRxVerification {
   items: PrescriptionItem[];
   verified?: boolean;
 }
+
+// Doctor Workspace & Clinical Roster (M3)
+export interface DoctorPatient {
+  id: string;
+  email: string;
+  first_name: string;
+  last_name: string;
+  role: 'patient';
+  tenant_id: string;
+  created_at: string;
+  updated_at?: string;
+}
+
+export interface DoctorSchedule {
+  id: string;
+  doctor_id: string;
+  day_of_week: number; // 0=Sunday, 1=Monday, ..., 6=Saturday
+  start_time: string; // "HH:MM" e.g. "09:00"
+  end_time: string; // "HH:MM" e.g. "17:00"
+  slot_duration: number; // 15 | 20 | 30 | 45 | 60
+  timezone: string;
+  is_active: boolean;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface DoctorScheduleInput {
+  day_of_week: number;
+  start_time: string;
+  end_time: string;
+  slot_duration: number;
+  timezone: string;
+  is_active?: boolean;
+}
+
+export interface InteractionAlert {
+  drug1: string;
+  drug2: string;
+  severity: SafetySeverity;
+  description: string;
+  mechanism?: string;
+}
+
+export interface SafetyReport {
+  has_high_severity_alerts: boolean;
+  interaction_alerts: InteractionAlert[];
+  allergy_alerts: unknown[];
+  service_degraded: boolean;
+  degraded_reason?: string;
+  unchecked_drugs?: string[];
+}
+
+export interface CreateDigitalPrescriptionRequest {
+  patient_id: string;
+  notes?: string;
+  override_safety?: boolean;
+  override_reason?: string;
+  items: {
+    medication_name: string;
+    dosage?: string;
+    frequency?: string;
+    duration?: string;
+    timing?: string;
+    instructions?: string;
+  }[];
+}
+
+export interface CreateDigitalPrescriptionResponse {
+  id: string;
+  source: 'digital';
+  status: 'approved';
+}
+
+export interface PatientVital {
+  id: string;
+  patient_id: string;
+  recorder_id: string;
+  recorder_role: UserRole;
+  recorded_at: string;
+  systolic_bp?: number;
+  diastolic_bp?: number;
+  heart_rate?: number;
+  blood_glucose?: number;
+  oxygen_saturation?: number;
+  temperature?: number;
+  weight_kg?: number;
+  notes?: string;
+  is_critical?: boolean;
+  critical_alerts?: string[];
+  created_at: string;
+}
+
+export interface VitalInput {
+  patient_id: string;
+  recorded_at?: string;
+  systolic_bp?: number;
+  diastolic_bp?: number;
+  heart_rate?: number;
+  blood_glucose?: number;
+  oxygen_saturation?: number;
+  temperature?: number;
+  weight_kg?: number;
+  notes?: string;
+}
+
