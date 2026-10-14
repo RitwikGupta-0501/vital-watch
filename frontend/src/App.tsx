@@ -29,6 +29,8 @@ import { PrescriptionDetail } from './pages/patient/PrescriptionDetail';
 import { DoctorDashboard } from './pages/doctor/Dashboard';
 import { TodayTimeline } from './pages/doctor/TodayTimeline';
 import { DoctorAppointmentsList } from './pages/doctor/AppointmentsList';
+import { DoctorPatientRoster } from './pages/doctor/PatientRoster';
+import { DoctorPatientChart } from './pages/doctor/PatientChart';
 import { EmptyState } from './components/ui/EmptyState';
 
 const queryClient = new QueryClient({
@@ -112,6 +114,9 @@ function App() {
             <Route path="dashboard" element={<DoctorDashboard />} />
             <Route path="today" element={<TodayTimeline />} />
             <Route path="appointments" element={<DoctorAppointmentsList />} />
+            <Route path="patients" element={<DoctorPatientRoster />} />
+            <Route path="patients/:id" element={<DoctorPatientChart />} />
+            <Route path="patients/:id/record-vitals" element={<DoctorPatientChart autoOpenVitals />} />
           </Route>
 
           {/* 404 Catch-All */}
