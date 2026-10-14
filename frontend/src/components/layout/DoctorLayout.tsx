@@ -1,20 +1,88 @@
-import { Outlet } from 'react-router-dom'
+import { Outlet, Link, useNavigate } from 'react-router-dom';
+import { useAuth } from '../../context/useAuth';
+import type { DoctorProfile } from '../../lib/api/types';
+import { LayoutDashboard, LogOut } from 'lucide-react';
 
 export function DoctorLayout() {
+  const { user, logout } = useAuth();
+  const navigate = useNavigate();
+  const doctor = user as DoctorProfile | null;
+
+  const handleSignOut = async () => {
+    await logout();
+    navigate('/login?role=doctor');
+  };
+
   return (
-    <div className="flex min-h-screen bg-white w-full">
-        {/* Dark dense sidebar */}
-        <aside className="w-16 bg-slate-900 border-r border-slate-800 flex flex-col items-center py-4 sticky top-0 h-screen">
-            <div className="w-10 h-10 bg-brand-600 rounded-lg flex items-center justify-center text-white font-bold mb-8">V</div>
-            <nav className="flex-1 flex flex-col gap-4 w-full px-2">
-                <div className="w-full aspect-square bg-brand-700/20 text-brand-400 rounded-xl flex items-center justify-center border-l-4 border-brand-500">
-                    <span className="text-xs">Dash</span>
-                </div>
-            </nav>
-        </aside>
-        <main className="flex-1 flex bg-surface">
-            <Outlet />
+    <div className="flex min-h-screen bg-slate-950 text-slate-100 w-full font-sans">
+      {/* Dark Dense Sidebar Rail */}
+      <aside className="w-16 bg-slate-900 border-r border-slate-800 flex flex-col items-center py-5 justify-between sticky top-0 h-screen select-none shrink-0 z-40">
+        <div className="flex flex-col items-center gap-6 w-full px-2">
+          <Link
+            to="/"
+            title="VitalWatch Home"
+            className="w-10 h-10 bg-brand-600 hover:bg-brand-500 rounded-lg flex items-center justify-center text-white font-bold transition-colors"
+          >
+            V
+          </Link>
+
+          <nav className="flex flex-col items-center gap-2 w-full">
+            <Link
+              to="/doctor/dashboard"
+              title="Clinician Dashboard"
+              className="w-10 h-10 rounded-lg flex items-center justify-center bg-brand-500/10 text-brand-400 border border-brand-500/30 transition-all hover:bg-brand-500/20"
+            >
+              <LayoutDashboard className="w-5 h-5" />
+            </Link>
+          </nav>
+        </div>
+
+        {/* Clinician Profile & Logout */}
+        <div className="flex flex-col items-center gap-3 w-full px-2">
+          <div
+            title={doctor ? `Dr. ${doctor.first_name} ${doctor.last_name} (${doctor.specialty || 'Clinician'})` : 'Doctor'}
+            className="w-9 h-9 rounded-lg bg-slate-800 border border-slate-700 flex items-center justify-center text-xs font-mono font-bold text-slate-200"
+          >
+            {doctor?.first_name ? `Dr` : 'MD'}
+          </div>
+
+          <button
+            onClick={handleSignOut}
+            type="button"
+            title="Sign out of workspace"
+            className="w-10 h-10 rounded-lg flex items-center justify-center text-slate-400 hover:text-rose-400 hover:bg-rose-500/10 transition-colors cursor-pointer"
+          >
+            <LogOut className="w-5 h-5" />
+          </button>
+        </div>
+      </aside>
+
+      {/* Main Workspace Surface */}
+      <div className="flex-1 flex flex-col bg-slate-50 text-slate-900 min-w-0">
+        {/* Clinician Top Bar */}
+        <header className="h-14 bg-white border-b border-border px-6 flex items-center justify-between shrink-0">
+          <div className="flex items-center gap-3">
+            <span className="font-mono text-xs font-semibold uppercase tracking-wider text-slate-500 bg-slate-100 px-2 py-0.5 rounded border border-slate-200">
+              Clinical Workspace
+            </span>
+            <span className="text-slate-300">•</span>
+            <span className="text-xs text-slate-600 font-medium">
+              {doctor ? `Dr. ${doctor.first_name} ${doctor.last_name} — ${doctor.specialty || 'Staff Physician'}` : 'Signed In'}
+            </span>
+          </div>
+
+          <div className="flex items-center gap-4 text-xs text-slate-500 font-mono">
+            <span className="inline-flex items-center gap-1.5 text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+              HIPAA Encrypted
+            </span>
+          </div>
+        </header>
+
+        <main className="flex-1 p-6 md:p-8 overflow-auto">
+          <Outlet />
         </main>
+      </div>
     </div>
-  )
+  );
 }
