@@ -223,3 +223,28 @@ export const USER_ROLE_MAP: Record<UserRole, StatusMeta> = {
     icon: ShieldAlert,
   },
 };
+
+export function getStatusMeta(
+  domain: 'appointment' | 'appointment_type' | 'prescription' | 'prescription_source' | 'medication_log' | 'safety' | 'role',
+  value: string
+): StatusMeta {
+  switch (domain) {
+    case 'appointment':
+      return APPOINTMENT_STATUS_MAP[value as AppointmentStatus] || { label: value, tone: 'neutral', icon: Clock };
+    case 'appointment_type':
+      return APPOINTMENT_TYPE_MAP[value as AppointmentType] || { label: value, tone: 'neutral', icon: Clock };
+    case 'prescription':
+      return PRESCRIPTION_STATUS_MAP[value as PrescriptionStatus] || { label: value, tone: 'neutral', icon: Clock };
+    case 'prescription_source':
+      return PRESCRIPTION_SOURCE_MAP[value as PrescriptionSource] || { label: value, tone: 'neutral', icon: Clock };
+    case 'medication_log':
+      return MEDICATION_LOG_STATUS_MAP[value as MedicationLogStatus] || { label: value, tone: 'neutral', icon: Clock };
+    case 'safety':
+      return SAFETY_SEVERITY_MAP[value as SafetySeverity] || { label: value, tone: 'neutral', icon: Clock };
+    case 'role':
+      return USER_ROLE_MAP[value as UserRole] || { label: value, tone: 'neutral', icon: Clock };
+    default:
+      return { label: value, tone: 'neutral', icon: Clock };
+  }
+}
+
