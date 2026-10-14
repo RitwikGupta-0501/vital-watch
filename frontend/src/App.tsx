@@ -16,8 +16,16 @@ import { Register } from './pages/Register';
 import { NoticeOfPrivacyPractices } from './pages/legal/NoticeOfPrivacyPractices';
 import { TermsOfService } from './pages/legal/TermsOfService';
 import { SecurityPosture } from './pages/legal/SecurityPosture';
+import { VerifyRx } from './pages/VerifyRx';
 
 import { PatientDashboard } from './pages/patient/Dashboard';
+import { DoctorDirectory } from './pages/patient/DoctorDirectory';
+import { DoctorDetail } from './pages/patient/DoctorDetail';
+import { BookingConfirm } from './pages/patient/BookingConfirm';
+import { AppointmentsList } from './pages/patient/AppointmentsList';
+import { PrescriptionsList } from './pages/patient/PrescriptionsList';
+import { PrescriptionDetail } from './pages/patient/PrescriptionDetail';
+
 import { DoctorDashboard } from './pages/doctor/Dashboard';
 import { EmptyState } from './components/ui/EmptyState';
 
@@ -58,7 +66,7 @@ function App() {
       <AuthProvider>
         <GlobalStreamBanner />
         <Routes>
-          {/* Public Routes */}
+          {/* Public Routes with standard chrome */}
           <Route element={<PublicLayout />}>
             <Route path="/" element={<Landing />} />
             <Route path="/login" element={<Login />} />
@@ -67,6 +75,9 @@ function App() {
             <Route path="/terms" element={<TermsOfService />} />
             <Route path="/security" element={<SecurityPosture />} />
           </Route>
+
+          {/* Standalone Public Verification (Bare layout for QR authenticity) */}
+          <Route path="/verify/rx/:id" element={<VerifyRx />} />
 
           {/* Patient Routes */}
           <Route
@@ -78,6 +89,12 @@ function App() {
             }
           >
             <Route path="dashboard" element={<PatientDashboard />} />
+            <Route path="doctors" element={<DoctorDirectory />} />
+            <Route path="doctors/:id" element={<DoctorDetail />} />
+            <Route path="doctors/:id/book" element={<BookingConfirm />} />
+            <Route path="appointments" element={<AppointmentsList />} />
+            <Route path="prescriptions" element={<PrescriptionsList />} />
+            <Route path="prescriptions/:id" element={<PrescriptionDetail />} />
           </Route>
 
           {/* Doctor Routes */}
