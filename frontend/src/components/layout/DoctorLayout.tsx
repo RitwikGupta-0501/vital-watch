@@ -1,13 +1,25 @@
 import { Outlet, Link, useNavigate, useLocation } from 'react-router-dom';
 import { useAuth } from '../../context/useAuth';
 import type { DoctorProfile } from '../../lib/api/types';
-import { Calendar, CalendarDays, Users, FileText, Clock, LogOut } from 'lucide-react';
+import { useQuery } from '@tanstack/react-query';
+import { Calendar, CalendarDays, Users, FileText, Clock, LogOut, ClipboardCheck } from 'lucide-react';
+import { getPendingReviewPrescriptions } from '../../lib/api/prescriptions';
+import type { PaginatedResponse, Prescription } from '../../lib/api/types';
 
 export function DoctorLayout() {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
   const doctor = user as DoctorProfile | null;
+
+  const { data: pendingData } = useQuery<PaginatedResponse<Prescription>>({
+    queryKey: ['pending-review-prescriptions'],
+    queryFn: () => getPendingReviewPrescriptions(10, 0),
+    enabled: !!user && user.role === 'doctor',
+    refetchInterval: 30000,
+  });
+
+  const pendingCount = pendingData?.data?.length || 0;
 
   const handleSignOut = async () => {
     await logout();
@@ -32,6 +44,13 @@ export function DoctorLayout() {
       title: 'Patient Roster',
       icon: Users,
       isActive: location.pathname.startsWith('/doctor/patients'),
+    },
+    {
+      to: '/doctor/review',
+      title: 'OCR Review Queue',
+      icon: ClipboardCheck,
+      isActive: location.pathname.startsWith('/doctor/review'),
+      badge: pendingCount > 0 ? pendingCount : undefined,
     },
     {
       to: '/doctor/prescriptions',
@@ -68,13 +87,18 @@ export function DoctorLayout() {
                   key={item.to}
                   to={item.to}
                   title={item.title}
-                  className={`w-10 h-10 rounded-lg flex items-center justify-center transition-all ${
+                  className={`relative w-10 h-10 rounded-lg flex items-center justify-center transition-all ${
                     item.isActive
                       ? 'bg-brand-500/10 text-brand-400 border border-brand-500/30'
                       : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
                   }`}
                 >
                   <Icon className="w-5 h-5" />
+                  {item.badge !== undefined && (
+                    <span className="absolute -top-1 -right-1 min-w-4 h-4 px-1 rounded-full bg-amber-500 text-slate-950 text-[10px] font-mono font-bold flex items-center justify-center shadow-xs">
+                      {item.badge}
+                    </span>
+                  )}
                 </Link>
               );
             })}

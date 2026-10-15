@@ -213,8 +213,56 @@ export interface Prescription {
 
 export interface PrescriptionDownloadResponse {
   download_url: string;
-  file_name: string;
+  file_name?: string;
   expires_in: number;
+}
+
+export interface PrescriptionUploadURLRequest {
+  patient_id: string;
+  filename: string;
+  content_type: string;
+  file_size: number;
+}
+
+export interface PrescriptionUploadURLResponse {
+  upload_url: string;
+  file_key: string;
+  expires_in: number;
+}
+
+export interface CreateUploadedPrescriptionRequest {
+  patient_id: string;
+  file_name: string;
+  notes?: string;
+  medication?: string;
+}
+
+export interface CreateUploadedPrescriptionResponse {
+  id: string;
+  filename: string;
+  status: PrescriptionStatus;
+}
+
+export interface VerifyPrescriptionItemInput {
+  medication_name: string;
+  dosage?: string;
+  frequency?: string;
+  duration?: string;
+  timing?: string;
+  instructions?: string;
+}
+
+export interface VerifyPrescriptionRequest {
+  status: 'approved' | 'rejected';
+  notes?: string;
+  items?: VerifyPrescriptionItemInput[];
+  override_safety?: boolean;
+  override_reason?: string;
+}
+
+export interface VerifyPrescriptionResponse {
+  message: string;
+  status: 'approved' | 'rejected';
 }
 
 // Public Authenticity Verification (A4)
