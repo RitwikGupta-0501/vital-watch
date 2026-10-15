@@ -18,7 +18,8 @@ import {
   ArrowLeft,
   Video,
   Building2,
-  AlertTriangle
+  AlertTriangle,
+  Upload
 } from 'lucide-react';
 
 interface PatientChartProps {
@@ -146,6 +147,13 @@ export function DoctorPatientChart({ autoOpenVitals = false }: PatientChartProps
             <Activity className="w-4 h-4 text-slate-500" />
             Record Vitals
           </button>
+          <Link
+            to={`/doctor/patients/${patientId}/prescribe/upload`}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-md hover:bg-slate-50 transition-colors shadow-2xs"
+          >
+            <Upload className="w-4 h-4 text-slate-500" />
+            Upload Paper Rx
+          </Link>
           <Link
             to={`/doctor/patients/${patientId}/prescribe/new`}
             className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-md transition-colors shadow-2xs"

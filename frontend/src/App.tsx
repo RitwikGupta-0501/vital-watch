@@ -34,6 +34,9 @@ import { DoctorPatientChart } from './pages/doctor/PatientChart';
 import { DigitalPrescribe } from './pages/doctor/DigitalPrescribe';
 import { DoctorPrescriptionsList } from './pages/doctor/PrescriptionsList';
 import { DoctorScheduleSettings } from './pages/doctor/ScheduleSettings';
+import { PrescribeUpload } from './pages/doctor/PrescribeUpload';
+import { OCRReviewQueue } from './pages/doctor/OCRReviewQueue';
+import { PrescriptionReviewDetail } from './pages/doctor/PrescriptionReviewDetail';
 import { EmptyState } from './components/ui/EmptyState';
 
 const queryClient = new QueryClient({
@@ -121,6 +124,9 @@ function App() {
             <Route path="patients/:id" element={<DoctorPatientChart />} />
             <Route path="patients/:id/record-vitals" element={<DoctorPatientChart autoOpenVitals />} />
             <Route path="patients/:id/prescribe/new" element={<DigitalPrescribe />} />
+            <Route path="patients/:id/prescribe/upload" element={<PrescribeUpload />} />
+            <Route path="review" element={<OCRReviewQueue />} />
+            <Route path="review/:id" element={<PrescriptionReviewDetail />} />
             <Route path="prescriptions" element={<DoctorPrescriptionsList />} />
             <Route path="settings/schedule" element={<DoctorScheduleSettings />} />
           </Route>
